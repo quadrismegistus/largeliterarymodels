@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "largeliterarymodels"
+version = "0.1.0"
+description = "LLMs for digital humanities"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.0"]
+dev = ["pytest", "pydantic>=2.0"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["largeliterarymodels*"]

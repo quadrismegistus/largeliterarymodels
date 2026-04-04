@@ -1,5 +1,8 @@
 # Large Literary Models
 
+[![PyPI version](https://badge.fury.io/py/largeliterarymodels.svg)](https://pypi.org/project/largeliterarymodels/)
+[![Tests](https://github.com/quadrismegistus/largeliterarymodels/actions/workflows/test.yml/badge.svg)](https://github.com/quadrismegistus/largeliterarymodels/actions/workflows/test.yml)
+
 A Python toolkit for using Large Language Models (LLMs) to produce structured, annotated data from unstructured texts. Built for digital humanities research.
 
 **What it does:** You give it messy text (OCR scans, bibliographies, novel excerpts, archival documents) and a description of the structured data you want back (characters, citations, sentiments, relationships). It sends the text to an LLM, parses the response into clean structured data, caches everything so you never pay for the same query twice, and hands you back validated Python objects you can export to CSV or a pandas DataFrame.
@@ -16,6 +19,8 @@ A Python toolkit for using Large Language Models (LLMs) to produce structured, a
 - [Working with Multiple Prompts](#working-with-multiple-prompts)
 - [Caching](#caching)
 - [Example: Bibliography Extraction](#example-bibliography-extraction)
+- [Starting Your Own Project](#starting-your-own-project)
+- [Model Constants](#model-constants)
 - [Project Structure](#project-structure)
 
 ## Installation
@@ -30,37 +35,12 @@ python --version
 
 If you see something like `Python 3.10.6` or higher, you're good. If not, install a newer Python from [python.org](https://www.python.org/downloads/) or via [pyenv](https://github.com/pyenv/pyenv).
 
-### Step 1: Clone the repository
+### Install from PyPI
+
+The simplest way to install:
 
 ```bash
-git clone https://github.com/quadrismegistus/largeliterarymodels.git
-cd largeliterarymodels
-```
-
-### Step 2: Create a virtual environment
-
-A virtual environment keeps this project's dependencies separate from your other Python projects. Run:
-
-```bash
-python -m venv .venv
-```
-
-Then activate it:
-
-```bash
-# On Mac/Linux:
-source .venv/bin/activate
-
-# On Windows:
-.venv\Scripts\activate
-```
-
-You should see `(.venv)` at the start of your terminal prompt. You'll need to activate this environment each time you open a new terminal to work on this project.
-
-### Step 3: Install the package
-
-```bash
-pip install -e "."
+pip install largeliterarymodels
 ```
 
 This installs `largeliterarymodels` and all its dependencies (the Anthropic, OpenAI, and Google AI client libraries, plus [HashStash](https://github.com/quadrismegistus/hashstash) for caching).
@@ -68,7 +48,19 @@ This installs `largeliterarymodels` and all its dependencies (the Anthropic, Ope
 To also install [pydantic](https://docs.pydantic.dev/) for structured data extraction (recommended):
 
 ```bash
-pip install -e ".[pydantic]"
+pip install "largeliterarymodels[pydantic]"
+```
+
+### Install from source (for development)
+
+If you want to modify the library itself:
+
+```bash
+git clone https://github.com/quadrismegistus/largeliterarymodels.git
+cd largeliterarymodels
+python -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
 ```
 
 ## Setup: API Keys
@@ -90,7 +82,7 @@ export OPENAI_API_KEY="sk-your-key-here"
 export GEMINI_API_KEY="your-key-here"
 ```
 
-To avoid typing these every time, add the `export` lines to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) or create a `.env` file in the project directory.
+To avoid typing these every time, add the `export` lines to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) or create a `.env` file in your project directory.
 
 To check which keys are set:
 
@@ -116,8 +108,9 @@ from largeliterarymodels import LLM
 llm = LLM()
 
 # Or specify a model:
-llm = LLM("gpt-4o-mini")
-llm = LLM("gemini-2.5-flash")
+from largeliterarymodels import CLAUDE_OPUS, GPT_4O_MINI, GEMINI_FLASH
+llm = LLM(GPT_4O_MINI)
+llm = LLM(GEMINI_FLASH)
 
 # Generate text
 response = llm.generate("What is the plot of Pamela by Samuel Richardson?")
@@ -129,8 +122,10 @@ The response is automatically cached. If you run the exact same call again, it r
 ### Changing default parameters
 
 ```python
+from largeliterarymodels import LLM, CLAUDE_SONNET
+
 # Lower temperature = more deterministic output
-llm = LLM("claude-sonnet-4-20250514", temperature=0.2)
+llm = LLM(CLAUDE_SONNET, temperature=0.2)
 
 # Set a system prompt that applies to all calls
 llm = LLM(system_prompt="You are an expert in 18th-century English literature.")
@@ -148,7 +143,7 @@ response = llm.generate(
 
 This is the core feature. Instead of getting back free-form text, you define a **schema** -- a description of the exact fields you want -- and the LLM fills them in.
 
-You define schemas using [pydantic](https://docs.pydantic.dev/), which is a way of describing data structures in Python. Install it with `pip install pydantic` if you haven't already.
+You define schemas using [pydantic](https://docs.pydantic.dev/), which is a way of describing data structures in Python.
 
 ### A simple example
 
@@ -296,9 +291,22 @@ characters_gpt = task.run(chapter_text, model="gpt-4o-mini")
 characters = task.run(chapter_text, system_prompt="Focus only on female characters.")
 ```
 
-### Task caching
+### Task caching and results
 
 Each task gets its own separate cache directory (at `data/stash/<TaskClassName>/`). This keeps results organized and means you can clear one task's cache without affecting others.
+
+You can access all cached results as a DataFrame at any time:
+
+```python
+task = CharacterTask()
+task.map(chapter_texts)    # populate the cache
+
+# Get all results as a DataFrame
+df = task.df
+print(df.head())
+```
+
+The DataFrame includes metadata columns (`model`, `temperature`, `prompt`) alongside all schema fields. For `list[Model]` schemas, each item in the list becomes its own row.
 
 ## Working with Multiple Prompts
 
@@ -319,7 +327,7 @@ responses = llm.map(
 task = CharacterTask()
 results = task.map(
     [chapter_1_text, chapter_2_text, chapter_3_text],
-    model="claude-sonnet-4-20250514",
+    model="claude-sonnet-4-6",
 )
 # results is a list of list[Character], one per chapter
 ```
@@ -348,6 +356,8 @@ df.to_csv("characters.csv", index=False)
 print(df.head())
 ```
 
+Or use the task's built-in DataFrame (see [Task caching and results](#task-caching-and-results) above).
+
 ## Caching
 
 All LLM calls are automatically cached using [HashStash](https://github.com/quadrismegistus/hashstash). The cache key is the combination of:
@@ -375,8 +385,8 @@ response = llm.generate("What is the plot of Pamela?", force=True)
 The library ships with a ready-made task for parsing messy OCR bibliography entries into structured data. This is a real-world example of the kind of work `largeliterarymodels` is designed for.
 
 ```python
-from largeliterarymodels.tasks import BibliographyTask
-import re, pandas as pd
+from largeliterarymodels.tasks import BibliographyTask, chunk_bibliography
+import pandas as pd
 
 # Load the task
 task = BibliographyTask()
@@ -385,9 +395,8 @@ task = BibliographyTask()
 with open("data/bibliography.html") as f:
     raw_html = f.read()
 
-# Split on year headings -- each chunk is one year's entries
-chunks = re.split(r'(?=<h2[^>]*>)', raw_html)
-chunks = [c.strip() for c in chunks if c.strip()]
+# Split into chunks (by year heading, max 20 entries each)
+chunks = chunk_bibliography(raw_html, max_entries=20)
 
 # Extract from all chunks (parallel, cached)
 all_entries = task.map(chunks)
@@ -395,38 +404,91 @@ all_entries = task.map(chunks)
 # Flatten and export
 flat = [entry for chunk_entries in all_entries for entry in chunk_entries]
 df = pd.DataFrame([e.model_dump() for e in flat])
-df = df.sort_values(["year", "author"]).reset_index(drop=True)
 df.to_csv("data/bibliography.csv", index=False)
 
-print(f"{len(df)} entries extracted")
-print(df[["year", "author", "title", "printer", "publisher"]].head())
+# Or use the built-in DataFrame
+df = task.df
 ```
 
-The `BibliographyEntry` schema extracts 14 fields from each entry: author, title, subtitle, year, edition, bibliographic ID, translation status, translator, printer, publisher, bookseller, and notes. See `largeliterarymodels/tasks/extract_bibliography.py` for the full schema and few-shot examples.
+The `BibliographyEntry` schema extracts fields including: author, title, subtitle, year, edition, bibliographic ID, translation status, translator, printer, publisher, bookseller, and notes. See `largeliterarymodels/tasks/extract_bibliography.py` for the full schema and few-shot examples.
 
 ### Comparing models
 
 ```python
-for model in ["claude-sonnet-4-20250514", "gpt-4o-mini", "gemini-2.5-flash"]:
+from largeliterarymodels import CLAUDE_SONNET, GPT_4O_MINI, GEMINI_FLASH
+
+for model in [CLAUDE_SONNET, GPT_4O_MINI, GEMINI_FLASH]:
     entries = task.run(chunks[0], model=model)
     print(f"{model}: {len(entries)} entries extracted")
+```
+
+## Starting Your Own Project
+
+`largeliterarymodels` is a general-purpose toolkit. For your specific research project, we recommend creating a **separate repository** that depends on it:
+
+```
+my-bibliography-project/
+    task.py                 # your Task subclass with custom schema/examples
+    data/
+        source.html         # your input data
+        output.csv          # your results
+    notebooks/
+        extract.ipynb       # your working notebook
+```
+
+Your `task.py` defines only what's specific to your project:
+
+```python
+from pydantic import BaseModel, Field
+from largeliterarymodels import Task
+
+class MyEntry(BaseModel):
+    # your custom fields here
+    ...
+
+class MyBibliographyTask(Task):
+    schema = list[MyEntry]
+    system_prompt = "Your domain-specific instructions..."
+    examples = [...]
+```
+
+Install `largeliterarymodels` in your project's environment:
+
+```bash
+pip install largeliterarymodels
+```
+
+This way your project-specific decisions (field names, few-shot examples, OCR quirks) live in their own tracked repository, separate from the general-purpose toolkit.
+
+## Model Constants
+
+For convenience, common model names are available as constants:
+
+```python
+from largeliterarymodels import (
+    CLAUDE_OPUS,    # claude-opus-4-6
+    CLAUDE_SONNET,  # claude-sonnet-4-6
+    CLAUDE_HAIKU,   # claude-haiku-4-5-20251001
+    GPT_4O,         # gpt-4o
+    GPT_4O_MINI,    # gpt-4o-mini
+    GEMINI_PRO,     # gemini-2.5-pro
+    GEMINI_FLASH,   # gemini-2.5-flash
+)
+
+llm = LLM(CLAUDE_OPUS)
 ```
 
 ## Project Structure
 
 ```
 largeliterarymodels/
-    __init__.py              # Exports: LLM, Task, check_api_keys, available_models
+    __init__.py              # Exports: LLM, Task, model constants, check_api_keys
     llm.py                   # Core LLM class: generate, extract, map, extract_map
     task.py                  # Task class: reusable extraction task definition
-    providers.py             # Direct API calls to Anthropic, OpenAI, Google (no litellm)
+    providers.py             # Direct API calls to Anthropic, OpenAI, Google
     utils.py                 # Utility functions
     tasks/
         extract_bibliography.py  # Built-in bibliography extraction task
-data/
-    stash/                   # Cached LLM responses (auto-generated)
-notebooks/
-    extract_bibliography.ipynb   # Example notebook
 tests/                       # Test suite (run with: pytest)
 ```
 

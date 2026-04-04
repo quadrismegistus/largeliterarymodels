@@ -8,7 +8,16 @@ from hashstash import HashStash
 from tqdm import tqdm
 from .providers import route_provider, check_api_keys
 
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+# Model constants
+CLAUDE_OPUS = "claude-opus-4-6"
+CLAUDE_SONNET = "claude-sonnet-4-6"
+CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
+GPT_4O = "gpt-4o"
+GPT_4O_MINI = "gpt-4o-mini"
+GEMINI_PRO = "gemini-2.5-pro"
+GEMINI_FLASH = "gemini-2.5-flash"
+
+DEFAULT_MODEL = CLAUDE_SONNET
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 4096
 STASH_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "stash")

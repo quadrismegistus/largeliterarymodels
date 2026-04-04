@@ -1,8 +1,13 @@
 """Task class: reusable structured extraction tasks with their own cache."""
 
+import json
 import os
+import pandas as pd
 from hashstash import HashStash
-from .llm import LLM, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, STASH_PATH
+from .llm import (
+    LLM, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, STASH_PATH,
+    _parse_json_response, _validate_parsed, _unwrap_schema,
+)
 
 
 class Task:
@@ -118,6 +123,47 @@ class Task:
             force=force,
             **kwargs,
         )
+
+    @property
+    def results(self):
+        """Iterate over all cached (key_dict, parsed_result) pairs.
+
+        Yields:
+            tuple: (key_dict, validated pydantic object or list thereof)
+        """
+        for key, raw in self.stash.items():
+            if not isinstance(raw, str):
+                continue
+            try:
+                parsed = _parse_json_response(raw)
+                result = _validate_parsed(parsed, self.schema)
+                yield key, result
+            except Exception:
+                continue
+
+    @property
+    def df(self):
+        """Build a DataFrame from all cached results.
+
+        For list[Model] schemas, each item becomes its own row.
+        Key metadata (model, prompt snippet, temperature) are included as columns.
+        """
+        rows = []
+        is_list, item_schema = _unwrap_schema(self.schema)
+        for key, result in self.results:
+            meta = {}
+            if isinstance(key, dict):
+                meta["model"] = key.get("model", "")
+                meta["temperature"] = key.get("temperature", "")
+                prompt = key.get("prompt", "")
+                meta["prompt"] = prompt[:200] if isinstance(prompt, str) else str(prompt)[:200]
+
+            items = result if is_list else [result]
+            for item in items:
+                row = {**meta, **item.model_dump()}
+                rows.append(row)
+
+        return pd.DataFrame(rows)
 
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.task_name!r}, schema={_schema_repr(self.schema)})"

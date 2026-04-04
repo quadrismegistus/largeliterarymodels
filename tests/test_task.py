@@ -174,7 +174,7 @@ class TestBibliographyTask:
         task = BibliographyTask()
         assert task.task_name == "BibliographyTask"
         assert task.retries == 2
-        assert task.max_tokens == 8192
+        assert task.max_tokens == 16384
 
     def test_schema_is_list(self):
         from largeliterarymodels.tasks import BibliographyTask

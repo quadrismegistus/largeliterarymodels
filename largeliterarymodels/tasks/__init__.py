@@ -1,1 +1,1 @@
-from .extract_bibliography import BibliographyTask, BibliographyEntry
+from .extract_bibliography import BibliographyTask, BibliographyEntry, chunk_bibliography

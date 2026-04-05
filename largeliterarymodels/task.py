@@ -31,6 +31,11 @@ class Task:
         task = BechdelTask()
         result = task.run(scene_text)
         results = task.map(scenes)
+
+        # with images and metadata
+        result = task.run("Extract entries from this page.",
+                          images=["page1.png"],
+                          metadata={"page": 1, "source": "mish_biblio.pdf"})
     """
 
     name = None  # defaults to class name if not set
@@ -67,7 +72,7 @@ class Task:
         )
 
     def run(self, prompt, model=None, system_prompt=None, examples=None,
-            force=False, **kwargs):
+            images=None, metadata=None, force=False, **kwargs):
         """Extract structured data from a single input.
 
         Args:
@@ -75,6 +80,8 @@ class Task:
             model: Override the default model.
             system_prompt: Override the task's system_prompt.
             examples: Override the task's few-shot examples.
+            images: List of images (file paths, bytes, or PIL Images).
+            metadata: Dict of user-defined metadata (e.g. page_number).
             force: Bypass cache.
             **kwargs: Additional arguments passed to LLM.extract().
 
@@ -89,12 +96,15 @@ class Task:
             schema=self.schema,
             system_prompt=system_prompt or self.system_prompt,
             examples=examples if examples is not None else self.examples,
+            images=images,
+            metadata=metadata,
             retries=self.retries,
             force=force,
             **kwargs,
         )
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
+            images_list=None, metadata_list=None,
             num_workers=4, force=False, **kwargs):
         """Extract structured data from multiple inputs, with parallelism.
 
@@ -103,6 +113,8 @@ class Task:
             model: Override the default model.
             system_prompt: Override the task's system_prompt.
             examples: Override the task's few-shot examples.
+            images_list: List of image lists, one per prompt (or None).
+            metadata_list: List of metadata dicts, one per prompt (or None).
             num_workers: Number of parallel threads.
             force: Bypass cache.
             **kwargs: Additional arguments passed to LLM.extract_map().
@@ -118,6 +130,8 @@ class Task:
             schema=self.schema,
             system_prompt=system_prompt or self.system_prompt,
             examples=examples if examples is not None else self.examples,
+            images_list=images_list,
+            metadata_list=metadata_list,
             num_workers=num_workers,
             retries=self.retries,
             force=force,
@@ -146,7 +160,8 @@ class Task:
         """Build a DataFrame from all cached results.
 
         For list[Model] schemas, each item becomes its own row.
-        Key metadata (model, prompt snippet, temperature) are included as columns.
+        Key metadata (model, prompt snippet, temperature) and user-defined
+        metadata are included as columns.
         """
         rows = []
         is_list, item_schema = _unwrap_schema(self.schema)
@@ -157,6 +172,11 @@ class Task:
                 meta["temperature"] = key.get("temperature", "")
                 prompt = key.get("prompt", "")
                 meta["prompt"] = prompt[:200] if isinstance(prompt, str) else str(prompt)[:200]
+                # Include user-defined metadata
+                user_meta = key.get("metadata")
+                if isinstance(user_meta, dict):
+                    for k, v in user_meta.items():
+                        meta[f"meta_{k}"] = v
 
             items = result if is_list else [result]
             for item in items:

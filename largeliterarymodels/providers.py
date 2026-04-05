@@ -2,8 +2,13 @@
 
 Each provider function takes a standard set of arguments and returns the
 response text as a string. No litellm — direct SDK calls only.
+
+Supports multimodal inputs via the `images` parameter: a list of file paths,
+bytes, or PIL Image objects.
 """
 
+import base64
+import io
 import os
 
 
@@ -39,28 +44,59 @@ def _strip_prefix(model):
     return model
 
 
-def _build_messages(prompt, system_prompt=None):
-    """Build a messages list from prompt and optional system prompt."""
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-    return messages
+def _load_image_bytes(image):
+    """Convert an image (path, bytes, or PIL Image) to (bytes, mime_type)."""
+    if isinstance(image, str):
+        # File path
+        with open(image, "rb") as f:
+            data = f.read()
+        ext = os.path.splitext(image)[1].lower()
+        mime_map = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        }
+        return data, mime_map.get(ext, "image/png")
+    elif isinstance(image, bytes):
+        return image, "image/png"
+    else:
+        # PIL Image
+        buf = io.BytesIO()
+        fmt = getattr(image, "format", "PNG") or "PNG"
+        image.save(buf, format=fmt)
+        mime = f"image/{fmt.lower()}"
+        return buf.getvalue(), mime
 
 
 def call_anthropic(prompt, model="claude-sonnet-4-20250514", system_prompt=None,
-                   temperature=0.7, max_tokens=4096, **kwargs):
+                   temperature=0.7, max_tokens=4096, images=None, **kwargs):
     """Call Anthropic's Claude API directly."""
     from anthropic import Anthropic
 
     client = Anthropic(api_key=_get_key("ANTHROPIC_API_KEY"))
     model = _strip_prefix(model)
 
+    # Build content blocks
+    if images:
+        content = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime,
+                    "data": base64.b64encode(data).decode("utf-8"),
+                },
+            })
+        content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+
     api_kwargs = dict(
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": content}],
     )
     if system_prompt:
         api_kwargs["system"] = system_prompt
@@ -70,16 +106,35 @@ def call_anthropic(prompt, model="claude-sonnet-4-20250514", system_prompt=None,
 
 
 def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,
-                temperature=0.7, max_tokens=4096, **kwargs):
+                temperature=0.7, max_tokens=4096, images=None, **kwargs):
     """Call OpenAI's API directly."""
     from openai import OpenAI
 
     client = OpenAI(api_key=_get_key("OPENAI_API_KEY"))
     model = _strip_prefix(model)
 
+    # Build content
+    if images:
+        content = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            b64 = base64.b64encode(data).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+
     response = client.chat.completions.create(
         model=model,
-        messages=_build_messages(prompt, system_prompt),
+        messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -87,9 +142,10 @@ def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,
 
 
 def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
-                temperature=0.7, max_tokens=4096, **kwargs):
+                temperature=0.7, max_tokens=4096, images=None, **kwargs):
     """Call Google's GenAI API directly."""
     from google import genai
+    from google.genai import types
 
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -98,16 +154,27 @@ def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
     client = genai.Client(api_key=api_key)
     model = _strip_prefix(model)
 
-    config = genai.types.GenerateContentConfig(
+    config = types.GenerateContentConfig(
         temperature=temperature,
         max_output_tokens=max_tokens,
     )
     if system_prompt:
         config.system_instruction = system_prompt
 
+    # Build contents
+    if images:
+        parts = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+        parts.append(types.Part.from_text(text=prompt))
+        contents = parts
+    else:
+        contents = prompt
+
     response = client.models.generate_content(
         model=model,
-        contents=prompt,
+        contents=contents,
         config=config,
     )
     return response.text

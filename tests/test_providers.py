@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import patch
 from largeliterarymodels.providers import (
     route_provider, call_anthropic, call_openai, call_google,
-    check_api_keys, _get_key, _strip_prefix, _build_messages,
+    check_api_keys, _get_key, _strip_prefix, _load_image_bytes,
 )
 
 
@@ -51,17 +51,18 @@ class TestStripPrefix:
         assert _strip_prefix("claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
 
 
-class TestBuildMessages:
-    def test_without_system(self):
-        msgs = _build_messages("hello")
-        assert msgs == [{"role": "user", "content": "hello"}]
+class TestLoadImageBytes:
+    def test_from_bytes(self):
+        data, mime = _load_image_bytes(b"\x89PNG\r\n")
+        assert data == b"\x89PNG\r\n"
+        assert mime == "image/png"
 
-    def test_with_system(self):
-        msgs = _build_messages("hello", system_prompt="be helpful")
-        assert msgs == [
-            {"role": "system", "content": "be helpful"},
-            {"role": "user", "content": "hello"},
-        ]
+    def test_from_path(self, tmp_path):
+        img_path = tmp_path / "test.jpg"
+        img_path.write_bytes(b"\xff\xd8\xff")
+        data, mime = _load_image_bytes(str(img_path))
+        assert data == b"\xff\xd8\xff"
+        assert mime == "image/jpeg"
 
 
 class TestGetKey:

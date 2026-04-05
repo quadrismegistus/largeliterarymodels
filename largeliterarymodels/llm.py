@@ -24,7 +24,7 @@ STASH_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 
 
 def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
-                   max_tokens=DEFAULT_MAX_TOKENS, **kwargs):
+                   max_tokens=DEFAULT_MAX_TOKENS, images=None, **kwargs):
     """Dispatch a prompt to the appropriate provider. Used as the cacheable function."""
     provider_fn = route_provider(model)
     return provider_fn(
@@ -33,13 +33,23 @@ def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPER
         system_prompt=system_prompt,
         temperature=temperature,
         max_tokens=max_tokens,
+        images=images,
         **kwargs,
     )
 
 
 def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
-              max_tokens=DEFAULT_MAX_TOKENS, schema_name=None):
-    """Build the dict used as a HashStash key."""
+              max_tokens=DEFAULT_MAX_TOKENS, schema_name=None, images=None,
+              metadata=None):
+    """Build the dict used as a HashStash key.
+
+    Args:
+        metadata: Optional dict of user-defined metadata (e.g. page_number,
+                  source_file). Stored in the key for retrieval via task.df
+                  but does not affect the LLM call.
+        images: Optional list of image paths. Paths are included in the key
+                for cache differentiation; the actual bytes are not stored.
+    """
     key = {
         "prompt": prompt,
         "model": model,
@@ -49,6 +59,15 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
     }
     if schema_name:
         key["schema"] = schema_name
+    if images:
+        # Store paths/identifiers for cache key differentiation
+        key["images"] = [
+            img if isinstance(img, str) else f"<bytes:{len(img)}>"
+            if isinstance(img, bytes) else f"<image:{id(img)}>"
+            for img in images
+        ]
+    if metadata:
+        key["metadata"] = metadata
     return key
 
 
@@ -173,6 +192,10 @@ class LLM:
             role: str = Field(description="Role in the narrative")
         characters = llm.extract("Describe the characters in Pamela.",
                                   schema=list[Character])
+
+        # with images
+        llm = LLM("gemini-2.5-flash")
+        text = llm.generate("Describe this page.", images=["page1.png"])
     """
 
     def __init__(self, model=DEFAULT_MODEL, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
@@ -194,7 +217,7 @@ class LLM:
         )
 
     def generate(self, prompt, system_prompt=None, temperature=None,
-                 max_tokens=None, force=False, **kwargs):
+                 max_tokens=None, images=None, metadata=None, force=False, **kwargs):
         """Generate text from the LLM, with caching.
 
         Args:
@@ -202,6 +225,8 @@ class LLM:
             system_prompt: Override instance system_prompt for this call.
             temperature: Override instance temperature for this call.
             max_tokens: Override instance max_tokens for this call.
+            images: List of images (file paths, bytes, or PIL Images).
+            metadata: Dict of user-defined metadata to store with the cache entry.
             force: If True, bypass cache and force a new generation.
             **kwargs: Additional provider-specific arguments.
 
@@ -211,7 +236,8 @@ class LLM:
         system_prompt, temperature, max_tokens = self._resolve(
             system_prompt, temperature, max_tokens,
         )
-        key = _make_key(prompt, self.model, system_prompt, temperature, max_tokens)
+        key = _make_key(prompt, self.model, system_prompt, temperature, max_tokens,
+                        images=images, metadata=metadata)
 
         if not force and key in self.stash:
             return self.stash[key]
@@ -222,13 +248,15 @@ class LLM:
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
+            images=images,
             **kwargs,
         )
         self.stash[key] = result
         return result
 
     def extract(self, prompt, schema, system_prompt=None, examples=None,
-                temperature=None, max_tokens=None, force=False, retries=1, **kwargs):
+                temperature=None, max_tokens=None, images=None, metadata=None,
+                force=False, retries=1, **kwargs):
         """Extract structured data from text using a Pydantic schema.
 
         Args:
@@ -239,6 +267,8 @@ class LLM:
                       Output can be a BaseModel instance, dict, or list thereof.
             temperature: Override instance temperature.
             max_tokens: Override instance max_tokens.
+            images: List of images (file paths, bytes, or PIL Images).
+            metadata: Dict of user-defined metadata to store with the cache entry.
             force: If True, bypass cache.
             retries: Number of retries on malformed JSON (default 1).
             **kwargs: Additional provider-specific arguments.
@@ -254,7 +284,7 @@ class LLM:
         )
         s_name = _schema_name(schema)
         key = _make_key(user_prompt, self.model, full_system, temperature, max_tokens,
-                        schema_name=s_name)
+                        schema_name=s_name, images=images, metadata=metadata)
 
         if not force and key in self.stash:
             cached = self.stash[key]
@@ -281,6 +311,7 @@ class LLM:
                 system_prompt=call_system,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                images=images,
                 **kwargs,
             )
 
@@ -299,7 +330,8 @@ class LLM:
         )
 
     def map(self, prompts, system_prompt=None, temperature=None,
-            max_tokens=None, num_workers=4, force=False, **kwargs):
+            max_tokens=None, images_list=None, metadata_list=None,
+            num_workers=4, force=False, **kwargs):
         """Generate text for multiple prompts, with caching and parallelism.
 
         Args:
@@ -307,6 +339,8 @@ class LLM:
             system_prompt: Override instance system_prompt.
             temperature: Override instance temperature.
             max_tokens: Override instance max_tokens.
+            images_list: List of image lists, one per prompt (or None).
+            metadata_list: List of metadata dicts, one per prompt (or None).
             num_workers: Number of parallel threads (default 4).
             force: If True, bypass cache and force new generations.
             **kwargs: Additional provider-specific arguments.
@@ -322,23 +356,27 @@ class LLM:
         to_compute = []
 
         for i, prompt in enumerate(prompts):
-            key = _make_key(prompt, self.model, system_prompt, temperature, max_tokens)
+            images = images_list[i] if images_list else None
+            metadata = metadata_list[i] if metadata_list else None
+            key = _make_key(prompt, self.model, system_prompt, temperature, max_tokens,
+                            images=images, metadata=metadata)
             if not force and key in self.stash:
                 results[i] = self.stash[key]
             else:
-                to_compute.append((i, prompt, key))
+                to_compute.append((i, prompt, key, images))
 
         if not to_compute:
             return results
 
         def _do_one(item):
-            i, prompt, key = item
+            i, prompt, key, images = item
             result = _call_provider(
                 prompt=prompt,
                 model=self.model,
                 system_prompt=system_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                images=images,
                 **kwargs,
             )
             self.stash[key] = result
@@ -353,7 +391,8 @@ class LLM:
         return results
 
     def extract_map(self, prompts, schema, system_prompt=None, examples=None,
-                    temperature=None, max_tokens=None, num_workers=4,
+                    temperature=None, max_tokens=None, images_list=None,
+                    metadata_list=None, num_workers=4,
                     force=False, retries=1, **kwargs):
         """Extract structured data from multiple prompts, with caching and parallelism.
 
@@ -364,6 +403,8 @@ class LLM:
             examples: Few-shot examples as list of (input_str, output) tuples.
             temperature: Override instance temperature.
             max_tokens: Override instance max_tokens.
+            images_list: List of image lists, one per prompt (or None).
+            metadata_list: List of metadata dicts, one per prompt (or None).
             num_workers: Number of parallel threads (default 4).
             force: If True, bypass cache.
             retries: Number of retries on malformed JSON (default 1).
@@ -384,25 +425,27 @@ class LLM:
         to_compute = []
 
         for i, prompt in enumerate(prompts):
+            images = images_list[i] if images_list else None
+            metadata = metadata_list[i] if metadata_list else None
             key = _make_key(prompt, self.model, full_system, temperature, max_tokens,
-                            schema_name=s_name)
+                            schema_name=s_name, images=images, metadata=metadata)
             if not force and key in self.stash:
                 cached = self.stash[key]
                 if isinstance(cached, str):
                     try:
                         results[i] = _validate_parsed(_parse_json_response(cached), schema)
                     except Exception:
-                        to_compute.append((i, prompt, key))
+                        to_compute.append((i, prompt, key, images))
                 else:
                     results[i] = cached
             else:
-                to_compute.append((i, prompt, key))
+                to_compute.append((i, prompt, key, images))
 
         if not to_compute:
             return results
 
         def _do_one(item):
-            i, prompt, key = item
+            i, prompt, key, images = item
             last_error = None
             for attempt in range(1 + retries):
                 call_prompt = prompt
@@ -418,6 +461,7 @@ class LLM:
                     system_prompt=full_system,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    images=images,
                     **kwargs,
                 )
                 try:

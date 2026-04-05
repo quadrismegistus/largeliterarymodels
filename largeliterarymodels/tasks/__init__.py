@@ -1,1 +1,2 @@
 from .extract_bibliography import BibliographyTask, BibliographyEntry, chunk_bibliography
+from .classify_genre import GenreTask, GenreClassification, format_text_for_classification

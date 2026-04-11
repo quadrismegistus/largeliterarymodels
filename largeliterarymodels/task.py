@@ -185,6 +185,22 @@ class Task:
 
         return pd.DataFrame(rows)
 
+    def annotate(self, port=8989, annotator='default', host='127.0.0.1'):
+        """Launch a web app for human annotation of this task's cached items.
+
+        The app generates form fields from the Pydantic schema, shows the
+        LLM's annotation alongside for comparison, and saves human annotations
+        to a JSONL file per annotator. A /compare page shows inter-annotator
+        agreement statistics.
+
+        Args:
+            port: Port to serve on.
+            annotator: Annotator ID (each gets their own JSONL file).
+            host: Host to bind to.
+        """
+        from .annotate import run_annotator
+        run_annotator(self, port=port, annotator=annotator, host=host)
+
     def __repr__(self):
         return f"{self.__class__.__name__}(name={self.task_name!r}, schema={_schema_repr(self.schema)})"
 

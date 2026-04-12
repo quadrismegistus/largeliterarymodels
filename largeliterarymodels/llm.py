@@ -324,9 +324,11 @@ class LLM:
                 last_error = e
                 continue
 
+        print(f"Raw response: {raw}")
         raise ValueError(
             f"Failed to extract valid {s_name} after {1 + retries} attempts. "
             f"Last error: {last_error}"
+            f"Raw response: {raw}"
         )
 
     def map(self, prompts, system_prompt=None, temperature=None,
@@ -472,6 +474,8 @@ class LLM:
                 except Exception as e:
                     last_error = e
                     continue
+            
+            print(f"Raw response: {raw}")
             raise ValueError(
                 f"Failed to extract valid {s_name} for prompt {i} after {1 + retries} attempts. "
                 f"Last error: {last_error}"

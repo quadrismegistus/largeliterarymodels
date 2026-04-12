@@ -177,6 +177,10 @@ def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
         contents=contents,
         config=config,
     )
+    print("--------------------------------")
+    print(response.candidates[0].finish_reason)  # SAFETY? MAX_TOKENS? STOP?                      
+    print(response.text) 
+    print("--------------------------------")
     return response.text
 
 

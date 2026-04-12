@@ -184,6 +184,13 @@ class PassageAnnotation(BaseModel):
         "Words like: sword, door, rain, teeth, dress, carriage, mud, blood. "
         "Choose words that are characteristic of the passage's physical world."
     )
+    passage_summary: str = Field(
+        description="1-2 sentence summary of what happens in this passage. "
+        "Focus on the action, situation, or argument — who does what, where, why. "
+        "Be specific enough to locate the passage in the plot (e.g. 'Pamela hides "
+        "in the closet as Mr. B attempts to assault her; Mrs. Jervis intervenes' "
+        "not 'a tense scene between characters'). Include character names."
+    )
     confidence: float = Field(
         description="Overall confidence in the annotation, 0.0 to 1.0. "
         "Lower if the passage is ambiguous, fragmentary, or difficult to classify."
@@ -275,6 +282,9 @@ EXAMPLES = [
             abs_conc_tendency="predominantly_abstract",
             key_abstractions=["elegance", "taste", "propriety", "caution", "politeness"],
             key_concretions=["shooting-jacket", "house"],
+            passage_summary="Willoughby is introduced after carrying Marianne into the house; "
+            "Marianne is immediately charmed by his manner while Elinor judges his character "
+            "more cautiously, noting his want of propriety.",
             confidence=0.95,
             reasoning="Willoughby is introduced almost entirely through abstract social "
             "qualities — 'elegance,' 'understanding,' 'taste' — with the 'shooting-jacket' "
@@ -312,6 +322,9 @@ EXAMPLES = [
             abs_conc_tendency="predominantly_concrete",
             key_abstractions=["cunning", "deceit"],
             key_concretions=["chest", "bread", "mice", "crumbs", "cloths"],
+            passage_summary="Lazaro, left alone and starving, devises a scheme to steal bread "
+            "from his master's locked chest by picking at the loaf and scattering crumbs to "
+            "simulate mouse damage.",
             confidence=0.9,
             reasoning="Classic picaresque concreteness: Lazaro's hunger drives a minute, "
             "step-by-step account of physical objects — chest, bread, crumbs, cloths — "
@@ -351,6 +364,9 @@ EXAMPLES = [
             abs_conc_tendency="predominantly_concrete",
             key_abstractions=["property"],
             key_concretions=["bones", "rags", "cobwebs", "bottles", "parchments"],
+            passage_summary="Krook the rag-and-bone dealer is introduced through a detailed "
+            "description of his body and shop, both composed of the same decaying materials — "
+            "rags, bones, cobwebs, old papers.",
             confidence=0.95,
             reasoning="Krook is introduced through pure materiality — his body and shop "
             "are indistinguishable, both heaps of 'bones, rags, odds-and-ends.' The passage "
@@ -388,6 +404,9 @@ EXAMPLES = [
             abs_conc_tendency="predominantly_abstract",
             key_abstractions=["Insinuations", "Tendernesses", "Desire", "Vigour", "Rapture"],
             key_concretions=["Chairs", "Lodgings"],
+            passage_summary="Dorimenus seduces a young widow he has just met at a masquerade; "
+            "the encounter and sexual consummation are narrated entirely through abstract "
+            "nominalizations and mythological circumlocution.",
             confidence=0.9,
             reasoning="A paradigm of abstract realism via nominalization. Dorimenus' seduction "
             "is never shown — only 'those Insinuations,' 'those melting Tendernesses,' "
@@ -428,6 +447,9 @@ EXAMPLES = [
             abs_conc_tendency="concrete_punctuated",
             key_abstractions=["Despond", "happiness", "burden"],
             key_concretions=["Slough", "mire", "dirt", "bog"],
+            passage_summary="Christian and Pliable fall into the Slough of Despond; Pliable, "
+            "disgusted by the difficulty, struggles out and abandons Christian, who sinks "
+            "under his burden.",
             confidence=0.95,
             reasoning="The Slough of Despond is the paradigmatic allegory of the symbol: "
             "a concrete place (miry bog, dirt, sinking) that directly encodes an abstract "
@@ -464,7 +486,7 @@ class PassageTask(Task):
     examples = EXAMPLES
     retries = 2
     temperature = 0.2
-    max_tokens = 4096
+    max_tokens = 8192
 
 
 # ── Helper functions ──────────────────────────────────────────────────────

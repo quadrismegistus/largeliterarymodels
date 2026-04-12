@@ -467,7 +467,7 @@ This way your project-specific decisions (field names, few-shot examples, OCR qu
 
 ## Using with LLTK
 
-The library includes tasks designed for literary analysis with [LLTK](https://github.com/quadrismegistus/lltk) corpora. Install with `pip install "largeliterarymodels[lltk]"`.
+The library includes tasks designed for literary analysis with [LLTK](https://github.com/quadrismegistus/lltk) (Literary Language Toolkit), which provides 50+ literary corpora, cross-corpus deduplication, and DuckDB-backed metadata. Install together with `pip install "largeliterarymodels[lltk]"`, or install LLTK separately with `pip install lltk-dh`.
 
 ### Genre classification
 

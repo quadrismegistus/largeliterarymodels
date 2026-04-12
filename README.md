@@ -20,6 +20,7 @@ A Python toolkit for using Large Language Models (LLMs) to produce structured, a
 - [Caching](#caching)
 - [Example: Bibliography Extraction](#example-bibliography-extraction)
 - [Starting Your Own Project](#starting-your-own-project)
+- [Using with LLTK](#using-with-lltk)
 - [Model Constants](#model-constants)
 - [Project Structure](#project-structure)
 
@@ -43,13 +44,17 @@ The simplest way to install:
 pip install largeliterarymodels
 ```
 
-This installs `largeliterarymodels` and all its dependencies (the Anthropic, OpenAI, and Google AI client libraries, plus [HashStash](https://github.com/quadrismegistus/hashstash) for caching).
+This installs `largeliterarymodels` and all its dependencies: the Anthropic, OpenAI, and Google AI client libraries, [pydantic](https://docs.pydantic.dev/) for structured data extraction, and [HashStash](https://github.com/quadrismegistus/hashstash) for caching.
 
-To also install [pydantic](https://docs.pydantic.dev/) for structured data extraction (recommended):
+### Install with LLTK (for literary corpus analysis)
+
+To use the built-in literary analysis tasks (genre classification, character networks, Frye mode analysis) with [LLTK](https://github.com/quadrismegistus/lltk) corpora:
 
 ```bash
-pip install "largeliterarymodels[pydantic]"
+pip install "largeliterarymodels[lltk]"
 ```
+
+This adds [lltk-dh](https://pypi.org/project/lltk-dh/), which provides 50+ literary corpora, cross-corpus matching, and DuckDB-backed metadata. See [Using with LLTK](#using-with-lltk) below.
 
 ### Install from source (for development)
 
@@ -459,6 +464,63 @@ pip install largeliterarymodels
 ```
 
 This way your project-specific decisions (field names, few-shot examples, OCR quirks) live in their own tracked repository, separate from the general-purpose toolkit.
+
+## Using with LLTK
+
+The library includes tasks designed for literary analysis with [LLTK](https://github.com/quadrismegistus/lltk) corpora. Install with `pip install "largeliterarymodels[lltk]"`.
+
+### Genre classification
+
+Classify texts by genre from title/author metadata:
+
+```python
+from largeliterarymodels.tasks import GenreTask, format_text_for_classification
+
+task = GenreTask()
+prompt = format_text_for_classification(title="Pamela", author_norm="richardson", year=1740)
+result = task.run(prompt)
+print(result.genre, result.genre_raw, result.confidence)
+# Fiction Novel, Epistolary fiction 1.0
+```
+
+### Character resolution (BookNLP cleanup)
+
+BookNLP's NER is noisy on early modern texts. This task merges fragmented character clusters and filters noise:
+
+```python
+import lltk
+from largeliterarymodels.tasks import CharacterTask, format_character_roster
+
+t = lltk.load('chadwyck').text('Eighteenth-Century_Fiction/fieldinh.06')  # Tom Jones
+t.booknlp.parse()  # run BookNLP first
+
+task = CharacterTask()
+prompt = format_character_roster(t, max_chars=30)
+results = task.run(prompt)  # returns list[CharacterResolution]
+for r in results:
+    if r.type == 'character':
+        print(f"{r.name}: {r.ids}")
+# Tom Jones: ['C822', 'C625', 'C491']
+# Sophia Western: ['C821', 'C888', 'C4113']
+```
+
+Or use the LLTK wrapper directly:
+
+```python
+t.booknlp.resolve_characters()   # runs CharacterTask, saves JSON
+t.booknlp.plot_network()         # co-mention network visualization
+```
+
+### Available tasks
+
+| Task | Input | Output |
+|------|-------|--------|
+| `GenreTask` | Title/author metadata | Genre, subgenre, translation status |
+| `FryeTask` | Text passages (opening/middle/closing) | Frye mode, mythos, referential mode |
+| `PassageTask` | ~1K-word passages | Scene type, narration mode, allegorical regime |
+| `CharacterTask` | BookNLP character roster | Merged/cleaned character list |
+| `CharacterIntroTask` | Character first-mention passages | Introduction mode, social class, interiority |
+| `BibliographyTask` | OCR bibliography pages | Structured bibliography entries |
 
 ## Model Constants
 

@@ -4,7 +4,7 @@ import os
 import pytest
 from unittest.mock import patch
 from largeliterarymodels.providers import (
-    route_provider, call_anthropic, call_openai, call_google,
+    route_provider, call_anthropic, call_openai, call_google, call_local,
     check_api_keys, _get_key, _strip_prefix, _load_image_bytes,
 )
 
@@ -27,6 +27,12 @@ class TestRouteProvider:
         assert route_provider("gemini-2.5-pro") is call_google
         assert route_provider("google/gemini-pro") is call_google
 
+    def test_local_models(self):
+        assert route_provider("local/llama3.3") is call_local
+        assert route_provider("ollama/qwen3:14b") is call_local
+        assert route_provider("vllm/qwen2.5-32b") is call_local
+        assert route_provider("lmstudio/gemma-27b") is call_local
+
     def test_unknown_model_raises(self):
         with pytest.raises(ValueError, match="Cannot determine provider"):
             route_provider("llama-3.1-70b")
@@ -46,6 +52,12 @@ class TestStripPrefix:
 
     def test_google_prefix(self):
         assert _strip_prefix("google/gemini-pro") == "gemini-pro"
+
+    def test_local_prefixes(self):
+        assert _strip_prefix("local/llama3.3") == "llama3.3"
+        assert _strip_prefix("ollama/qwen3:14b") == "qwen3:14b"
+        assert _strip_prefix("vllm/qwen2.5-32b") == "qwen2.5-32b"
+        assert _strip_prefix("lmstudio/gemma-27b") == "gemma-27b"
 
     def test_no_prefix(self):
         assert _strip_prefix("claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"

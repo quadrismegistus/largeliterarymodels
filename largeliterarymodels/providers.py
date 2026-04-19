@@ -22,6 +22,8 @@ def _get_key(env_var):
 def route_provider(model):
     """Return the appropriate provider function for a model string."""
     model_lower = model.lower()
+    if model_lower.startswith(("local/", "ollama/", "vllm/", "lmstudio/")):
+        return call_local
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
         return call_anthropic
     elif "gpt" in model_lower or "o1" in model_lower or "o3" in model_lower or model_lower.startswith("openai/"):
@@ -32,13 +34,14 @@ def route_provider(model):
         raise ValueError(
             f"Cannot determine provider for model '{model}'. "
             f"Model name should contain 'claude', 'gpt', or 'gemini', "
-            f"or use a prefix like 'anthropic/', 'openai/', or 'google/'."
+            f"or use a prefix like 'anthropic/', 'openai/', 'google/', or 'local/'."
         )
 
 
 def _strip_prefix(model):
     """Remove provider prefix like 'anthropic/' or 'openai/' from model name."""
-    for prefix in ("anthropic/", "openai/", "google/"):
+    for prefix in ("anthropic/", "openai/", "google/",
+                   "local/", "ollama/", "vllm/", "lmstudio/"):
         if model.lower().startswith(prefix):
             return model[len(prefix):]
     return model
@@ -178,10 +181,67 @@ def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
         config=config,
     )
     print("--------------------------------")
-    print(response.candidates[0].finish_reason)  # SAFETY? MAX_TOKENS? STOP?                      
-    print(response.text) 
+    print(response.candidates[0].finish_reason)  # SAFETY? MAX_TOKENS? STOP?
+    print(response.text)
     print("--------------------------------")
     return response.text
+
+
+def call_local(prompt, model="llama3.3", system_prompt=None,
+               temperature=0.7, max_tokens=4096, images=None, **kwargs):
+    """Call a local OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp server).
+
+    Defaults to Ollama at http://localhost:11434/v1. Override by setting
+    LOCAL_BASE_URL in the environment. No API key required; the OpenAI SDK
+    needs a non-empty string so we pass 'local'.
+
+    Quality caveat: open-weight models are meaningfully below API-tier Claude
+    and GPT for structured extraction with multilingual content, specialist
+    literary knowledge, and strict JSON compliance. Treat as a complement
+    (validation passes, dev iteration, cost-free experimentation) rather than
+    a drop-in replacement for GenreTask / TranslationTask / PassageTask.
+    """
+    from openai import OpenAI
+
+    base_url = os.getenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
+    client = OpenAI(api_key="local", base_url=base_url)
+    model = _strip_prefix(model)
+
+    if images:
+        content = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            b64 = base64.b64encode(data).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "connection" in msg or "refused" in msg or "econnrefused" in msg:
+            raise RuntimeError(
+                f"Local inference server at {base_url} is not reachable. "
+                f"Is Ollama (or vLLM / LM Studio) running? "
+                f"Override via LOCAL_BASE_URL env if using a different host/port."
+            ) from e
+        raise
+    return response.choices[0].message.content
 
 
 def check_api_keys(verbose=False):

@@ -18,6 +18,7 @@ A Python toolkit for using Large Language Models (LLMs) to produce structured, a
 - [Defining a Task](#defining-a-task)
 - [Working with Multiple Prompts](#working-with-multiple-prompts)
 - [Caching](#caching)
+- [Using local models (Ollama, vLLM, LM Studio)](#using-local-models-ollama-vllm-lm-studio)
 - [Example: Bibliography Extraction](#example-bibliography-extraction)
 - [Starting Your Own Project](#starting-your-own-project)
 - [Using with LLTK](#using-with-lltk)
@@ -384,6 +385,41 @@ Cache is stored in `data/stash/` inside the repository. To force a fresh generat
 ```python
 response = llm.generate("What is the plot of Pamela?", force=True)
 ```
+
+## Using local models (Ollama, vLLM, LM Studio)
+
+Any OpenAI-compatible local inference server works by using one of the local prefixes:
+
+```python
+from largeliterarymodels import LLM
+llm = LLM(model="local/llama3.3")  # or "ollama/mistral", "vllm/qwen2.5", "lmstudio/..."
+response = llm.generate("Translate 'freedom' to German.")
+```
+
+By default, `largeliterarymodels` points at Ollama's usual endpoint (`http://localhost:11434/v1`). Override by setting `LOCAL_BASE_URL` in the environment (e.g. a different port, a remote vLLM host, or LM Studio on a LAN box).
+
+```bash
+export LOCAL_BASE_URL="http://localhost:8000/v1"   # vLLM default
+export LOCAL_BASE_URL="http://192.168.1.50:11434/v1"  # remote Ollama
+```
+
+The local provider reuses the OpenAI SDK, so any inference server that speaks the OpenAI chat-completions protocol (Ollama, vLLM, LM Studio, llama.cpp server, SGLang, Together's self-host mode) will work without further config.
+
+**Thinking / reasoning mode**. Ollama's reasoning models (Qwen 3, DeepSeek R1, Gemma 4) expose a `think: true|false` toggle on their native `/api/chat` endpoint, with chain-of-thought returned in a separate `message.thinking` field. This library's `call_local` goes through the OpenAI-compatible `/v1/chat/completions` endpoint, which does **not** accept the `think` parameter — so by default, reasoning models run in their no-think mode when invoked via `LLM(model="ollama/qwen3:14b")`. In practice, empirical testing on TranslationTask and GenreTask shows no-think mode is both faster (10–20x) and produces more reliably-parsed JSON than thinking mode; thinking responses under a tight `num_predict` budget silently return empty content. If you specifically need chain-of-thought output from a local model, POST directly to `http://localhost:11434/api/chat` with `{"think": true, "options": {"num_predict": 8192}}` rather than using the `LLM` class.
+
+**Quality caveat.** Open-weight models are meaningfully below API-tier Claude and GPT on the workloads this library is built for:
+
+- **Structured JSON compliance**: small open models produce malformed JSON more often; retries compound at batch scale.
+- **Specialist literary knowledge**: `GenreTask`/`FryeTask`/`PassageTask` rely on recognition of specific early-modern works and authors. Open models under 70B rarely have the coverage.
+- **Multilingual nuance**: Llama 3.3 70B's German/French translation quality is noticeably below Haiku 4.5 on `TranslationTask`-shaped prompts.
+
+Treat local models as complements rather than drop-in replacements:
+
+- **Validation / redundancy passes**: back-translation checks, cross-model agreement tests — the different model family is an asset.
+- **Development and iteration**: draft prompts, debug schemas, run regression tests without burning API credits.
+- **New tasks where quality tolerance is high**: initial exploration, rough-cut classification at scale.
+
+Don't swap a validated Haiku/Sonnet pipeline to a local model as a pure cost optimization — the quality drop will usually show up in the output.
 
 ## Example: Bibliography Extraction
 

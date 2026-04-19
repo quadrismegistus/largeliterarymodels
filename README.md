@@ -386,6 +386,46 @@ Cache is stored in `data/stash/` inside the repository. To force a fresh generat
 response = llm.generate("What is the plot of Pamela?", force=True)
 ```
 
+### Provider-side prompt caching
+
+On top of local HashStash caching, `largeliterarymodels` also turns on **provider-side prompt caching** where the API supports it. For long Task system prompts (which include few-shot examples), this cuts input cost ~10x on repeat calls within a single batch — Anthropic's default 5-minute cache window covers typical `task.map()` workloads.
+
+- **Anthropic**: enabled automatically. `providers.call_anthropic` marks the system field with `cache_control: {type: "ephemeral"}` on every call. Cache hits bill at ~10% of input rate.
+- **OpenAI**: automatic on the API side; no client-side change needed. Hits above 1024 tokens bill at ~50% of input rate.
+- **Gemini**: explicit context caching exists (`client.caches.create`) but the minimum of ~32K tokens makes it irrelevant for Task-sized system prompts. Not implemented.
+
+**Caching thresholds are model-specific — and higher than the docs claim.** Empirically verified (April 2026):
+
+| Model | Docs say | Reality (caches at ≥) |
+|---|---|---|
+| Claude Sonnet 4.6 | 1024 | ~2048 tokens |
+| Claude Haiku 4.5 | 1024 | **~6000 tokens** |
+| Claude Opus 4.7 | 1024 | ~2048 (assumed by analogy) |
+| GPT-4o family | 1024 | 1024 (automatic) |
+
+Below the threshold, the `cache_control` marker is silently ignored — no error, just no cache. **This matters most for cost-optimized Haiku batches**: a Task whose system prompt fits in 3–4K tokens will cache cleanly on Sonnet but not on Haiku, and 27K calls at Haiku-uncached pricing is ~$70, not the $5-10 a naive Haiku estimate suggests.
+
+Auditing a Task's system prompt size:
+
+```python
+import tiktoken
+from largeliterarymodels.llm import _build_extract_prompt
+from largeliterarymodels.tasks import TranslationTask
+
+t = TranslationTask()
+full_system, _ = _build_extract_prompt(
+    prompt="", schema=t.schema,
+    system_prompt=t.system_prompt, examples=t.examples,
+)
+n = len(tiktoken.get_encoding("cl100k_base").encode(full_system))
+# tiktoken undercounts ~18% vs Anthropic's tokenizer.
+# Safe caching margins:
+#   Sonnet/Opus: n ≥ 2400 tiktoken (~2800 Anthropic)
+#   Haiku:       n ≥ 5500 tiktoken (~6500 Anthropic)
+```
+
+Of the built-in tasks, as of April 2026: `GenreTask`, `FryeTask`, `PassageTask`, `CharacterIntroTask`, and `TranslationTask` cache on Sonnet/Opus. Only `PassageTask` currently crosses the Haiku threshold. If you plan a high-volume Haiku run with a different task, consider expanding its `examples` list with genuinely useful additions until it crosses 6K tokens.
+
 ## Using local models (Ollama, vLLM, LM Studio)
 
 Any OpenAI-compatible local inference server works by using one of the local prefixes:

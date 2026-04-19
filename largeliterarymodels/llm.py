@@ -1,12 +1,15 @@
 """Core LLM class: unified interface for text generation with HashStash caching."""
 
 import json
+import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashstash import HashStash
 from tqdm import tqdm
 from .providers import route_provider, check_api_keys
+
+log = logging.getLogger(__name__)
 
 # Model constants
 CLAUDE_OPUS = "claude-opus-4-6"
@@ -298,6 +301,10 @@ class LLM:
                 call_system = full_system
                 call_prompt = user_prompt
             else:
+                log.warning(
+                    "extract retry %d/%d for %s (model=%s): %s",
+                    attempt, retries, s_name, self.model, last_error,
+                )
                 call_system = full_system
                 call_prompt = (
                     f"Your previous response was not valid JSON. "
@@ -366,6 +373,13 @@ class LLM:
                 results[i] = self.stash[key]
             else:
                 to_compute.append((i, prompt, key, images))
+
+        total = len(prompts)
+        fresh = len(to_compute)
+        cached = total - fresh
+        if total >= 10:
+            log.info("generate_map: %d/%d cached, %d API calls needed (model=%s)",
+                     cached, total, fresh, self.model)
 
         if not to_compute:
             return results
@@ -443,6 +457,25 @@ class LLM:
             else:
                 to_compute.append((i, prompt, key, images))
 
+        total = len(prompts)
+        fresh = len(to_compute)
+        n_cached = total - fresh
+        if total >= 10:
+            log.info("extract_map: %d/%d cached, %d API calls needed (model=%s)",
+                     n_cached, total, fresh, self.model)
+            if n_cached == 0 and fresh >= 100:
+                try:
+                    has_old_entries = next(iter(self.stash.items()), None) is not None
+                except Exception:
+                    has_old_entries = False
+                if has_old_entries:
+                    log.warning(
+                        "extract_map: 0/%d cached despite existing entries in %s's stash. "
+                        "System prompt, examples, schema, temperature, or max_tokens may "
+                        "have changed since the last run — previous cache keys are unreachable.",
+                        total, s_name,
+                    )
+
         if not to_compute:
             return results
 
@@ -452,6 +485,10 @@ class LLM:
             for attempt in range(1 + retries):
                 call_prompt = prompt
                 if attempt > 0:
+                    log.warning(
+                        "extract_map retry %d/%d for prompt %d (model=%s): %s",
+                        attempt, retries, i, self.model, last_error,
+                    )
                     call_prompt = (
                         f"Your previous response was not valid JSON. "
                         f"Return ONLY valid JSON matching the schema, nothing else.\n\n"

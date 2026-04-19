@@ -98,11 +98,21 @@ def call_anthropic(prompt, model="claude-sonnet-4-20250514", system_prompt=None,
     api_kwargs = dict(
         model=model,
         max_tokens=max_tokens,
-        temperature=temperature,
         messages=[{"role": "user", "content": content}],
     )
+    # claude-opus-4-7 and later deprecate `temperature`; skip when unsupported.
+    if temperature is not None and 'opus-4-7' not in model:
+        api_kwargs["temperature"] = temperature
+    # Mark system (which includes few-shot examples per llm._build_extract_prompt)
+    # as cacheable. Task batches reuse the same system across hundreds-to-thousands
+    # of calls; the per-call user message is tiny. Caching cuts input cost ~10x on
+    # cache hits. Below the model's cache threshold Anthropic silently skips.
     if system_prompt:
-        api_kwargs["system"] = system_prompt
+        api_kwargs["system"] = [{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }]
 
     response = client.messages.create(**api_kwargs)
     return response.content[0].text
@@ -180,10 +190,6 @@ def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
         contents=contents,
         config=config,
     )
-    print("--------------------------------")
-    print(response.candidates[0].finish_reason)  # SAFETY? MAX_TOKENS? STOP?
-    print(response.text)
-    print("--------------------------------")
     return response.text
 
 

@@ -2,14 +2,8 @@
 
 from pydantic import BaseModel, Field
 from typing import Optional
+from lltk.tools.vocabs import GENRE_VOCAB
 from largeliterarymodels.task import Task
-
-
-GENRE_VOCAB = [
-    'Fiction', 'Poetry', 'Drama', 'Periodical', 'Essay', 'Treatise',
-    'Letters', 'Sermon', 'Biography', 'History', 'Nonfiction', 'Legal',
-    'Speech', 'Criticism', 'Academic', 'Almanac', 'Reference',
-]
 
 GENRE_RAW_EXAMPLES = [
     'Novel', 'Romance', 'Romance, chivalric', 'Romance, heroic',
@@ -26,7 +20,7 @@ GENRE_RAW_EXAMPLES_STR = "; ".join([f"{x}" for x in GENRE_RAW_EXAMPLES])
 
 class GenreClassification(BaseModel):
     genre: str = Field(
-        description=f"Broad genre category. One of: {', '.join(GENRE_VOCAB)}. "
+        description=f"Broad genre category. One of: {', '.join(sorted(GENRE_VOCAB))}. "
         "Use 'Fiction' for prose fiction (novels, romances, tales, etc.). "
         "Use 'Poetry' for verse. Use 'Drama' for plays. "
         "Use 'Nonfiction' if it doesn't fit any specific nonfiction category."

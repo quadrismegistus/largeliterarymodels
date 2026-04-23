@@ -1,0 +1,83 @@
+"""largeliterarymodels.analysis — CH-backed cross-task discrimination analysis.
+
+Reads passage annotations from ClickHouse (llmtasks.passage_annotations), joins
+across tasks on (_id, scheme, seq), builds boolean feature matrices via
+schema-introspection, and runs Fisher-exact discrimination with BH-FDR.
+
+The statistical engine (fisher_tests + bh_fdr + group_matrix) is a temporary
+stand-in here. When lltk publishes `lltk.analysis.stats`, the imports in
+`stats.py` will swap to `from lltk.analysis.stats import ...` and the local
+implementations get deleted.
+
+Public API:
+    from largeliterarymodels.analysis import (
+        joint_feature_matrix, passage_groups,
+        fisher_tests, bh_fdr,  # will be lltk.analysis.stats later
+    )
+
+Example:
+    feats = joint_feature_matrix(
+        tasks=['passage-content', 'passage-form'],
+        task_versions={'passage-content': 3, 'passage-form': 1},
+    )
+    groups = passage_groups(feats.index, include_halfcent=True)
+    results = fisher_tests(feats, groups)
+    results['q_value'] = bh_fdr(results['p_value'])
+"""
+
+from .adapters import wide_to_features, classify_schema_fields
+from .features import (
+    build_feature_matrix,
+    fit_partition_model,
+    load_genre_extras,
+    period_dummies,
+    DEFAULT_ORDINAL_ENCODINGS,
+)
+from .groups import passage_groups
+from .reader import joint_feature_matrix, load_task_annotations
+from .registry import TASK_REGISTRY, register_task, resolve_task_class
+from .reliability import (
+    audit_disagrees_with_reference,
+    flagged_for_audit,
+    load_agent_annotations,
+    majority_consensus,
+    pairwise_agreement,
+    per_field_trust,
+    write_consensus,
+)
+from .propagate import (
+    evaluate_classifiers, calibrate_thresholds, predict_all, write_propagated,
+)
+from .stats import bh_fdr, fisher_tests, group_matrix
+
+__all__ = [
+    'joint_feature_matrix',
+    'load_task_annotations',
+    'passage_groups',
+    'wide_to_features',
+    'classify_schema_fields',
+    'build_feature_matrix',
+    'fit_partition_model',
+    'load_genre_extras',
+    'period_dummies',
+    'DEFAULT_ORDINAL_ENCODINGS',
+    'TASK_REGISTRY',
+    'register_task',
+    'resolve_task_class',
+    'fisher_tests',
+    'bh_fdr',
+    'group_matrix',
+    # propagation
+    'evaluate_classifiers',
+    'calibrate_thresholds',
+    'predict_all',
+    'write_propagated',
+    # reliability / ensemble consensus
+    'load_agent_annotations',
+    'per_field_trust',
+    'pairwise_agreement',
+    'majority_consensus',
+    'flagged_for_audit',
+    'audit_disagrees_with_reference',
+    'write_consensus',
+]

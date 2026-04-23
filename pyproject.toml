@@ -30,9 +30,14 @@ Homepage = "https://github.com/quadrismegistus/largeliterarymodels"
 Repository = "https://github.com/quadrismegistus/largeliterarymodels"
 Issues = "https://github.com/quadrismegistus/largeliterarymodels/issues"
 
+[project.scripts]
+litmod = "largeliterarymodels.cli.main:main"
+
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
 lltk = ["lltk-dh"]
+annotate = ["fh-pydantic-form>=0.3", "uvicorn"]
+analysis = ["scipy>=1.9", "numpy", "pandas"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}

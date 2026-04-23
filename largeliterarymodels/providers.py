@@ -154,7 +154,7 @@ def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,
     return response.choices[0].message.content
 
 
-def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
+def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None, **kwargs):
     """Call Google's GenAI API directly."""
     from google import genai
@@ -193,13 +193,60 @@ def call_google(prompt, model="gemini-2.5-flash", system_prompt=None,
     return response.text
 
 
+_LOCAL_BACKEND_DEFAULTS = {
+    "ollama":   "http://localhost:11434/v1",
+    "lmstudio": "http://localhost:1234/v1",
+    "vllm":     "http://localhost:8000/v1",
+    # "local/" has no canonical backend; falls through to LOCAL_BASE_URL
+    # or Ollama's port as the final default.
+}
+
+
+def _resolve_local_base_url(model: str) -> str:
+    """Pick the base URL for a local/OSS model string.
+
+    Priority:
+      1. Per-backend env override (OLLAMA_BASE_URL, LMSTUDIO_BASE_URL, VLLM_BASE_URL)
+      2. LOCAL_BASE_URL (legacy global override)
+      3. Per-backend default (lmstudio→1234, ollama→11434, vllm→8000)
+      4. Ollama default as final fallback
+
+    The routing is prefix-pinned so `lmstudio/...` always hits LM Studio and
+    `ollama/...` always hits Ollama, even when both servers are running.
+    """
+    prefix = None
+    model_lower = model.lower()
+    for p in _LOCAL_BACKEND_DEFAULTS:
+        if model_lower.startswith(p + "/"):
+            prefix = p
+            break
+
+    if prefix:
+        per_backend = os.getenv(f"{prefix.upper()}_BASE_URL")
+        if per_backend:
+            return per_backend
+
+    global_override = os.getenv("LOCAL_BASE_URL")
+    if global_override:
+        return global_override
+
+    if prefix and _LOCAL_BACKEND_DEFAULTS.get(prefix):
+        return _LOCAL_BACKEND_DEFAULTS[prefix]
+
+    return "http://localhost:11434/v1"
+
+
 def call_local(prompt, model="llama3.3", system_prompt=None,
                temperature=0.7, max_tokens=4096, images=None, **kwargs):
     """Call a local OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp server).
 
-    Defaults to Ollama at http://localhost:11434/v1. Override by setting
-    LOCAL_BASE_URL in the environment. No API key required; the OpenAI SDK
-    needs a non-empty string so we pass 'local'.
+    Routing is prefix-pinned: `lmstudio/<model>` always hits LM Studio (port
+    1234), `ollama/<model>` always hits Ollama (11434), `vllm/<model>` always
+    hits vLLM (8000). Override any of them with the corresponding
+    `<BACKEND>_BASE_URL` env var. `LOCAL_BASE_URL` still works as a global
+    override that wins over the per-backend defaults.
+
+    No API key required; the OpenAI SDK needs a non-empty string so we pass 'local'.
 
     Quality caveat: open-weight models are meaningfully below API-tier Claude
     and GPT for structured extraction with multilingual content, specialist
@@ -209,7 +256,7 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     """
     from openai import OpenAI
 
-    base_url = os.getenv("LOCAL_BASE_URL", "http://localhost:11434/v1")
+    base_url = _resolve_local_base_url(model)
     client = OpenAI(api_key="local", base_url=base_url)
     model = _strip_prefix(model)
 
@@ -231,20 +278,38 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": content})
 
+    # Disable thinking mode for qwen3.5+ which defaults to reasoning — otherwise
+    # max_tokens gets burned in `reasoning_content` leaving empty `content`. The
+    # OpenAI-compat layer forwards this to Qwen's chat template.
+    extra_body = {"cache_prompt": True}
+    effective_max = max_tokens
+    model_lower = model.lower()
+    if "qwen" in model_lower:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    # Clamp max_tokens for big local models. Raised from 1024 → 2048 after
+    # observing llama-3.1-70b produce JSON-schema envelopes that balloon output
+    # tokens (each field wrapped as {type, title, description, value}). For
+    # multi-field schemas (20+ fields), 1024 truncates mid-response. 2048 is
+    # still conservative vs 16K context.
+    if any(tag in model_lower for tag in ("qwen", "llama-3", "llama3", "gemma-4-31", "gemma4:31")):
+        effective_max = min(max_tokens, 2048)
+
     try:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=effective_max,
+            extra_body=extra_body or None,
         )
     except Exception as e:
         msg = str(e).lower()
         if "connection" in msg or "refused" in msg or "econnrefused" in msg:
             raise RuntimeError(
                 f"Local inference server at {base_url} is not reachable. "
-                f"Is Ollama (or vLLM / LM Studio) running? "
-                f"Override via LOCAL_BASE_URL env if using a different host/port."
+                f"Is the expected backend running? Override via "
+                f"OLLAMA_BASE_URL / LMSTUDIO_BASE_URL / VLLM_BASE_URL / "
+                f"LOCAL_BASE_URL env if using a different host/port."
             ) from e
         raise
     return response.choices[0].message.content

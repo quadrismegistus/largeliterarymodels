@@ -50,6 +50,7 @@ class Task:
         for k, v in kwargs.items():
             setattr(self, k, v)
         self._stash = None
+        self._human_stashes = {}
 
     @property
     def task_name(self):
@@ -62,10 +63,39 @@ class Task:
             self._stash = HashStash(stash_dir, engine="pairtree", append_mode=True)
         return self._stash
 
+    def human_stash(self, annotator: str = 'default'):
+        """JSONL-backed stash for human annotations by this annotator.
+
+        Uses hashstash flat mode: each write appends a plain-JSON line with
+        dict fields inlined at top level (greppable, jq-queryable). Append-
+        only on disk (full edit history preserved); reads return the latest
+        value per key.
+
+        Usage:
+            stash = task.human_stash('ryan')
+            stash[item_key] = {'field1': True, ...}   # append edit
+            stash[item_key]                            # latest dict for key
+            stash.items()                              # {key: latest_value}
+            stash.df                                   # all history as DataFrame
+
+        Files live under data/stash/_human_annotations/<task>/<annotator>/
+        jsonl.hashstash.raw/data.jsonl.
+        """
+        if annotator not in self._human_stashes:
+            root = os.path.join(
+                STASH_PATH, '_human_annotations', self.task_name, annotator,
+            )
+            # hashstash >= 0.4 defaults jsonl engine to flat/raw/no-b64 —
+            # no flags needed.
+            self._human_stashes[annotator] = HashStash(
+                root_dir=root, engine='jsonl',
+            )
+        return self._human_stashes[annotator]
+
     def _get_llm(self, model=None):
         """Get an LLM instance using this task's stash."""
         return LLM(
-            model=model or DEFAULT_MODEL,
+            model=model or getattr(self, 'model', None) or DEFAULT_MODEL,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stash=self.stash,
@@ -105,7 +135,7 @@ class Task:
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
             images_list=None, metadata_list=None,
-            num_workers=4, force=False, **kwargs):
+            num_workers=4, force=False, verbose=False, **kwargs):
         """Extract structured data from multiple inputs, with parallelism.
 
         Args:
@@ -117,6 +147,9 @@ class Task:
             metadata_list: List of metadata dicts, one per prompt (or None).
             num_workers: Number of parallel threads.
             force: Bypass cache.
+            verbose: If True, print a compact per-call summary as each
+                result lands. If a callable, use it as a custom formatter
+                (see LLM.extract_map for the signature).
             **kwargs: Additional arguments passed to LLM.extract_map().
 
         Returns:
@@ -135,6 +168,7 @@ class Task:
             num_workers=num_workers,
             retries=self.retries,
             force=force,
+            verbose=verbose,
             **kwargs,
         )
 

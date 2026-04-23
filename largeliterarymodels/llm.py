@@ -144,7 +144,11 @@ def _build_extract_prompt(prompt, schema, system_prompt=None, examples=None):
 
 
 def _parse_json_response(text):
-    """Extract JSON from an LLM response, handling markdown fencing and surrounding text."""
+    """Extract JSON from an LLM response, handling markdown fencing and surrounding text.
+
+    Falls back to json_repair for common malformations (e.g. missing opening
+    quotes on string values — observed with qwen3.5 on large multi-field schemas).
+    """
     text = text.strip()
     # strip markdown fencing
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
@@ -164,18 +168,69 @@ def _parse_json_response(text):
                 return json.loads(text[start:end + 1])
             except json.JSONDecodeError:
                 continue
+    # Last resort: json_repair for malformed output from local models.
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(text, return_objects=True)
+        # repair_json returns '' when completely unrecoverable.
+        if repaired not in ('', None):
+            return repaired
+    except ImportError:
+        pass
     raise ValueError(f"Could not parse JSON from response: {text[:200]}...")
 
 
 def _validate_parsed(data, schema):
     """Validate parsed JSON against the Pydantic schema."""
     is_list, item_schema = _unwrap_schema(schema)
+    data = _unwrap_envelopes(data, item_schema)
     if is_list:
         if not isinstance(data, list):
             data = [data]
-        return [item_schema.model_validate(item) for item in data]
+        return [item_schema.model_validate(_unwrap_envelopes(item, item_schema))
+                for item in data]
     else:
         return item_schema.model_validate(data)
+
+
+def _unwrap_envelopes(data, item_schema):
+    """Apply all known output-envelope unwraps in sequence."""
+    data = _unwrap_schema_envelope(data, item_schema)
+    data = _unwrap_per_field_envelope(data)
+    return data
+
+
+def _unwrap_schema_envelope(data, item_schema):
+    """Some models (observed: gemma4) echo the JSON-schema structure back as
+    an output envelope: {"properties": {...actual fields...}}. Detect and
+    unwrap when the inner dict clearly matches the schema better than the
+    outer one."""
+    if not (isinstance(data, dict) and "properties" in data
+            and isinstance(data["properties"], dict)):
+        return data
+    try:
+        expected = set(item_schema.model_fields.keys())
+    except Exception:
+        return data
+    outer_match = len(set(data.keys()) & expected)
+    inner_match = len(set(data["properties"].keys()) & expected)
+    if inner_match > outer_match and inner_match > 0:
+        return data["properties"]
+    return data
+
+
+def _unwrap_per_field_envelope(data):
+    """Some models (observed: llama-3.1-70b on large schemas) wrap each field
+    value as a JSON-schema field descriptor containing a 'value' key — e.g.
+    {"type": "boolean", "value": false} or {"description": "...", "title": "...",
+    "type": "boolean", "value": false}. Detect when every value in the dict
+    has both 'type' and 'value' keys and unwrap to the bare values."""
+    if not isinstance(data, dict) or not data:
+        return data
+    for v in data.values():
+        if not (isinstance(v, dict) and "type" in v and "value" in v):
+            return data
+    return {k: v["value"] for k, v in data.items()}
 
 
 class LLM:
@@ -409,7 +464,7 @@ class LLM:
     def extract_map(self, prompts, schema, system_prompt=None, examples=None,
                     temperature=None, max_tokens=None, images_list=None,
                     metadata_list=None, num_workers=4,
-                    force=False, retries=1, **kwargs):
+                    force=False, retries=1, verbose=False, **kwargs):
         """Extract structured data from multiple prompts, with caching and parallelism.
 
         Args:
@@ -424,6 +479,10 @@ class LLM:
             num_workers: Number of parallel threads (default 4).
             force: If True, bypass cache.
             retries: Number of retries on malformed JSON (default 1).
+            verbose: If True, print a compact per-call summary as each result
+                lands (plays nicely with tqdm via tqdm.write). If a callable,
+                use it as a custom formatter — signature
+                (i: int, prompt: str, metadata: dict|None, result) -> str.
             **kwargs: Additional provider-specific arguments.
 
         Returns:
@@ -436,6 +495,35 @@ class LLM:
             "", schema, system_prompt=system_prompt, examples=examples,
         )
         s_name = _schema_name(schema)
+
+        def _default_verbose_line(i, prompt, metadata, result, from_cache=False):
+            meta_str = ""
+            if isinstance(metadata, dict) and metadata:
+                meta_str = " ".join(f"{k}={v}" for k, v in metadata.items() if v not in ("", None))
+            try:
+                if isinstance(result, list):
+                    payload = f"[list x{len(result)}]"
+                    if result:
+                        payload += " " + ", ".join(
+                            f"{k}={v!r}" for k, v in list(result[0].model_dump().items())[:3]
+                        )
+                else:
+                    payload = ", ".join(
+                        f"{k}={v!r}" for k, v in list(result.model_dump().items())[:4]
+                    )
+            except Exception:
+                payload = str(result)[:120]
+            prompt_head = (prompt or "").splitlines()[0][:60]
+            tag = "⊛" if from_cache else "→"
+            return f"[{i:>5}] {meta_str}  {tag} {payload}  ({prompt_head!r})"
+
+        def _emit_verbose(i, prompt, metadata, result, from_cache):
+            try:
+                line = (verbose(i, prompt, metadata, result) if callable(verbose)
+                        else _default_verbose_line(i, prompt, metadata, result, from_cache))
+                tqdm.write(line)
+            except Exception as e:
+                tqdm.write(f"[{i}] <verbose formatter error: {e}>")
 
         results = [None] * len(prompts)
         to_compute = []
@@ -452,8 +540,11 @@ class LLM:
                         results[i] = _validate_parsed(_parse_json_response(cached), schema)
                     except Exception:
                         to_compute.append((i, prompt, key, images))
+                        continue
                 else:
                     results[i] = cached
+                if verbose and results[i] is not None:
+                    _emit_verbose(i, prompt, metadata, results[i], from_cache=True)
             else:
                 to_compute.append((i, prompt, key, images))
 
@@ -482,6 +573,7 @@ class LLM:
         def _do_one(item):
             i, prompt, key, images = item
             last_error = None
+            raw = None
             for attempt in range(1 + retries):
                 call_prompt = prompt
                 if attempt > 0:
@@ -494,16 +586,16 @@ class LLM:
                         f"Return ONLY valid JSON matching the schema, nothing else.\n\n"
                         f"{prompt}"
                     )
-                raw = _call_provider(
-                    prompt=call_prompt,
-                    model=self.model,
-                    system_prompt=full_system,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    images=images,
-                    **kwargs,
-                )
                 try:
+                    raw = _call_provider(
+                        prompt=call_prompt,
+                        model=self.model,
+                        system_prompt=full_system,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        images=images,
+                        **kwargs,
+                    )
                     parsed = _parse_json_response(raw)
                     result = _validate_parsed(parsed, schema)
                     self.stash[key] = raw
@@ -511,12 +603,15 @@ class LLM:
                 except Exception as e:
                     last_error = e
                     continue
-            
-            print(f"Raw response: {raw}")
-            raise ValueError(
-                f"Failed to extract valid {s_name} for prompt {i} after {1 + retries} attempts. "
-                f"Last error: {last_error}"
+            # Exhausted retries — return None so the pool drains cleanly and
+            # the pilot continues past individual failures rather than hanging.
+            log.error(
+                "extract_map giving up on prompt %d after %d attempts (model=%s). "
+                "Last error: %s. Raw (truncated): %s",
+                i, 1 + retries, self.model, last_error,
+                (raw or '')[:400],
             )
+            return i, None
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {executor.submit(_do_one, item): item for item in to_compute}
@@ -524,6 +619,10 @@ class LLM:
                                desc=f"Extracting {s_name} ({self.model})"):
                 i, result = future.result()
                 results[i] = result
+                if verbose:
+                    prompt = prompts[i]
+                    metadata = metadata_list[i] if metadata_list else None
+                    _emit_verbose(i, prompt, metadata, result, from_cache=False)
 
         return results
 

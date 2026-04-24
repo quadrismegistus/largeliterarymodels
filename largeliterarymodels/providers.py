@@ -322,3 +322,34 @@ def check_api_keys(verbose=False):
             status = "+" if v else "X"
             print(f"  {status} {k}")
     return available
+
+
+def set_api_keys():
+    """Interactively set API keys (safe for Colab — keys stay in memory only).
+
+    Prompts for each provider key. Press Enter to skip. Uses getpass to
+    mask input where available (Colab, terminals), falls back to input().
+    Keys are set as environment variables for the current process only.
+    """
+    try:
+        from getpass import getpass
+        ask = getpass
+    except ImportError:
+        ask = input
+
+    providers = [
+        ("ANTHROPIC_API_KEY", "Anthropic (Claude)"),
+        ("OPENAI_API_KEY", "OpenAI (GPT)"),
+        ("GEMINI_API_KEY", "Google (Gemini)"),
+    ]
+    for env_var, label in providers:
+        existing = os.getenv(env_var)
+        if existing:
+            print(f"  + {label}: already set")
+            continue
+        val = ask(f"  {label} API key (Enter to skip): ").strip()
+        if val:
+            os.environ[env_var] = val
+            print(f"  + {label}: set")
+        else:
+            print(f"  - {label}: skipped")

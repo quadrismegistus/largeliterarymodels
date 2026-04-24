@@ -311,7 +311,7 @@ class SocialNetworkTask(SequentialTask):
             status += f"\n         events: {ev_preview}"
         if dialogue:
             dl_preview = '; '.join(
-                (d.get('speaker', '?') + '→' + d.get('addressee', '?'))
+                ((d.get('speaker') or '?') + '→' + (d.get('addressee') or '?'))
                 for d in dialogue[:3]
             )
             if len(dialogue) > 3:

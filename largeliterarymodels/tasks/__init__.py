@@ -56,6 +56,8 @@ _LAZY_IMPORTS = {
     'TranslationTask': ('.translate_word', 'TranslationTask'),
     'WordTranslation': ('.translate_word', 'WordTranslation'),
     'format_word_for_translation': ('.translate_word', 'format_word_for_translation'),
+
+    'SocialNetworkTask': ('.extract_social_network', 'SocialNetworkTask'),
 }
 
 

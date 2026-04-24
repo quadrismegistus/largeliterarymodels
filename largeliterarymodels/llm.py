@@ -275,7 +275,8 @@ class LLM:
         )
 
     def generate(self, prompt, system_prompt=None, temperature=None,
-                 max_tokens=None, images=None, metadata=None, force=False, **kwargs):
+                 max_tokens=None, images=None, metadata=None, force=False,
+                 cache_key=None, **kwargs):
         """Generate text from the LLM, with caching.
 
         Args:
@@ -286,6 +287,7 @@ class LLM:
             images: List of images (file paths, bytes, or PIL Images).
             metadata: Dict of user-defined metadata to store with the cache entry.
             force: If True, bypass cache and force a new generation.
+            cache_key: Optional dict to override the auto-generated stash key.
             **kwargs: Additional provider-specific arguments.
 
         Returns:
@@ -294,8 +296,11 @@ class LLM:
         system_prompt, temperature, max_tokens = self._resolve(
             system_prompt, temperature, max_tokens,
         )
-        key = _make_key(prompt, self.model, system_prompt, temperature, max_tokens,
-                        images=images, metadata=metadata)
+        if cache_key is not None:
+            key = cache_key
+        else:
+            key = _make_key(prompt, self.model, system_prompt, temperature, max_tokens,
+                            images=images, metadata=metadata)
 
         if not force and key in self.stash:
             return self.stash[key]
@@ -314,7 +319,7 @@ class LLM:
 
     def extract(self, prompt, schema, system_prompt=None, examples=None,
                 temperature=None, max_tokens=None, images=None, metadata=None,
-                force=False, retries=1, **kwargs):
+                force=False, retries=1, cache_key=None, **kwargs):
         """Extract structured data from text using a Pydantic schema.
 
         Args:
@@ -329,6 +334,10 @@ class LLM:
             metadata: Dict of user-defined metadata to store with the cache entry.
             force: If True, bypass cache.
             retries: Number of retries on malformed JSON (default 1).
+            cache_key: Optional dict to use as the stash key instead of the
+                       auto-generated prompt-based key. Useful for sequential
+                       pipelines where the prompt varies but the identity of
+                       the work unit is stable (e.g. text_id + passage_seq).
             **kwargs: Additional provider-specific arguments.
 
         Returns:
@@ -341,8 +350,11 @@ class LLM:
             prompt, schema, system_prompt=system_prompt, examples=examples,
         )
         s_name = _schema_name(schema)
-        key = _make_key(user_prompt, self.model, full_system, temperature, max_tokens,
-                        schema_name=s_name, images=images, metadata=metadata)
+        if cache_key is not None:
+            key = cache_key
+        else:
+            key = _make_key(user_prompt, self.model, full_system, temperature, max_tokens,
+                            schema_name=s_name, images=images, metadata=metadata)
 
         if not force and key in self.stash:
             cached = self.stash[key]

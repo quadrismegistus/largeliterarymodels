@@ -239,6 +239,221 @@ class Task:
         return f"{self.__class__.__name__}(name={self.task_name!r}, schema={_schema_repr(self.schema)})"
 
 
+class SequentialTask(Task):
+    """Base class for tasks that process a text chunk-by-chunk with
+    feedforward state (summaries, character registers, etc.).
+
+    Unlike Task.run() which handles a single prompt, SequentialTask.run()
+    processes a full text by splitting it into chunks of passages, maintaining
+    rolling state across chunks, and aggregating the results.
+
+    Subclass and implement:
+        - build_state(): return initial state dict
+        - format_context(state): format state for the prompt
+        - parse_response(raw): parse LLM output into structured result
+        - update_state(state, result, chunk_idx, start, end): update state from result
+        - aggregate(all_results, state): combine chunk results into final output
+    """
+
+    chunk_size = 10
+    max_tokens = 8192
+
+    def build_state(self):
+        """Initialize the rolling state. Override in subclasses."""
+        return {}
+
+    def format_context(self, state):
+        """Format the rolling state as a prompt prefix. Override in subclasses."""
+        raise NotImplementedError
+
+    def format_passages(self, passages_df, start_idx):
+        """Format a chunk of passages for the prompt."""
+        parts = []
+        for i, (_, row) in enumerate(passages_df.iterrows()):
+            pnum = start_idx + i
+            parts.append(f"--- P{pnum:03d} ({row['n_words']} words) ---")
+            parts.append(row['text'])
+            parts.append("")
+        return '\n'.join(parts)
+
+    def parse_response(self, raw):
+        """Parse raw LLM output into a structured result dict. Override in subclasses."""
+        import re
+        json_text = raw.strip()
+        if json_text.startswith('```'):
+            json_text = re.sub(r'^```(?:json)?\s*', '', json_text)
+            json_text = re.sub(r'\s*```\s*$', '', json_text)
+        return json.loads(json_text)
+
+    def update_state(self, state, result, chunk_idx, start, end):
+        """Update rolling state from the chunk's output. Override in subclasses."""
+        raise NotImplementedError
+
+    def aggregate(self, all_results, state):
+        """Combine all chunk results into a final output dict. Override in subclasses."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _load_passages(source, passage_size=500):
+        """Load passages from a text_id, file path, or list of strings.
+
+        Returns:
+            tuple: (pd.DataFrame with 'text' and 'n_words' columns, source_label)
+        """
+        if isinstance(source, list):
+            rows = [{'text': t, 'n_words': len(t.split()), 'seq': i}
+                    for i, t in enumerate(source)]
+            return pd.DataFrame(rows), 'list'
+
+        if isinstance(source, str) and (source.endswith('.txt') or '/' in source
+                                         and not source.startswith('_')):
+            import os
+            if os.path.isfile(source):
+                with open(source) as f:
+                    full_text = f.read()
+                words = full_text.split()
+                passages = []
+                for i in range(0, len(words), passage_size):
+                    chunk = ' '.join(words[i:i + passage_size])
+                    passages.append({
+                        'text': chunk, 'n_words': len(words[i:i + passage_size]),
+                        'seq': len(passages),
+                    })
+                return pd.DataFrame(passages), os.path.basename(source)
+
+        import lltk
+        pdf = lltk.db.get_passages([source])
+        pdf = pdf.sort_values('seq').reset_index(drop=True)
+        return pdf, source
+
+    def run(self, source, model=None, chunk_size=None, limit_chunks=0,
+            force=False, verbose=True, save=None):
+        """Process a full text chunk-by-chunk with feedforward state.
+
+        Args:
+            source: One of:
+                - lltk text ID (e.g. '_chadwyck/.../haywood.13')
+                - path to a .txt file (auto-chunked into ~500-word passages)
+                - list of passage strings
+            model: Override the default model.
+            chunk_size: Override the default chunk size.
+            limit_chunks: Stop after N chunks (0=all).
+            force: Bypass cache.
+            verbose: Print progress to stderr.
+            save: Path to save JSON output (or True for auto-naming).
+
+        Returns:
+            dict: Aggregated results from all chunks.
+        """
+        import sys
+        import time
+
+        chunk_size = chunk_size or self.chunk_size
+        model = model or getattr(self, 'model', None) or DEFAULT_MODEL
+
+        pdf, source_label = self._load_passages(source)
+        n_chunks = (len(pdf) + chunk_size - 1) // chunk_size
+        if limit_chunks:
+            n_chunks = min(n_chunks, limit_chunks)
+
+        if verbose:
+            print(f"Model: {model}", file=sys.stderr)
+            print(f"Text: {source_label}", file=sys.stderr)
+            print(f"Passages: {len(pdf)}, Chunk size: {chunk_size}, "
+                  f"Chunks: {n_chunks}", file=sys.stderr)
+
+        llm = self._get_llm(model)
+        state = self.build_state()
+        all_results = []
+
+        t0 = time.time()
+        for chunk_idx in range(n_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, len(pdf))
+            chunk_df = pdf.iloc[start:end]
+
+            context = self.format_context(state)
+            passages_text = self.format_passages(chunk_df, start)
+            prompt = context + "\n\n" + f"PASSAGES:\n{passages_text}"
+
+            cache_key = {
+                'task': self.task_name, 'text_id': source_label,
+                'chunk': chunk_idx, 'model': model,
+                'chunk_size': chunk_size,
+            }
+
+            try:
+                raw = llm.generate(
+                    prompt=prompt,
+                    system_prompt=self.system_prompt,
+                    cache_key=cache_key,
+                    force=force,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  [Chunk {chunk_idx:02d}] FAILED: {e!s:.100s}",
+                          file=sys.stderr)
+                all_results.append(None)
+                continue
+
+            try:
+                result = self.parse_response(raw)
+            except (json.JSONDecodeError, Exception) as e:
+                if verbose:
+                    print(f"  [Chunk {chunk_idx:02d}] PARSE FAILED: {e!s:.80s}",
+                          file=sys.stderr)
+                all_results.append(None)
+                continue
+
+            state = self.update_state(state, result, chunk_idx, start, end)
+            all_results.append(result)
+
+            if verbose:
+                elapsed = time.time() - t0
+                self.log_chunk(chunk_idx, start, end, elapsed, state, result)
+
+        elapsed = time.time() - t0
+        if verbose:
+            print(f"\nDone: {n_chunks} chunks in {elapsed:.0f}s "
+                  f"({elapsed/max(1,n_chunks):.1f}s/chunk)", file=sys.stderr)
+
+        output = self.aggregate(all_results, state)
+        output['metadata'] = {
+            'source': source_label,
+            'model': model,
+            'n_passages': len(pdf),
+            'n_chunks': n_chunks,
+            'chunk_size': chunk_size,
+            'elapsed_seconds': elapsed,
+        }
+
+        if save:
+            self._save_result(output, save, source_label, model)
+
+        return output
+
+    def _save_result(self, output, save, source_label, model):
+        """Save aggregated result to JSON."""
+        if save is True:
+            slug = source_label.replace('/', '_').replace(' ', '_').strip('_')
+            model_slug = model.split('/')[-1].replace('.', '').replace(' ', '_')
+            save = os.path.join(
+                STASH_PATH, '..', f'{self.task_name}_{slug}_{model_slug}.json',
+            )
+            save = os.path.normpath(save)
+        os.makedirs(os.path.dirname(save), exist_ok=True)
+        with open(save, 'w') as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+        import sys
+        print(f"Saved to {save}", file=sys.stderr)
+
+    def log_chunk(self, chunk_idx, start, end, elapsed, state, result):
+        """Print per-chunk progress. Override for custom logging."""
+        import sys
+        print(f"  [Chunk {chunk_idx:02d}] P{start:03d}-P{end-1:03d}  "
+              f"{elapsed:6.1f}s", file=sys.stderr)
+
+
 def _schema_repr(schema):
     if schema is None:
         return "None"

@@ -286,13 +286,7 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     model_lower = model.lower()
     if "qwen" in model_lower:
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-    # Clamp max_tokens for big local models. Raised from 1024 → 2048 after
-    # observing llama-3.1-70b produce JSON-schema envelopes that balloon output
-    # tokens (each field wrapped as {type, title, description, value}). For
-    # multi-field schemas (20+ fields), 1024 truncates mid-response. 2048 is
-    # still conservative vs 16K context.
-    if any(tag in model_lower for tag in ("qwen", "llama-3", "llama3", "gemma-4-31", "gemma4:31")):
-        effective_max = min(max_tokens, 2048)
+    effective_max = max_tokens
 
     try:
         response = client.chat.completions.create(

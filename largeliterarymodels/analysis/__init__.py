@@ -48,6 +48,21 @@ from .reliability import (
 from .propagate import (
     evaluate_classifiers, calibrate_thresholds, predict_all, write_propagated,
 )
+from .cross_language import compare_cross_language
+from .embeddings import center_by_group, fetch_passage_embeddings, mean_pool_to_text
+from .social_networks import (
+    build_dialogue_graph,
+    build_directed_graph,
+    build_event_graph,
+    build_graph,
+    character_trajectories,
+    load_result,
+    location_summary,
+    network_metrics,
+    plot_network,
+    relation_type_counts,
+    event_verb_counts,
+)
 from .stats import bh_fdr, fisher_tests, group_matrix
 
 __all__ = [
@@ -80,4 +95,22 @@ __all__ = [
     'flagged_for_audit',
     'audit_disagrees_with_reference',
     'write_consensus',
+    # cross-language comparison
+    'compare_cross_language',
+    # embeddings
+    'fetch_passage_embeddings',
+    'mean_pool_to_text',
+    'center_by_group',
+    # social networks
+    'build_graph',
+    'build_directed_graph',
+    'build_dialogue_graph',
+    'build_event_graph',
+    'load_result',
+    'character_trajectories',
+    'location_summary',
+    'network_metrics',
+    'plot_network',
+    'relation_type_counts',
+    'event_verb_counts',
 ]

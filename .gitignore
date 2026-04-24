@@ -209,3 +209,5 @@ __marimo__/
 data/stash
 data/
 .DS_Store
+uv.lock
+.sesskey

@@ -46,13 +46,11 @@ MODEL_TABLE = {
 }
 
 
-def model_slug(model_str):
-    return re.sub(r'[^a-zA-Z0-9]', '-', model_str).strip('-')
-
-
 def output_path(text_id, model_str):
-    slug = text_id.replace('_chadwyck/', '').replace('/', '_')
-    return os.path.join(DATA_DIR, f'social_network_{slug}_{model_slug(model_str)}.json')
+    """Match the filename convention from SequentialTask._save_result."""
+    source_slug = text_id.replace('/', '_').replace(' ', '_').strip('_')
+    m_slug = model_str.split('/')[-1].replace('.', '').replace(' ', '_')
+    return os.path.join(DATA_DIR, f'social_network_{source_slug}_{m_slug}.json')
 
 
 def get_text_ids(subcollection):

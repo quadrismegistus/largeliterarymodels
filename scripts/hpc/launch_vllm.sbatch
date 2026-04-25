@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=vllm-social-network
 #SBATCH --partition=ampere
-#SBATCH --account=PLACEHOLDER_ACCOUNT
+#SBATCH --account=HEUSER-SL3-GPU
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=80G
-#SBATCH --time=36:00:00
+#SBATCH --time=12:00:00  # SL3 max; change to 36:00:00 for SL1/2
 #SBATCH --output=logs/vllm_%j.out
 #SBATCH --error=logs/vllm_%j.err
 
@@ -29,11 +29,12 @@ MODEL="${1:-Qwen/Qwen3.6-27B}"
 PORT=8000
 
 module purge
-module load python/3.11
-module load cuda/12.2
+module load rhel8/default-amp
+module load python/3.11.9/gcc/nptrdpll
+module load cuda/12.1
 
-# Activate venv (create once with: python -m venv ~/vllm_env && pip install vllm)
-source ~/vllm_env/bin/activate
+# Activate venv (see README.md for setup)
+source ~/rds/hpc-work/venvs/llm/bin/activate
 
 mkdir -p logs
 
@@ -52,6 +53,7 @@ python -m vllm.entrypoints.openai.api_server \
     --host 0.0.0.0 \
     --max-model-len 32768 \
     --gpu-memory-utilization 0.90 \
+    --enable-prefix-caching \
     --dtype auto \
     --trust-remote-code \
     --disable-log-requests

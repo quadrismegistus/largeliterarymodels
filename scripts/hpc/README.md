@@ -1,131 +1,221 @@
 # Running SocialNetworkTask on Cambridge CSD3
 
 You have 3,000 A100 GPU-hours on CSD3. This guide gets you from zero to
-bulk social network extraction across all of Chadwyck.
+bulk social network extraction across pre-1800 English prose fiction.
 
-## What's happening
+## Overview
 
-1. You submit a SLURM job that starts a **vLLM server** on an A100 node.
-   vLLM loads a model (default: Qwen 3.6 27B) and exposes an OpenAI-compatible
-   HTTP API on port 8000.
+1. Export passage data locally (where ClickHouse lives)
+2. Rsync passages to CSD3
+3. Launch a Jupyter notebook on an A100 node via `salloc`
+4. Start vLLM + run the batch from notebook cells
+5. Rsync results back
 
-2. You run the **batch script** which loops through texts in a Chadwyck
-   subcollection, calling that API for each one. Each text produces a JSON
-   file with characters, relations, events, dialogue, and narrative summaries.
+Everything is **resumable**. If the 12h wall time kills your job, just
+relaunch — completed texts are skipped (output file exists).
 
-3. Everything is **resumable**. If a job dies, re-run the same command.
-   Completed texts are skipped (output file exists), and partially-completed
-   texts resume from the last finished chunk (cached by hashstash).
+## Storage layout
+
+Home directory is **50GB** — don't put venvs or model weights there.
+Use `/rds/user/$USER/hpc-work/` (1TB, not backed up) for everything heavy.
+
+```
+~/rds/hpc-work/venvs/llm/          # Python venv (vllm + largeliterarymodels)
+~/rds/hpc-work/largeliterarymodels/ # git clone of this repo
+~/rds/hpc-work/texts/              # exported JSONL passages
+~/rds/hpc-work/output/             # social network results
+~/rds/hpc-work/.cache/huggingface/ # model weights (~50GB)
+```
 
 ## One-time setup
 
-SSH into CSD3 and set up the Python environments:
+### 1. Check available modules
+
+SSH into CSD3 and check what's available:
 
 ```bash
-# vLLM environment (GPU node will use this)
-python3 -m venv ~/vllm_env
-source ~/vllm_env/bin/activate
-pip install vllm
+module avail python    # need 3.9+ for vLLM
+module avail cuda      # need 12.x for vLLM
+module avail miniconda # fallback if no python 3.9+
+```
 
-# Project environment (batch script uses this)
-python3 -m venv ~/llm_env
-source ~/llm_env/bin/activate
+### 2. Create the environment
+
+Build on an ampere node (Rocky Linux 8, different arch from login nodes):
+
+```bash
+sintr -t 1:0:0 --gres=gpu:1 -A HEUSER-SL3-GPU -p ampere --nodes=1
+
+module purge
+module load rhel8/default-amp
+module load python/3.11.9/gcc/nptrdpll
+module load cuda/12.1
+
+python3 -m venv ~/rds/hpc-work/venvs/llm
+source ~/rds/hpc-work/venvs/llm/bin/activate
+pip install --upgrade pip
+pip install vllm jupyter ipykernel
 pip install git+https://github.com/quadrismegistus/largeliterarymodels.git
-pip install lltk-dh  # for passage loading
-
-# Clone the repo for the scripts
-git clone https://github.com/quadrismegistus/largeliterarymodels.git ~/largeliterarymodels
-cd ~/largeliterarymodels
 ```
 
-Edit `launch_vllm.sbatch` and replace `PLACEHOLDER_ACCOUNT` with your
-CSD3 account code (e.g. `--account=CASTLE-SL3-GPU`). Also update the
-venv path in `run_batch.sh` if you put it somewhere other than `~/llm_env`.
-
-## Running
-
-### Step 1: Start the vLLM server
+### 3. Register Jupyter kernel
 
 ```bash
-mkdir -p logs
-sbatch scripts/hpc/launch_vllm.sbatch
+ipython kernel install --user --name=llm
 ```
 
-This queues a 36-hour GPU job. Monitor it:
+### 4. Redirect HuggingFace cache to rds
 
 ```bash
-squeue -u $USER                    # check job status
-tail -f logs/vllm_<JOBID>.out      # watch for "Uvicorn running on http://0.0.0.0:8000"
+mkdir -p ~/rds/hpc-work/.cache/huggingface
+ln -sf ~/rds/hpc-work/.cache/huggingface ~/.cache/huggingface
 ```
 
-Wait until you see the "Uvicorn running" line — model loading takes 2-5 minutes.
-
-### Step 2: Run the batch
-
-**Option A — same node (simplest):**
+### 5. Pre-download the model
 
 ```bash
-# Find the job ID from squeue, then:
-srun --jobid=<JOBID> --overlap bash scripts/hpc/run_batch.sh Early_English_Prose_Fiction
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.6-27B')"
 ```
 
-The script waits for vLLM to be healthy, then starts processing texts.
+This takes a while (~50GB) but only needs to happen once.
 
-**Option B — from your laptop via SSH tunnel:**
+### 6. Clone the repo
 
 ```bash
-# Terminal 1: tunnel to the compute node (find node name in the vLLM log)
-ssh -L 8000:<NODE>:8000 <username>@login.hpc.cam.ac.uk
+cd ~/rds/hpc-work
+git clone https://github.com/quadrismegistus/largeliterarymodels.git
+```
 
-# Terminal 2: run locally
-VLLM_BASE_URL=http://localhost:8000/v1 \
-python scripts/batch_social_network.py \
+## Export passages (on your laptop)
+
+Run locally where ClickHouse is available:
+
+```bash
+# Single subcollection
+python scripts/hpc/export_passages.py \
     --subcollection Early_English_Prose_Fiction \
-    --model vllm/Qwen/Qwen3.6-27B
+    --out texts/
+
+# All pre-1800 English fiction
+python scripts/hpc/export_passages.py \
+    --query "genre='Fiction' AND year<1800 AND lang='en'" \
+    --out texts/
+
+# Upload to CSD3
+rsync -avz texts/ csd3:~/rds/hpc-work/texts/
 ```
 
-### Step 3: Collect results
+Each JSONL file has one passage per line: `{"seq": N, "text": "...", "n_words": N}`.
 
-Output JSONs land in `data/social_network_*.json`. Copy them back to
-your laptop:
+## Running (Jupyter on GPU node)
+
+### Launch the notebook
 
 ```bash
-scp 'csd3:~/largeliterarymodels/data/social_network_*.json' data/
+salloc -t 12:0:0 --nodes=1 --gres=gpu:1 --ntasks-per-node=1 \
+    --cpus-per-task=32 -p ampere -A HEUSER-SL3-GPU \
+    jupyter notebook --no-browser --ip=* --port=8081
 ```
 
-## Subcollections and time estimates
-
-At ~120s/chunk on A100 (likely faster with vLLM batching):
-
-| Subcollection | Texts | Passages | Est. time |
-|---|---|---|---|
-| Early_English_Prose_Fiction | 110 | 11,964 | ~5-10 hours |
-| Eighteenth-Century_Fiction | 95 | 21,911 | ~10-18 hours |
-| Nineteenth-Century_Fiction | 250 | 75,617 | ~1-2 days |
-| Early_American_Fiction | 882 | 123,030 | ~2-4 days |
-
-A single 36-hour job should cover Early English + 18C Fiction. For 19C
-and Early American, submit multiple jobs or chain them.
-
-## Using a different model
+Note the `gpu-q-XX` node name from the output. Then from your laptop:
 
 ```bash
-# Llama 3.1 70B (fits A100 80GB at 4-bit)
-sbatch scripts/hpc/launch_vllm.sbatch meta-llama/Meta-Llama-3.1-70B-Instruct
-bash scripts/hpc/run_batch.sh Early_English_Prose_Fiction vllm/meta-llama/Meta-Llama-3.1-70B-Instruct
+ssh -L 8081:gpu-q-XX:8081 -l USERNAME login-q-1.hpc.cam.ac.uk
+```
+
+Open the URL Jupyter printed (replace `gpu-q-XX` with `127.0.0.1`).
+Select the `llm` kernel when creating a new notebook.
+
+### In the notebook
+
+See `scripts/hpc/run_social_network.ipynb` for a ready-to-run notebook,
+or run these cells:
+
+```python
+# Cell 1: Start vLLM server
+import subprocess, os
+proc = subprocess.Popen([
+    "python", "-m", "vllm.entrypoints.openai.api_server",
+    "--model", "Qwen/Qwen3.6-27B",
+    "--port", "8000",
+    "--host", "127.0.0.1",
+    "--enable-prefix-caching",
+    "--gpu-memory-utilization", "0.90",
+    "--max-model-len", "32768",
+    "--disable-log-requests",
+], stdout=open("vllm.log", "w"), stderr=subprocess.STDOUT)
+print(f"vLLM starting (pid {proc.pid}), check vllm.log")
+```
+
+```python
+# Cell 2: Wait for vLLM to be ready
+import time, urllib.request
+for i in range(60):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8000/health")
+        print("vLLM ready!")
+        break
+    except:
+        if i % 6 == 0: print(f"Waiting... ({i*5}s)")
+        time.sleep(5)
+else:
+    print("vLLM failed to start — check vllm.log")
+```
+
+```python
+# Cell 3: Run batch (4 workers to saturate GPU)
+rds = os.path.expanduser("~/rds/hpc-work")
+!python {rds}/largeliterarymodels/scripts/batch_social_network.py \
+    --text-dir {rds}/texts/ \
+    --output-dir {rds}/output/ \
+    --model vllm-qwen36 \
+    --workers 4
+```
+
+### After the run
+
+```bash
+# On your laptop — pull results back
+rsync -avz csd3:~/rds/hpc-work/output/ output/
+```
+
+## Time estimates
+
+At ~18-35s/chunk on A100 with vLLM (5-10x faster than local):
+
+| Scope | Texts | Est. time (1 GPU) |
+|---|---|---|
+| Early English Prose Fiction | 110 | 6-12 hours |
+| All pre-1800 fiction (with passages) | 251 | 1-3 days |
+| All pre-1800 fiction (full 1,966) | 1,966 | 4-5 days |
+
+SL3 wall time limit is 12 hours per job. Just relaunch — skip-existing
+handles resumption automatically.
+
+## Alternative: sbatch (no Jupyter)
+
+If you prefer batch submission over interactive Jupyter:
+
+```bash
+# Step 1: submit vLLM server
+sbatch scripts/hpc/launch_vllm.sbatch
+
+# Step 2: run batch on same node
+srun --jobid=<JOBID> --overlap bash scripts/hpc/run_batch.sh
 ```
 
 ## Troubleshooting
 
-**vLLM OOM**: Reduce `--gpu-memory-utilization` in the sbatch file (default 0.90).
+**vLLM OOM**: Reduce `--gpu-memory-utilization` (default 0.90) or
+`--max-model-len` (default 32768).
 
-**Job killed at 36h wall time**: Just re-run. The batch script skips
-completed texts and hashstash resumes mid-text.
+**Job killed at 12h**: Just relaunch. Completed texts are skipped,
+partially-completed texts resume from the last finished chunk (hashstash cache).
 
-**"Connection refused" from batch script**: vLLM isn't ready yet. The
-`run_batch.sh` script auto-waits up to 10 minutes.
+**"Connection refused"**: vLLM isn't ready yet. Model loading takes 2-5 min.
 
-**lltk can't connect to ClickHouse**: CSD3 compute nodes may not have
-outbound access. If so, pre-export the text list and passage data on
-the login node, then pass `--text-id` for individual texts or modify
-the batch script to read from a local manifest CSV.
+**Python too old**: Use `module load python/3.11.9/gcc/nptrdpll` (confirmed
+available on CSD3 as of April 2026).
+
+**Home quota exceeded**: Move venvs and HF cache to `~/rds/hpc-work/`.
+Symlink `~/.cache/huggingface` to rds.

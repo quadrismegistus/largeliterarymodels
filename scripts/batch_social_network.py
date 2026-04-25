@@ -19,6 +19,9 @@ Usage:
     # Single text (for testing)
     python scripts/batch_social_network.py --text-id _chadwyck/Early_English_Prose_Fiction/ee80010.02
 
+    # From exported JSONL files (no lltk/ClickHouse needed — for HPC)
+    python scripts/batch_social_network.py --text-dir texts/ --output-dir output/ --model vllm-qwen36 --workers 4
+
     # Resume after interruption — just re-run the same command (cache handles it)
 """
 
@@ -29,8 +32,7 @@ import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
-import lltk
+from pathlib import Path
 
 from largeliterarymodels.tasks import SocialNetworkTask
 
@@ -46,14 +48,32 @@ MODEL_TABLE = {
 }
 
 
-def output_path(text_id, model_str):
-    """Match the filename convention from SequentialTask._save_result."""
+def model_slug(model_str):
+    return model_str.split('/')[-1].lower().replace('.', '').replace(' ', '_')
+
+
+def output_path(text_id, model_str, output_dir=None):
+    """Match the filename convention from SequentialTask._save_result.
+
+    Uses lltk.task_path() when available, falls back to output_dir or data/.
+    """
+    m_slug = model_slug(model_str)
+    if output_dir:
+        source_slug = text_id.replace('/', '_').replace(' ', '_').strip('_')
+        return os.path.join(output_dir, f'{source_slug}_{m_slug}.json')
+    if text_id.startswith('_'):
+        try:
+            import lltk
+            task_dir = lltk.task_path(text_id, 'social_network')
+            return os.path.join(task_dir, f'{m_slug}.json')
+        except (ImportError, AttributeError, Exception):
+            pass
     source_slug = text_id.replace('/', '_').replace(' ', '_').strip('_')
-    m_slug = model_str.split('/')[-1].replace('.', '').replace(' ', '_')
     return os.path.join(DATA_DIR, f'social_network_{source_slug}_{m_slug}.json')
 
 
 def get_text_ids(subcollection):
+    import lltk
     df = lltk.db.query(f"""
         SELECT t._id, t.title, t.author, t.year, count(p._id) as n_passages
         FROM (SELECT * FROM texts FINAL) AS t
@@ -65,11 +85,59 @@ def get_text_ids(subcollection):
     return df
 
 
-def run_one_text(text_id, model, verbose=True):
-    """Process a single text. Runs in a worker process."""
+def load_jsonl_passages(path):
+    """Load passages from a JSONL file. Each line: {"text": "...", ...}."""
+    passages = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                passages.append(json.loads(line)['text'])
+    return passages
+
+
+def slug_to_text_id(slug):
+    """Reverse the filename slug back to an lltk text ID.
+
+    chadwyck_Early_English_Prose_Fiction_ee08010.01
+    → _chadwyck/Early_English_Prose_Fiction/ee08010.01
+
+    The text ID portion (ee08010.01) always matches [a-z]+\\d+.*,
+    so we find the last underscore-separated segment that starts
+    with a lowercase letter followed by digits.
+    """
+    import re
+    m = re.search(r'^(.+)_([a-z]+\d.*)$', slug)
+    if m:
+        prefix, text_part = m.group(1), m.group(2)
+        # prefix = "chadwyck_Early_English_Prose_Fiction"
+        # split on first underscore to get corpus
+        corpus, _, subcollection = prefix.partition('_')
+        if subcollection:
+            return f'_{corpus}/{subcollection}/{text_part}'
+    return slug
+
+
+def run_one_text(text_id, model, verbose=True, source=None, save=True,
+                 output_dir=None):
+    """Process a single text. Runs in a worker process.
+
+    Args:
+        source: If provided, pass this (list of strings or file path)
+            to task.run() instead of text_id. text_id is still used for
+            naming the output.
+        output_dir: If provided, save output here instead of lltk task path.
+    """
     try:
         task = SocialNetworkTask(model=model)
-        result = task.run(text_id, save=True, verbose=verbose)
+        run_source = source if source is not None else text_id
+        if save and output_dir:
+            save_path = output_path(text_id, model, output_dir=output_dir)
+        elif save and source is not None:
+            save_path = output_path(text_id, model)
+        else:
+            save_path = save
+        result = task.run(run_source, save=save_path, verbose=verbose)
         n_chars = len(result.get('characters', []))
         n_rels = len(result.get('relations', []))
         return text_id, 'done', f'{n_chars} chars, {n_rels} rels'
@@ -83,6 +151,12 @@ def main():
                         help='Chadwyck subcollection name (e.g. Early_English_Prose_Fiction)')
     parser.add_argument('--text-id', type=str,
                         help='Single text ID to run (overrides --subcollection)')
+    parser.add_argument('--text-dir', type=str,
+                        help='Directory of JSONL files (no lltk needed). '
+                             'Each file: one JSON object per line with a "text" field.')
+    parser.add_argument('--output-dir', type=str,
+                        help='Output directory for results (used with --text-dir). '
+                             'Defaults to data/ if not set.')
     parser.add_argument('--model', default='qwen36-27b',
                         help=f'Model key or full model string. Keys: {list(MODEL_TABLE.keys())}')
     parser.add_argument('--workers', type=int, default=1,
@@ -99,14 +173,28 @@ def main():
                         help='Limit to first N texts (0 = all)')
     parser.add_argument('--min-passages', type=int, default=5,
                         help='Skip texts with fewer passages than this')
+    parser.add_argument('--shuffle', action='store_true',
+                        help='Randomize text order (instead of chronological)')
     args = parser.parse_args()
 
     model = MODEL_TABLE.get(args.model, args.model)
     skip_existing = not args.no_skip
 
+    output_dir = args.output_dir
+    text_dir_mode = False
+
     if args.text_id:
         texts = [{'_id': args.text_id}]
         print(f"Single text: {args.text_id}", file=sys.stderr)
+    elif args.text_dir:
+        text_dir_mode = True
+        jsonl_files = sorted(Path(args.text_dir).glob('*.jsonl'))
+        texts = [{'_id': slug_to_text_id(f.stem), '_path': str(f)}
+                 for f in jsonl_files]
+        print(f"Text dir: {args.text_dir} ({len(texts)} JSONL files)",
+              file=sys.stderr)
+        if not output_dir:
+            output_dir = DATA_DIR
     elif args.subcollection:
         df = get_text_ids(args.subcollection)
         if args.min_passages:
@@ -116,7 +204,11 @@ def main():
         print(f"{args.subcollection}: {len(texts)} texts, {total_passages} passages, "
               f"~{total_passages // 10} chunks", file=sys.stderr)
     else:
-        parser.error('Provide --subcollection or --text-id')
+        parser.error('Provide --subcollection, --text-id, or --text-dir')
+
+    if args.shuffle:
+        import random
+        random.shuffle(texts)
 
     if args.shard:
         n, m = map(int, args.shard.split('/'))
@@ -128,11 +220,14 @@ def main():
 
     os.makedirs(DATA_DIR, exist_ok=True)
 
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     # Filter out already-completed texts
     todo = []
     skipped = 0
     for t in texts:
-        out = output_path(t['_id'], model)
+        out = output_path(t['_id'], model, output_dir=output_dir)
         if skip_existing and os.path.exists(out):
             skipped += 1
         else:
@@ -146,6 +241,12 @@ def main():
     t0 = time.time()
     done, failed = 0, 0
 
+    def _source_for(t):
+        """Get the source argument for run_one_text."""
+        if '_path' in t:
+            return load_jsonl_passages(t['_path'])
+        return None
+
     if args.workers <= 1:
         for i, t in enumerate(todo):
             text_id = t['_id']
@@ -156,7 +257,9 @@ def main():
             print(f"\n{label} {text_id} ({year}) {title}... [{n_psg} passages]",
                   file=sys.stderr)
 
-            text_id, status, msg = run_one_text(text_id, model)
+            text_id, status, msg = run_one_text(
+                text_id, model, source=_source_for(t),
+                output_dir=output_dir)
             elapsed_text = time.time() - t0
             if status == 'done':
                 done += 1
@@ -169,7 +272,9 @@ def main():
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
             futures = {}
             for t in todo:
-                f = pool.submit(run_one_text, t['_id'], model, verbose=False)
+                f = pool.submit(run_one_text, t['_id'], model,
+                                verbose=False, source=_source_for(t),
+                                output_dir=output_dir)
                 futures[f] = t
 
             for f in as_completed(futures):

@@ -51,11 +51,13 @@ from .propagate import (
 from .cross_language import compare_cross_language
 from .embeddings import center_by_group, fetch_passage_embeddings, mean_pool_to_text
 from .social_networks import (
+    SocialNetwork,
     build_dialogue_graph,
     build_directed_graph,
     build_event_graph,
     build_graph,
     character_trajectories,
+    compare,
     load_result,
     location_summary,
     network_metrics,
@@ -102,10 +104,12 @@ __all__ = [
     'mean_pool_to_text',
     'center_by_group',
     # social networks
+    'SocialNetwork',
     'build_graph',
     'build_directed_graph',
     'build_dialogue_graph',
     'build_event_graph',
+    'compare',
     'load_result',
     'character_trajectories',
     'location_summary',

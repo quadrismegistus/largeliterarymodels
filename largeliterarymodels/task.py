@@ -421,6 +421,7 @@ class SequentialTask(Task):
         output['metadata'] = {
             'source': source_label,
             'model': model,
+            'schema_version': f'{self.task_name}_v1',
             'n_passages': len(pdf),
             'n_chunks': n_chunks,
             'chunk_size': chunk_size,
@@ -432,20 +433,37 @@ class SequentialTask(Task):
 
         return output
 
+    @staticmethod
+    def model_slug(model):
+        return model.split('/')[-1].lower().replace('.', '').replace(' ', '_')
+
     def _save_result(self, output, save, source_label, model):
-        """Save aggregated result to JSON."""
+        """Save aggregated result to JSON.
+
+        When lltk is available and source_label looks like an lltk text ID,
+        writes to lltk.task_path(). Otherwise falls back to data/.
+        """
         if save is True:
-            slug = source_label.replace('/', '_').replace(' ', '_').strip('_')
-            model_slug = model.split('/')[-1].replace('.', '').replace(' ', '_')
-            save = os.path.join(
-                STASH_PATH, '..', f'{self.task_name}_{slug}_{model_slug}.json',
-            )
-            save = os.path.normpath(save)
+            m_slug = self.model_slug(model)
+            save = self._resolve_save_path(source_label, m_slug)
         os.makedirs(os.path.dirname(save), exist_ok=True)
         with open(save, 'w') as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
         import sys
         print(f"Saved to {save}", file=sys.stderr)
+
+    def _resolve_save_path(self, source_label, model_slug):
+        if source_label.startswith('_'):
+            try:
+                import lltk
+                task_dir = lltk.task_path(source_label, self.task_name)
+                return os.path.join(task_dir, f'{model_slug}.json')
+            except (ImportError, Exception):
+                pass
+        source_slug = source_label.replace('/', '_').replace(' ', '_').strip('_')
+        return os.path.normpath(os.path.join(
+            STASH_PATH, '..', f'{self.task_name}_{source_slug}_{model_slug}.json',
+        ))
 
     def log_chunk(self, chunk_idx, start, end, elapsed, state, result):
         """Print per-chunk progress. Override for custom logging."""

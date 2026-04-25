@@ -327,7 +327,7 @@ class SequentialTask(Task):
         return pdf, source
 
     def run(self, source, model=None, chunk_size=None, limit_chunks=0,
-            force=False, verbose=True, save=None):
+            force=False, verbose=True, save=None, source_label=None):
         """Process a full text chunk-by-chunk with feedforward state.
 
         Args:
@@ -351,7 +351,8 @@ class SequentialTask(Task):
         chunk_size = chunk_size or self.chunk_size
         model = model or getattr(self, 'model', None) or DEFAULT_MODEL
 
-        pdf, source_label = self._load_passages(source)
+        pdf, auto_label = self._load_passages(source)
+        source_label = source_label or auto_label
         n_chunks = (len(pdf) + chunk_size - 1) // chunk_size
         if limit_chunks:
             n_chunks = min(n_chunks, limit_chunks)

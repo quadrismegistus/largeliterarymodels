@@ -144,7 +144,8 @@ def run_one_text(text_id, model, verbose=True, source=None, save=True,
             save_path = output_path(text_id, model, output_dir=output_dir)
         else:
             save_path = False
-        result = task.run(run_source, save=save_path, verbose=verbose)
+        result = task.run(run_source, save=save_path, verbose=verbose,
+                         source_label=text_id)
         n_chars = len(result.get('characters', []))
         n_rels = len(result.get('relations', []))
         return text_id, 'done', f'{n_chars} chars, {n_rels} rels'

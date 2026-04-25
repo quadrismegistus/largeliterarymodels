@@ -52,22 +52,31 @@ def model_slug(model_str):
     return model_str.split('/')[-1].lower().replace('.', '').replace(' ', '_')
 
 
+def task_path_inline(text_id, task_name='social_network'):
+    """Resolve lltk task path without importing lltk.
+
+    Equivalent to lltk.task_path() but with no dependencies.
+    """
+    _id = text_id
+    if _id.startswith('_'):
+        _id = _id[1:]
+    corpus_id, text_part = _id.split('/', 1)
+    corpus_dir = os.path.expanduser(f'~/lltk_data/corpora/{corpus_id}')
+    return os.path.join(corpus_dir, 'tasks', task_name, text_part)
+
+
 def output_path(text_id, model_str, output_dir=None):
     """Match the filename convention from SequentialTask._save_result.
 
-    Uses lltk.task_path() when available, falls back to output_dir or data/.
+    Uses lltk task path convention for lltk text IDs, falls back to data/.
     """
     m_slug = model_slug(model_str)
     if output_dir:
         source_slug = text_id.replace('/', '_').replace(' ', '_').strip('_')
         return os.path.join(output_dir, f'{source_slug}_{m_slug}.json')
     if text_id.startswith('_'):
-        try:
-            import lltk
-            task_dir = lltk.task_path(text_id, 'social_network')
-            return os.path.join(task_dir, f'{m_slug}.json')
-        except (ImportError, AttributeError, Exception):
-            pass
+        task_dir = task_path_inline(text_id)
+        return os.path.join(task_dir, f'{m_slug}.json')
     source_slug = text_id.replace('/', '_').replace(' ', '_').strip('_')
     return os.path.join(DATA_DIR, f'social_network_{source_slug}_{m_slug}.json')
 

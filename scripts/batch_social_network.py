@@ -110,17 +110,17 @@ def slug_to_text_id(slug):
 
     chadwyck_Early_English_Prose_Fiction_ee08010.01
     → _chadwyck/Early_English_Prose_Fiction/ee08010.01
+    chadwyck_Eighteenth-Century_Fiction_aubin.03
+    → _chadwyck/Eighteenth-Century_Fiction/aubin.03
 
-    The text ID portion (ee08010.01) always matches [a-z]+\\d+.*,
-    so we find the last underscore-separated segment that starts
-    with a lowercase letter followed by digits.
+    The text ID is the last underscore-separated segment that looks
+    like a text identifier (lowercase, may contain dots/digits).
+    The subcollection name may contain hyphens but not dots.
     """
     import re
-    m = re.search(r'^(.+)_([a-z]+\d.*)$', slug)
+    m = re.search(r'^(.+)_([a-z][a-z0-9]*[\d.].*)$', slug)
     if m:
         prefix, text_part = m.group(1), m.group(2)
-        # prefix = "chadwyck_Early_English_Prose_Fiction"
-        # split on first underscore to get corpus
         corpus, _, subcollection = prefix.partition('_')
         if subcollection:
             return f'_{corpus}/{subcollection}/{text_part}'

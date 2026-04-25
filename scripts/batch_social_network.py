@@ -95,14 +95,25 @@ def get_text_ids(subcollection):
 
 
 def load_jsonl_passages(path):
-    """Load passages from a JSONL file. Each line: {"text": "...", ...}."""
+    """Load passages from a JSONL file.
+
+    If the first line contains '_id', it's a metadata header (skip it).
+    Remaining lines: {"text": "...", ...}.
+    Returns (passages_list, text_id_or_None).
+    """
     passages = []
+    text_id = None
     with open(path) as f:
-        for line in f:
+        for i, line in enumerate(f):
             line = line.strip()
-            if line:
-                passages.append(json.loads(line)['text'])
-    return passages
+            if not line:
+                continue
+            obj = json.loads(line)
+            if i == 0 and '_id' in obj:
+                text_id = obj['_id']
+                continue
+            passages.append(obj['text'])
+    return passages, text_id
 
 
 def slug_to_text_id(slug):
@@ -197,8 +208,11 @@ def main():
     elif args.text_dir:
         text_dir_mode = True
         jsonl_files = sorted(Path(args.text_dir).glob('*.jsonl'))
-        texts = [{'_id': slug_to_text_id(f.stem), '_path': str(f)}
-                 for f in jsonl_files]
+        texts = []
+        for f in jsonl_files:
+            first_line = json.loads(f.read_text().split('\n', 1)[0])
+            text_id = first_line.get('_id', slug_to_text_id(f.stem))
+            texts.append({'_id': text_id, '_path': str(f)})
         print(f"Text dir: {args.text_dir} ({len(texts)} JSONL files)",
               file=sys.stderr)
         # output_dir stays None — output_path() resolves lltk task paths
@@ -252,7 +266,8 @@ def main():
     def _source_for(t):
         """Get the source argument for run_one_text."""
         if '_path' in t:
-            return load_jsonl_passages(t['_path'])
+            passages, _ = load_jsonl_passages(t['_path'])
+            return passages
         return None
 
     if args.workers <= 1:

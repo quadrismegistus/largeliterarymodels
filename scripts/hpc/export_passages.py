@@ -27,7 +27,7 @@ import lltk
 def export_text(text_id, out_dir):
     """Export one text's passages to a JSONL file.
 
-    Each line: {"seq": N, "text": "...", "n_words": N}
+    First line is metadata with _id, remaining lines are passages.
     Filename: text_id with slashes replaced by underscores.
     """
     pdf = lltk.db.get_passages([text_id])
@@ -37,6 +37,9 @@ def export_text(text_id, out_dir):
     slug = text_id.replace('/', '_').replace(' ', '_').strip('_')
     path = os.path.join(out_dir, f'{slug}.jsonl')
     with open(path, 'w') as f:
+        f.write(json.dumps({
+            '_id': text_id, '_n_passages': len(pdf),
+        }, ensure_ascii=False) + '\n')
         for _, row in pdf.iterrows():
             f.write(json.dumps({
                 'seq': int(row['seq']),

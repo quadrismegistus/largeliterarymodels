@@ -200,8 +200,8 @@ def main():
                  for f in jsonl_files]
         print(f"Text dir: {args.text_dir} ({len(texts)} JSONL files)",
               file=sys.stderr)
-        if not output_dir:
-            output_dir = DATA_DIR
+        # output_dir stays None — output_path() resolves lltk task paths
+        # for text IDs starting with _, falls back to DATA_DIR otherwise
     elif args.subcollection:
         df = get_text_ids(args.subcollection)
         if args.min_passages:

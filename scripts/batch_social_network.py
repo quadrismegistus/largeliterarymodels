@@ -140,12 +140,10 @@ def run_one_text(text_id, model, verbose=True, source=None, save=True,
     try:
         task = SocialNetworkTask(model=model)
         run_source = source if source is not None else text_id
-        if save and output_dir:
+        if save:
             save_path = output_path(text_id, model, output_dir=output_dir)
-        elif save and source is not None:
-            save_path = output_path(text_id, model)
         else:
-            save_path = save
+            save_path = False
         result = task.run(run_source, save=save_path, verbose=verbose)
         n_chars = len(result.get('characters', []))
         n_rels = len(result.get('relations', []))

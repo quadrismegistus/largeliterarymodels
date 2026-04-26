@@ -77,7 +77,7 @@ class OCRCleanTask(Task):
             force=force,
         )
 
-    def map(self, prompts, model=None, num_workers=4, force=False,
+    def map(self, prompts, model=None, num_workers=1, force=False,
             verbose=False, **kwargs):
         """Clean multiple pages in parallel."""
         llm = self._get_llm(model)

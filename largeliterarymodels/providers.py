@@ -156,12 +156,14 @@ def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
         "--output-format", "json",
         "--model", model_name,
     ]
+
+    full_prompt = prompt
     if system_prompt:
-        cmd += ["--system-prompt", system_prompt]
-    cmd.append(prompt)
+        full_prompt = f"<system>\n{system_prompt}\n</system>\n\n{prompt}"
 
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=300,
+        cmd, input=full_prompt,
+        capture_output=True, text=True, timeout=300,
     )
 
     if result.returncode != 0:

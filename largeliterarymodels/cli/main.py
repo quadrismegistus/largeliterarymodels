@@ -6,6 +6,7 @@ Subcommands:
     litmod smoke    <TaskName> --model M[,M2,...]
     litmod run      <TaskName> --input CSV --model M [--output CSV]
     litmod annotate <TaskName> [--annotator name] [--port N]
+    litmod cloud    <launch|setup|upload|run|status|download|stop|ssh>
 """
 
 import argparse
@@ -185,6 +186,16 @@ def cmd_annotate(args) -> int:
     return 0
 
 
+def cmd_cloud(args) -> int:
+    """Delegate to the Vast.ai cloud manager."""
+    from .cloud import main as cloud_main
+    cloud_argv = [args.cloud_command] + args.cloud_args
+    if args.yes:
+        cloud_argv = ['--yes'] + cloud_argv
+    cloud_main(cloud_argv)
+    return 0
+
+
 def _default_output_path(task_name: str, model_tag: str) -> str:
     slug = model_tag.replace('.', '').replace(':', '-').replace('/', '-')
     return os.path.join('data', f'litmod_run_{task_name}_{slug}.csv')
@@ -223,6 +234,17 @@ def build_parser() -> argparse.ArgumentParser:
                          'to restrict annotatable items to a specific '
                          'manifest — e.g. balanced100')
     sp.set_defaults(func=cmd_annotate)
+
+    sp = sub.add_parser('cloud',
+                        help='manage Vast.ai GPU instances')
+    sp.add_argument('--yes', '-y', action='store_true',
+                    help='skip confirmation prompts')
+    sp.add_argument('cloud_command',
+                    choices=['launch', 'setup', 'upload', 'run', 'status',
+                             'download', 'stop', 'ssh'],
+                    help='cloud subcommand')
+    sp.add_argument('cloud_args', nargs='*', help='arguments for subcommand')
+    sp.set_defaults(func=cmd_cloud)
 
     sp = sub.add_parser('run', help='run task over a manifest CSV')
     sp.add_argument('task')

@@ -211,3 +211,4 @@ data/
 .DS_Store
 uv.lock
 .sesskey
+.claude

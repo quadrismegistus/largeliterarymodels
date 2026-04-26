@@ -24,7 +24,7 @@ You are an expert at correcting OCR errors in early modern English texts (1500-1
 Given a passage of dirty OCR text, produce a cleaned version. Fix:
 - Long-s: ſ or f used where s is meant (e.g. "hiſtory" → "history", "fhall" → "shall")
 - VV/vv ligatures: "VVhen" → "When", "vvith" → "with"
-- Broken words: words split across lines with hyphens or spaces
+- Broken words: rejoin words split across lines with hyphens (e.g. "Gentle- man" → "Gentleman", "ex-\nplain" → "explain", "ut-\nmost" → "utmost"). Remove the hyphen and join the parts into one word. Keep genuine compound words hyphenated (e.g. "well-known", "self-same").
 - Common OCR substitutions: rn→m, cl→d, li→h, fi→fi
 - Garbled characters: random punctuation or symbols replacing letters
 - Missing or extra spaces between words
@@ -43,8 +43,8 @@ Return ONLY the cleaned text. No commentary, no explanations, no markdown."""
 EXAMPLES = [
     (
         "THe Hiſtory of the moſt Renowned and Victorious Princeſs "
-        "ELIZABETH, Late Queen of England. Containing all the moſt "
-        "Important and Remarkable Paſſages of State, both at Home and "
+        "ELIZABETH, Late Queen of England. Containing all the moſt Im-\n"
+        "portant and Remarkable Paſſages of State, both at Home and "
         "Abroad (ſo far as they were linked with Engliſh Affairs) during "
         "her Long and Proſperous Reign. VVritten by Mr. Cambden.",
         "The History of the most Renowned and Victorious Princess "

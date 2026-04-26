@@ -1,18 +1,12 @@
-"""largeliterarymodels.analysis — CH-backed cross-task discrimination analysis.
+"""largeliterarymodels.analysis — cross-task discrimination analysis.
 
-Reads passage annotations from ClickHouse (llmtasks.passage_annotations), joins
-across tasks on (_id, scheme, seq), builds boolean feature matrices via
-schema-introspection, and runs Fisher-exact discrimination with BH-FDR.
-
-The statistical engine (fisher_tests + bh_fdr + group_matrix) is a temporary
-stand-in here. When lltk publishes `lltk.analysis.stats`, the imports in
-`stats.py` will swap to `from lltk.analysis.stats import ...` and the local
-implementations get deleted.
+Schema-aware feature extraction, Fisher-exact discrimination with BH-FDR,
+ensemble consensus, and social network analysis.
 
 Public API:
     from largeliterarymodels.analysis import (
         joint_feature_matrix, passage_groups,
-        fisher_tests, bh_fdr,  # will be lltk.analysis.stats later
+        fisher_tests, bh_fdr,
     )
 
 Example:

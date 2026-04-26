@@ -29,7 +29,6 @@ import lltk
 import pandas as pd
 
 from largeliterarymodels.tasks.classify_genre import GenreTask, format_text_for_classification
-from largeliterarymodels.integrations.lltk import write_task_to_lltk
 from lltk.tools import annotations as A
 
 sys.stdout.reconfigure(line_buffering=True)

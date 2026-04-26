@@ -295,7 +295,7 @@ class SequentialTask(Task):
 
     @staticmethod
     def _load_passages(source, passage_size=500):
-        """Load passages from a text_id, file path, or list of strings.
+        """Load passages from a file path or list of strings.
 
         Returns:
             tuple: (pd.DataFrame with 'text' and 'n_words' columns, source_label)
@@ -305,8 +305,7 @@ class SequentialTask(Task):
                     for i, t in enumerate(source)]
             return pd.DataFrame(rows), 'list'
 
-        if isinstance(source, str) and (source.endswith('.txt') or '/' in source
-                                         and not source.startswith('_')):
+        if isinstance(source, str):
             import os
             if os.path.isfile(source):
                 with open(source) as f:
@@ -321,18 +320,18 @@ class SequentialTask(Task):
                     })
                 return pd.DataFrame(passages), os.path.basename(source)
 
-        import lltk
-        pdf = lltk.db.get_passages([source])
-        pdf = pdf.sort_values('seq').reset_index(drop=True)
-        return pdf, source
+        raise ValueError(
+            f"source must be a list of strings or a path to a .txt file, "
+            f"got {type(source).__name__}: {str(source)[:80]}"
+        )
 
     def run(self, source, model=None, chunk_size=None, limit_chunks=0,
-            force=False, verbose=True, save=None, source_label=None):
+            force=False, verbose=True, save=None, source_label=None,
+            cache_key=None):
         """Process a full text chunk-by-chunk with feedforward state.
 
         Args:
             source: One of:
-                - lltk text ID (e.g. '_chadwyck/.../haywood.13')
                 - path to a .txt file (auto-chunked into ~500-word passages)
                 - list of passage strings
             model: Override the default model.
@@ -341,6 +340,9 @@ class SequentialTask(Task):
             force: Bypass cache.
             verbose: Print progress to stderr.
             save: Path to save JSON output (or True for auto-naming).
+            source_label: Human-readable label for progress output.
+            cache_key: Stable identifier for caching (e.g. text ID).
+                If not provided, falls back to source_label.
 
         Returns:
             dict: Aggregated results from all chunks.
@@ -352,7 +354,8 @@ class SequentialTask(Task):
         model = model or getattr(self, 'model', None) or DEFAULT_MODEL
 
         pdf, auto_label = self._load_passages(source)
-        source_label = source_label or auto_label
+        source_label = source_label or cache_key or auto_label
+        cache_key = cache_key or source_label
         n_chunks = (len(pdf) + chunk_size - 1) // chunk_size
         if limit_chunks:
             n_chunks = min(n_chunks, limit_chunks)
@@ -377,8 +380,8 @@ class SequentialTask(Task):
             passages_text = self.format_passages(chunk_df, start)
             prompt = context + "\n\n" + f"PASSAGES:\n{passages_text}"
 
-            cache_key = {
-                'task': self.task_name, 'text_id': source_label,
+            chunk_cache_key = {
+                'task': self.task_name, 'text_id': cache_key,
                 'chunk': chunk_idx, 'model': model,
                 'chunk_size': chunk_size,
             }
@@ -387,7 +390,7 @@ class SequentialTask(Task):
                 raw = llm.generate(
                     prompt=prompt,
                     system_prompt=self.system_prompt,
-                    cache_key=cache_key,
+                    cache_key=chunk_cache_key,
                     force=force,
                 )
             except Exception as e:
@@ -439,11 +442,7 @@ class SequentialTask(Task):
         return model.split('/')[-1].lower().replace('.', '').replace(' ', '_')
 
     def _save_result(self, output, save, source_label, model):
-        """Save aggregated result to JSON.
-
-        When lltk is available and source_label looks like an lltk text ID,
-        writes to lltk.task_path(). Otherwise falls back to data/.
-        """
+        """Save aggregated result to JSON."""
         if save is True:
             m_slug = self.model_slug(model)
             save = self._resolve_save_path(source_label, m_slug)
@@ -454,13 +453,6 @@ class SequentialTask(Task):
         print(f"Saved to {save}", file=sys.stderr)
 
     def _resolve_save_path(self, source_label, model_slug):
-        if source_label.startswith('_'):
-            try:
-                import lltk
-                task_dir = lltk.task_path(source_label, self.task_name)
-                return os.path.join(task_dir, f'{model_slug}.json')
-            except (ImportError, Exception):
-                pass
         source_slug = source_label.replace('/', '_').replace(' ', '_').strip('_')
         return os.path.normpath(os.path.join(
             STASH_PATH, '..', f'{self.task_name}_{source_slug}_{model_slug}.json',

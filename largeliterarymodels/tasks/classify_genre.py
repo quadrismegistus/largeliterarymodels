@@ -2,7 +2,11 @@
 
 from pydantic import BaseModel, Field
 from typing import Optional
-from lltk.tools.vocabs import GENRE_VOCAB
+GENRE_VOCAB = frozenset({
+    'Fiction', 'Poetry', 'Drama', 'Periodical', 'Essay', 'Treatise',
+    'Letters', 'Sermon', 'Biography', 'Nonfiction', 'Legal', 'Speech',
+    'Spoken', 'History', 'Criticism', 'Academic', 'Almanac', 'Reference',
+})
 from largeliterarymodels.task import Task
 
 GENRE_RAW_EXAMPLES = [

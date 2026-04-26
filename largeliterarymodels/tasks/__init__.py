@@ -1,16 +1,12 @@
-"""Task catalog. Imports are lazy (PEP 562) so that tasks with optional
-dependencies (e.g. classify_genre → lltk) don't force those deps on users
-who only need lltk-free tasks like TranslationTask.
+"""Task catalog with lazy imports (PEP 562).
 
-Usage is unchanged:
-
+Usage:
     from largeliterarymodels.tasks import TranslationTask, GenreTask
 """
 
 import importlib
 
 _LAZY_IMPORTS = {
-    # classify_genre depends on lltk (GENRE_VOCAB is sourced from lltk.tools.vocabs)
     'GenreTask': ('.classify_genre', 'GenreTask'),
     'GenreClassification': ('.classify_genre', 'GenreClassification'),
     'format_text_for_classification': ('.classify_genre', 'format_text_for_classification'),

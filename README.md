@@ -7,7 +7,7 @@ A Python toolkit for using Large Language Models (LLMs) to produce structured, a
 
 **What it does:** You give it messy text (OCR scans, bibliographies, novel excerpts, archival documents) and a description of the structured data you want back (characters, citations, sentiments, relationships). It sends the text to an LLM, parses the response into clean structured data, caches everything so you never pay for the same query twice, and hands you back validated Python objects you can export to CSV or a pandas DataFrame.
 
-**Supported LLM providers:** Claude (Anthropic), GPT (OpenAI), Gemini (Google). No account with all three is needed -- any one will work.
+**Supported LLM providers:** Claude (Anthropic), GPT (OpenAI), Gemini (Google), and any OpenAI-compatible local server (vLLM, LM Studio, Ollama, llama.cpp).
 
 ## Table of Contents
 
@@ -17,29 +17,24 @@ A Python toolkit for using Large Language Models (LLMs) to produce structured, a
 - [Structured Extraction](#structured-extraction)
 - [Defining a Task](#defining-a-task)
 - [Working with Multiple Prompts](#working-with-multiple-prompts)
+- [Sequential Tasks](#sequential-tasks)
 - [Caching](#caching)
-- [Using local models (Ollama, vLLM, LM Studio)](#using-local-models-ollama-vllm-lm-studio)
+- [Using local models (vLLM, LM Studio, Ollama)](#using-local-models-vllm-lm-studio-ollama)
+- [CLI: litmod](#cli-litmod)
+- [Running at Scale](#running-at-scale)
+- [Relationship to LLTK](#relationship-to-lltk)
 - [Example: Bibliography Extraction](#example-bibliography-extraction)
 - [Starting Your Own Project](#starting-your-own-project)
-- [Using with LLTK](#using-with-lltk)
-- [Model Constants](#model-constants)
+- [Available Tasks](#available-tasks)
 - [Project Structure](#project-structure)
 
 ## Installation
 
 ### Prerequisites
 
-You need **Python 3.10 or later**. To check your version, open a terminal and run:
-
-```bash
-python --version
-```
-
-If you see something like `Python 3.10.6` or higher, you're good. If not, install a newer Python from [python.org](https://www.python.org/downloads/) or via [pyenv](https://github.com/pyenv/pyenv).
+You need **Python 3.10 or later**.
 
 ### Install from PyPI
-
-The simplest way to install:
 
 ```bash
 pip install largeliterarymodels
@@ -47,25 +42,13 @@ pip install largeliterarymodels
 
 This installs `largeliterarymodels` and all its dependencies: the Anthropic, OpenAI, and Google AI client libraries, [pydantic](https://docs.pydantic.dev/) for structured data extraction, and [HashStash](https://github.com/quadrismegistus/hashstash) for caching.
 
-### Install with LLTK (for literary corpus analysis)
-
-To use the built-in literary analysis tasks (genre classification, character networks, Frye mode analysis) with [LLTK](https://github.com/quadrismegistus/lltk) corpora:
-
-```bash
-pip install "largeliterarymodels[lltk]"
-```
-
-This adds [lltk-dh](https://pypi.org/project/lltk-dh/), which provides 50+ literary corpora, cross-corpus matching, and DuckDB-backed metadata. See [Using with LLTK](#using-with-lltk) below.
-
 ### Install from source (for development)
-
-If you want to modify the library itself:
 
 ```bash
 git clone https://github.com/quadrismegistus/largeliterarymodels.git
 cd largeliterarymodels
 python -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
@@ -79,29 +62,15 @@ To use an LLM, you need an API key from at least one provider. You only need one
 | OpenAI (GPT) | [platform.openai.com](https://platform.openai.com/api-keys) | `OPENAI_API_KEY` |
 | Google (Gemini) | [aistudio.google.com](https://aistudio.google.com/app/apikey) | `GEMINI_API_KEY` |
 
-Once you have a key, set it in your terminal before running any code:
+Set them in your shell:
 
 ```bash
-# Pick whichever provider(s) you have:
 export ANTHROPIC_API_KEY="sk-ant-your-key-here"
 export OPENAI_API_KEY="sk-your-key-here"
 export GEMINI_API_KEY="your-key-here"
 ```
 
-To avoid typing these every time, add the `export` lines to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) or create a `.env` file in your project directory.
-
-To check which keys are set:
-
-```python
-from largeliterarymodels import check_api_keys
-check_api_keys(verbose=True)
-```
-
-```
-  + ANTHROPIC_API_KEY
-  X OPENAI_API_KEY
-  + GEMINI_API_KEY
-```
+For local models (vLLM, LM Studio, Ollama), no API key is needed.
 
 ## Quick Start
 
@@ -110,54 +79,21 @@ check_api_keys(verbose=True)
 ```python
 from largeliterarymodels import LLM
 
-# Create an LLM instance (defaults to Claude Sonnet)
-llm = LLM()
-
-# Or specify a model:
-from largeliterarymodels import CLAUDE_OPUS, GPT_4O_MINI, GEMINI_FLASH
-llm = LLM(GPT_4O_MINI)
-llm = LLM(GEMINI_FLASH)
-
-# Generate text
+llm = LLM()  # defaults to Claude Sonnet
 response = llm.generate("What is the plot of Pamela by Samuel Richardson?")
 print(response)
 ```
 
-The response is automatically cached. If you run the exact same call again, it returns instantly without using any API credits.
+The response is automatically cached. Running the exact same call again returns instantly without using API credits.
 
-### Changing default parameters
+### Structured extraction
 
-```python
-from largeliterarymodels import LLM, CLAUDE_SONNET
-
-# Lower temperature = more deterministic output
-llm = LLM(CLAUDE_SONNET, temperature=0.2)
-
-# Set a system prompt that applies to all calls
-llm = LLM(system_prompt="You are an expert in 18th-century English literature.")
-response = llm.generate("Who is Pamela?")
-
-# Override per-call
-response = llm.generate(
-    "Who is Pamela?",
-    system_prompt="You are a children's librarian. Explain simply.",
-    temperature=0.9,
-)
-```
-
-## Structured Extraction
-
-This is the core feature. Instead of getting back free-form text, you define a **schema** -- a description of the exact fields you want -- and the LLM fills them in.
-
-You define schemas using [pydantic](https://docs.pydantic.dev/), which is a way of describing data structures in Python.
-
-### A simple example
+This is the core feature. Define a **schema** using pydantic, and the LLM fills it in:
 
 ```python
 from pydantic import BaseModel, Field
 from largeliterarymodels import LLM
 
-# Define what you want back
 class Sentiment(BaseModel):
     sentiment: str = Field(description="positive, negative, or neutral")
     confidence: float = Field(description="confidence score from 0.0 to 1.0")
@@ -174,7 +110,7 @@ print(result.confidence)    # 0.75
 print(result.explanation)   # "The passage juxtaposes extremes..."
 ```
 
-The `result` is a validated Python object -- not a string, not raw JSON. You can access its fields with dot notation.
+The `result` is a validated Python object with dot-notation access, not a string or raw JSON.
 
 ### Extracting a list of items
 
@@ -186,74 +122,17 @@ class Character(BaseModel):
     role: str = Field(description="role in the narrative")
     gender: str
 
-llm = LLM()
 characters = llm.extract(
     "Who are the main characters in Pride and Prejudice?",
     schema=list[Character],
-    system_prompt="You are a literary scholar.",
 )
-
 for c in characters:
     print(f"{c.name} ({c.gender}): {c.role}")
 ```
 
-```
-Elizabeth Bennet (Female): Protagonist; witty and independent young woman
-Mr. Darcy (Male): Male lead; proud wealthy gentleman
-Jane Bennet (Female): Elizabeth's gentle elder sister
-...
-```
-
-### Adding context with system prompts
-
-The `system_prompt` tells the LLM *how* to approach the task -- what expertise to assume, what conventions to follow:
-
-```python
-result = llm.extract(
-    scene_text,
-    schema=BechdelResult,
-    system_prompt="You are a film critic. Assess whether this scene passes the Bechdel test.",
-)
-```
-
-### Few-shot examples
-
-Few-shot examples show the LLM exactly what you expect. Each example is a pair: `(input_text, expected_output)`. The output can be a pydantic object or a plain dictionary.
-
-```python
-examples = [
-    # Example 1: show the LLM what good output looks like
-    (
-        "[INT. HOUSE]\nEMILY: What do you think about Michael?\nEMMA: He seems risky.",
-        Sentiment(sentiment="negative", confidence=0.7, explanation="Apprehension about Michael."),
-    ),
-    # Example 2: a contrasting case
-    (
-        "The sun shone brightly on the meadow.",
-        Sentiment(sentiment="positive", confidence=0.85, explanation="Bright, pleasant imagery."),
-    ),
-]
-
-result = llm.extract(
-    "The room was dark and cold.",
-    schema=Sentiment,
-    examples=examples,
-)
-```
-
-Few-shot examples dramatically improve accuracy, especially for domain-specific tasks. Even one or two examples help.
-
-### Error handling
-
-If the LLM returns malformed JSON, `extract()` will automatically retry (once by default). You can control this:
-
-```python
-result = llm.extract(prompt, schema=MySchema, retries=3)  # up to 3 retries
-```
-
 ## Defining a Task
 
-A **Task** bundles together everything needed for a specific extraction job: the schema, system prompt, examples, and configuration. This means you define your task once, then reuse it across many inputs and models.
+A **Task** bundles together everything needed for a specific extraction job: the schema, system prompt, examples, and configuration.
 
 ```python
 from pydantic import BaseModel, Field
@@ -267,7 +146,7 @@ class Character(BaseModel):
 
 class CharacterTask(Task):
     schema = list[Character]
-    system_prompt = "You are a literary scholar. Extract all named characters from the text."
+    system_prompt = "You are a literary scholar. Extract all named characters."
     examples = [
         (
             "Mr. Darcy danced with Elizabeth at the ball.",
@@ -280,54 +159,13 @@ class CharacterTask(Task):
     retries = 2
 ```
 
-### Using a Task
-
 ```python
 task = CharacterTask()
-
-# Extract from one text
 characters = task.run(chapter_text)
-for c in characters:
-    print(f"{c.name}: {c.role} ({c.prominence}/10)")
-
-# Try a different model
 characters_gpt = task.run(chapter_text, model="gpt-4o-mini")
-
-# Override system prompt for one call
-characters = task.run(chapter_text, system_prompt="Focus only on female characters.")
 ```
-
-### Task caching and results
-
-Each task gets its own separate cache directory (at `data/stash/<TaskClassName>/`). This keeps results organized and means you can clear one task's cache without affecting others.
-
-You can access all cached results as a DataFrame at any time:
-
-```python
-task = CharacterTask()
-task.map(chapter_texts)    # populate the cache
-
-# Get all results as a DataFrame
-df = task.df
-print(df.head())
-```
-
-The DataFrame includes metadata columns (`model`, `temperature`, `prompt`) alongside all schema fields. For `list[Model]` schemas, each item in the list becomes its own row.
 
 ## Working with Multiple Prompts
-
-### Batch generation
-
-```python
-llm = LLM()
-responses = llm.map(
-    ["Summarize Chapter 1.", "Summarize Chapter 2.", "Summarize Chapter 3."],
-    system_prompt="Summarize in one paragraph.",
-)
-# responses is a list of strings, in the same order as the prompts
-```
-
-### Batch extraction
 
 ```python
 task = CharacterTask()
@@ -335,50 +173,36 @@ results = task.map(
     [chapter_1_text, chapter_2_text, chapter_3_text],
     model="claude-sonnet-4-6",
 )
-# results is a list of list[Character], one per chapter
 ```
 
-Both `map()` methods run requests in parallel (4 threads by default), show a progress bar, and cache results. Re-running the same batch skips already-cached prompts:
+`map()` runs requests in parallel (4 threads by default), shows a progress bar, and caches results. Re-running the same batch skips already-cached prompts.
+
+## Sequential Tasks
+
+For long texts that need to be processed in chunks with rolling context (e.g., extracting a social network from a 300-page novel), use `SequentialTask`:
 
 ```python
-# This will only compute the new chapters, not re-do 1-3
-results = task.map(
-    [chapter_1_text, chapter_2_text, chapter_3_text, chapter_4_text],
-)
+from largeliterarymodels.tasks import SocialNetworkTask
+
+task = SocialNetworkTask(model="vllm/qwen3.6-27b")
+
+# Pass a list of passage strings
+result = task.run(passages, cache_key="my_text_id")
+
+# Or pass a .txt file path (auto-chunked)
+result = task.run("novel.txt", cache_key="novel")
 ```
 
-### Exporting to CSV
+`SequentialTask.run()` processes passages in chunks, feeding forward a rolling state (e.g., the character roster so far) to maintain consistency across chunks. Results are cached per-chunk, so interrupted runs resume where they left off.
 
-Since extraction results are pydantic objects, converting to a pandas DataFrame is straightforward:
-
-```python
-import pandas as pd
-
-# If results is a list of lists (from task.map), flatten first
-flat = [entry for chunk in results for entry in chunk]
-
-df = pd.DataFrame([entry.model_dump() for entry in flat])
-df.to_csv("characters.csv", index=False)
-print(df.head())
-```
-
-Or use the task's built-in DataFrame (see [Task caching and results](#task-caching-and-results) above).
+**Key parameters:**
+- `source`: list of passage strings, or path to a .txt file
+- `cache_key`: stable identifier for caching (e.g., a text ID)
+- `save`: path to save the aggregated JSON result, or `False` to skip
 
 ## Caching
 
-All LLM calls are automatically cached using [HashStash](https://github.com/quadrismegistus/hashstash). The cache key is the combination of:
-
-- `prompt` (the input text)
-- `model` (which LLM you used)
-- `system_prompt`
-- `temperature`
-- `max_tokens`
-- `schema` name (for `extract()` calls)
-
-This means:
-- **Same prompt + same model = cached** (instant, free)
-- **Same prompt + different model = separate cache entry** (lets you compare models)
-- **Same prompt + different system_prompt = separate cache entry**
+All LLM calls are automatically cached using [HashStash](https://github.com/quadrismegistus/hashstash). The cache key includes the prompt, model, system prompt, temperature, and schema. Same inputs = instant cached result.
 
 Cache is stored in `data/stash/` inside the repository. To force a fresh generation:
 
@@ -386,248 +210,201 @@ Cache is stored in `data/stash/` inside the repository. To force a fresh generat
 response = llm.generate("What is the plot of Pamela?", force=True)
 ```
 
-### Provider-side prompt caching
+Provider-side prompt caching (Anthropic, OpenAI) is enabled automatically for repeat calls within a batch, cutting input costs ~10x on long system prompts.
 
-On top of local HashStash caching, `largeliterarymodels` also turns on **provider-side prompt caching** where the API supports it. For long Task system prompts (which include few-shot examples), this cuts input cost ~10x on repeat calls within a single batch — Anthropic's default 5-minute cache window covers typical `task.map()` workloads.
+## Using local models (vLLM, LM Studio, Ollama)
 
-- **Anthropic**: enabled automatically. `providers.call_anthropic` marks the system field with `cache_control: {type: "ephemeral"}` on every call. Cache hits bill at ~10% of input rate.
-- **OpenAI**: automatic on the API side; no client-side change needed. Hits above 1024 tokens bill at ~50% of input rate.
-- **Gemini**: explicit context caching exists (`client.caches.create`) but the minimum of ~32K tokens makes it irrelevant for Task-sized system prompts. Not implemented.
-
-**Caching thresholds are model-specific — and higher than the docs claim.** Empirically verified (April 2026):
-
-| Model | Docs say | Reality (caches at ≥) |
-|---|---|---|
-| Claude Sonnet 4.6 | 1024 | ~2048 tokens |
-| Claude Haiku 4.5 | 1024 | **~6000 tokens** |
-| Claude Opus 4.7 | 1024 | ~2048 (assumed by analogy) |
-| GPT-4o family | 1024 | 1024 (automatic) |
-
-Below the threshold, the `cache_control` marker is silently ignored — no error, just no cache. **This matters most for cost-optimized Haiku batches**: a Task whose system prompt fits in 3–4K tokens will cache cleanly on Sonnet but not on Haiku, and 27K calls at Haiku-uncached pricing is ~$70, not the $5-10 a naive Haiku estimate suggests.
-
-Auditing a Task's system prompt size:
-
-```python
-import tiktoken
-from largeliterarymodels.llm import _build_extract_prompt
-from largeliterarymodels.tasks import TranslationTask
-
-t = TranslationTask()
-full_system, _ = _build_extract_prompt(
-    prompt="", schema=t.schema,
-    system_prompt=t.system_prompt, examples=t.examples,
-)
-n = len(tiktoken.get_encoding("cl100k_base").encode(full_system))
-# tiktoken undercounts ~18% vs Anthropic's tokenizer.
-# Safe caching margins:
-#   Sonnet/Opus: n ≥ 2400 tiktoken (~2800 Anthropic)
-#   Haiku:       n ≥ 5500 tiktoken (~6500 Anthropic)
-```
-
-Of the built-in tasks, as of April 2026: `GenreTask`, `FryeTask`, `PassageTask`, `CharacterIntroTask`, and `TranslationTask` cache on Sonnet/Opus. Only `PassageTask` currently crosses the Haiku threshold. If you plan a high-volume Haiku run with a different task, consider expanding its `examples` list with genuinely useful additions until it crosses 6K tokens.
-
-## Using local models (Ollama, vLLM, LM Studio)
-
-Any OpenAI-compatible local inference server works by using one of the local prefixes:
+Any OpenAI-compatible local inference server works:
 
 ```python
 from largeliterarymodels import LLM
-llm = LLM(model="local/llama3.3")  # or "ollama/mistral", "vllm/qwen2.5", "lmstudio/..."
-response = llm.generate("Translate 'freedom' to German.")
+llm = LLM(model="lmstudio/qwen3.5-35b-a3b")
+llm = LLM(model="vllm/qwen3.6-27b")
+llm = LLM(model="ollama/mistral")
 ```
 
-By default, `largeliterarymodels` points at Ollama's usual endpoint (`http://localhost:11434/v1`). Override by setting `LOCAL_BASE_URL` in the environment (e.g. a different port, a remote vLLM host, or LM Studio on a LAN box).
+By default, local models connect to `http://localhost:11434/v1` (Ollama's default). Override with:
 
 ```bash
-export LOCAL_BASE_URL="http://localhost:8000/v1"   # vLLM default
-export LOCAL_BASE_URL="http://192.168.1.50:11434/v1"  # remote Ollama
+export LOCAL_BASE_URL="http://localhost:8000/v1"   # vLLM
+export LOCAL_BASE_URL="http://localhost:1234/v1"   # LM Studio
 ```
 
-The local provider reuses the OpenAI SDK, so any inference server that speaks the OpenAI chat-completions protocol (Ollama, vLLM, LM Studio, llama.cpp server, SGLang, Together's self-host mode) will work without further config.
+## CLI: litmod
 
-**Thinking / reasoning mode**. Ollama's reasoning models (Qwen 3, DeepSeek R1, Gemma 4) expose a `think: true|false` toggle on their native `/api/chat` endpoint, with chain-of-thought returned in a separate `message.thinking` field. This library's `call_local` goes through the OpenAI-compatible `/v1/chat/completions` endpoint, which does **not** accept the `think` parameter — so by default, reasoning models run in their no-think mode when invoked via `LLM(model="ollama/qwen3:14b")`. In practice, empirical testing on TranslationTask and GenreTask shows no-think mode is both faster (10–20x) and produces more reliably-parsed JSON than thinking mode; thinking responses under a tight `num_predict` budget silently return empty content. If you specifically need chain-of-thought output from a local model, POST directly to `http://localhost:11434/api/chat` with `{"think": true, "options": {"num_predict": 8192}}` rather than using the `LLM` class.
+The package includes a CLI tool:
 
-**Quality caveat.** Open-weight models are meaningfully below API-tier Claude and GPT on the workloads this library is built for:
+```bash
+litmod ls                                      # list available tasks
+litmod show GenreTask                          # show task schema + fixtures
+litmod smoke GenreTask --model sonnet          # test on built-in fixtures
+litmod run GenreTask --input data/manifest.csv --model sonnet
+litmod annotate GenreTask --port 8989          # human annotation web app
+```
 
-- **Structured JSON compliance**: small open models produce malformed JSON more often; retries compound at batch scale.
-- **Specialist literary knowledge**: `GenreTask`/`FryeTask`/`PassageTask` rely on recognition of specific early-modern works and authors. Open models under 70B rarely have the coverage.
-- **Multilingual nuance**: Llama 3.3 70B's German/French translation quality is noticeably below Haiku 4.5 on `TranslationTask`-shaped prompts.
+### Cloud GPU management (Vast.ai)
 
-Treat local models as complements rather than drop-in replacements:
+For running sequential tasks at scale on rented GPUs:
 
-- **Validation / redundancy passes**: back-translation checks, cross-model agreement tests — the different model family is an asset.
-- **Development and iteration**: draft prompts, debug schemas, run regression tests without burning API credits.
-- **New tasks where quality tolerance is high**: initial exploration, rough-cut classification at scale.
+```bash
+litmod cloud launch              # find + rent cheapest A100 80GB (~$0.85/hr)
+litmod cloud setup               # install vLLM + largeliterarymodels over SSH
+litmod cloud upload passages_c19 # rsync passage files to instance
+litmod cloud run passages_c19    # start vLLM + batch in tmux (survives disconnects)
+litmod cloud status              # check progress, running cost, tail log
+litmod cloud download            # rsync results back locally
+litmod cloud stop                # destroy instance (stops all billing)
+litmod cloud ssh                 # interactive shell access
+```
 
-Don't swap a validated Haiku/Sonnet pipeline to a local model as a pure cost optimization — the quality drop will usually show up in the output.
+State is persisted in `.vastai.json` so everything is resumable across disconnects. Requires a [Vast.ai](https://vast.ai) account and API key (`pip install vastai && vastai set api-key YOUR_KEY`).
+
+## Running at Scale
+
+For processing hundreds or thousands of texts, the workflow splits across two environments:
+
+### On GPU (Colab, Vast.ai, or HPC)
+
+1. **Export passages** locally (where your database is):
+   ```bash
+   python scripts/hpc/export_passages.py --subcollection Nineteenth-Century_Fiction --out data/passages_c19
+   ```
+
+2. **Upload and run** on the GPU:
+   ```bash
+   # Vast.ai
+   litmod cloud upload passages_c19
+   litmod cloud run passages_c19
+
+   # Or Colab: upload JSONL files, then:
+   python scripts/batch_social_network.py --text-dir passages/ --output-dir results/ --model vllm-qwen36 --workers 4
+   ```
+
+3. **Download results** and ingest locally:
+   ```bash
+   litmod cloud download
+   lltk ingest-tasks social_network data/cloud_results/passages_c19/
+   ```
+
+The batch script handles resume-from-failure (skips texts with existing output), parallel workers, and sharding across multiple processes.
+
+### Passage export format
+
+Exported files are JSONL with an `_id` metadata header:
+
+```json
+{"_id": "_chadwyck/Nineteenth-Century_Fiction/ncf0101.01", "_n_passages": 298}
+{"seq": 0, "text": "CHAPTER I. In which the reader...", "n_words": 487}
+{"seq": 1, "text": "The morning was bright and clear...", "n_words": 512}
+```
+
+The `_id` in the header is authoritative for result placement -- filenames are slugified and not used for identity.
+
+## Relationship to LLTK
+
+This package is designed to work with [LLTK](https://github.com/quadrismegistus/lltk) (Literary Language Toolkit) but does not depend on it. The division of labor:
+
+| | largeliterarymodels | lltk |
+|---|---|---|
+| **Role** | Pure extraction library | Corpus management + orchestration |
+| **Knows about** | Schemas, LLMs, providers, caching | Corpora, passages, metadata, ClickHouse |
+| **Input** | `str` or `list[str]` | Text IDs, database queries |
+| **Output** | Pydantic models / dicts | Annotations, task paths, scalar features |
+
+**lltk imports largeliterarymodels** (not the reverse). This means largeliterarymodels works anywhere -- laptops, Colab, HPC, cloud GPUs -- without needing a database connection.
+
+When used together, lltk orchestrates the pipeline:
+
+```python
+import lltk
+
+# lltk resolves passages and calls largeliterarymodels tasks
+lltk.annotate.run_task('genre', ids=['_estc/T068056'], model='gemini-2.5-flash')
+lltk.annotate.run_task('social_network', ids=['_chadwyck/.../haywood.02'], model='vllm/qwen3.6-27b')
+
+# Results stored in lltk's annotation system
+# Full JSON blobs go to lltk.task_path()
+# Scalar features go to lltk.annotations
+```
+
+Install together: `pip install largeliterarymodels lltk-dh`
 
 ## Example: Bibliography Extraction
 
-The library ships with a ready-made task for parsing messy OCR bibliography entries into structured data. This is a real-world example of the kind of work `largeliterarymodels` is designed for.
-
 ```python
 from largeliterarymodels.tasks import BibliographyTask, chunk_bibliography
-import pandas as pd
 
-# Load the task
 task = BibliographyTask()
 
-# Load and chunk your HTML file
 with open("data/bibliography.html") as f:
     raw_html = f.read()
 
-# Split into chunks (by year heading, max 20 entries each)
 chunks = chunk_bibliography(raw_html, max_entries=20)
-
-# Extract from all chunks (parallel, cached)
 all_entries = task.map(chunks)
 
-# Flatten and export
 flat = [entry for chunk_entries in all_entries for entry in chunk_entries]
 df = pd.DataFrame([e.model_dump() for e in flat])
 df.to_csv("data/bibliography.csv", index=False)
-
-# Or use the built-in DataFrame
-df = task.df
-```
-
-The `BibliographyEntry` schema extracts fields including: author, title, subtitle, year, edition, bibliographic ID, translation status, translator, printer, publisher, bookseller, and notes. See `largeliterarymodels/tasks/extract_bibliography.py` for the full schema and few-shot examples.
-
-### Comparing models
-
-```python
-from largeliterarymodels import CLAUDE_SONNET, GPT_4O_MINI, GEMINI_FLASH
-
-for model in [CLAUDE_SONNET, GPT_4O_MINI, GEMINI_FLASH]:
-    entries = task.run(chunks[0], model=model)
-    print(f"{model}: {len(entries)} entries extracted")
 ```
 
 ## Starting Your Own Project
 
-`largeliterarymodels` is a general-purpose toolkit. For your specific research project, we recommend creating a **separate repository** that depends on it:
-
-```
-my-bibliography-project/
-    task.py                 # your Task subclass with custom schema/examples
-    data/
-        source.html         # your input data
-        output.csv          # your results
-    notebooks/
-        extract.ipynb       # your working notebook
-```
-
-Your `task.py` defines only what's specific to your project:
+Create a separate repository that depends on this package:
 
 ```python
 from pydantic import BaseModel, Field
 from largeliterarymodels import Task
 
 class MyEntry(BaseModel):
-    # your custom fields here
+    # your custom fields
     ...
 
-class MyBibliographyTask(Task):
+class MyTask(Task):
     schema = list[MyEntry]
     system_prompt = "Your domain-specific instructions..."
     examples = [...]
 ```
 
-Install `largeliterarymodels` in your project's environment:
-
 ```bash
 pip install largeliterarymodels
 ```
 
-This way your project-specific decisions (field names, few-shot examples, OCR quirks) live in their own tracked repository, separate from the general-purpose toolkit.
+## Available Tasks
 
-## Using with LLTK
+| Task | Type | Input | Output |
+|------|------|-------|--------|
+| `GenreTask` | Base | Title/author metadata | Genre, subgenre, translation status, confidence |
+| `GenreTaskLite` | Base | Title/author metadata | Constrained genre tags (form + mode) |
+| `FryeTask` | Base | Text passages | Frye mode, mythos, referential mode |
+| `PassageContentTask` | Sequential | Passage list | 43 binary content flags per passage |
+| `PassageFormTask` | Sequential | Passage list | Formal/stylistic features per passage |
+| `SocialNetworkTask` | Sequential | Passage list | Characters, relations, events, dialogue, summaries |
+| `CharacterTask` | Base | BookNLP character roster | Merged/cleaned character list |
+| `CharacterIntroTask` | Base | Character first-mention passages | Introduction mode, social class |
+| `TranslationTask` | Base | Word in context | Historical translation + connotations |
+| `BibliographyTask` | Base | OCR bibliography pages | Structured bibliography entries |
 
-The library includes tasks designed for literary analysis with [LLTK](https://github.com/quadrismegistus/lltk) (Literary Language Toolkit), which provides 50+ literary corpora, cross-corpus deduplication, and DuckDB-backed metadata. Install together with `pip install "largeliterarymodels[lltk]"`, or install LLTK separately with `pip install lltk-dh`.
-
-### Genre classification
-
-Classify texts by genre from title/author metadata:
-
-```python
-from largeliterarymodels.tasks import GenreTask, format_text_for_classification
-
-task = GenreTask()
-prompt = format_text_for_classification(title="Pamela", author_norm="richardson", year=1740)
-result = task.run(prompt)
-print(result.genre, result.genre_raw, result.confidence)
-# Fiction Novel, Epistolary fiction 1.0
-```
-
-### Character resolution (BookNLP cleanup)
-
-BookNLP's NER is noisy on early modern texts. This task merges fragmented character clusters and filters noise:
-
-```python
-import lltk
-from largeliterarymodels.tasks import CharacterTask, format_character_roster
-
-t = lltk.load('chadwyck').text('Eighteenth-Century_Fiction/fieldinh.06')  # Tom Jones
-t.booknlp.parse()  # run BookNLP first
-
-task = CharacterTask()
-prompt = format_character_roster(t, max_chars=30)
-results = task.run(prompt)  # returns list[CharacterResolution]
-for r in results:
-    if r.type == 'character':
-        print(f"{r.name}: {r.ids}")
-# Tom Jones: ['C822', 'C625', 'C491']
-# Sophia Western: ['C821', 'C888', 'C4113']
-```
-
-Or use the LLTK wrapper directly:
-
-```python
-t.booknlp.resolve_characters()   # runs CharacterTask, saves JSON
-t.booknlp.plot_network()         # co-mention network visualization
-```
-
-### Available tasks
-
-| Task | Input | Output |
-|------|-------|--------|
-| `GenreTask` | Title/author metadata | Genre, subgenre, translation status |
-| `FryeTask` | Text passages (opening/middle/closing) | Frye mode, mythos, referential mode |
-| `PassageTask` | ~1K-word passages | Scene type, narration mode, allegorical regime |
-| `CharacterTask` | BookNLP character roster | Merged/cleaned character list |
-| `CharacterIntroTask` | Character first-mention passages | Introduction mode, social class, interiority |
-| `BibliographyTask` | OCR bibliography pages | Structured bibliography entries |
-
-## Model Constants
-
-For convenience, common model names are available as constants:
-
-```python
-from largeliterarymodels import (
-    CLAUDE_OPUS,    # claude-opus-4-6
-    CLAUDE_SONNET,  # claude-sonnet-4-6
-    CLAUDE_HAIKU,   # claude-haiku-4-5-20251001
-    GPT_4O,         # gpt-4o
-    GPT_4O_MINI,    # gpt-4o-mini
-    GEMINI_PRO,     # gemini-2.5-pro
-    GEMINI_FLASH,   # gemini-2.5-flash
-)
-
-llm = LLM(CLAUDE_OPUS)
-```
+**Base tasks** process a single prompt and return a Pydantic model. **Sequential tasks** process a list of passages in chunks with rolling state and return an aggregated dict.
 
 ## Project Structure
 
 ```
 largeliterarymodels/
-    __init__.py              # Exports: LLM, Task, model constants, check_api_keys
-    llm.py                   # Core LLM class: generate, extract, map, extract_map
-    task.py                  # Task class: reusable extraction task definition
-    providers.py             # Direct API calls to Anthropic, OpenAI, Google
-    utils.py                 # Utility functions
-    tasks/
-        extract_bibliography.py  # Built-in bibliography extraction task
-tests/                       # Test suite (run with: pytest)
+    __init__.py              # Exports: LLM, Task, model constants
+    llm.py                   # Core LLM class: generate, extract, map
+    task.py                  # Task + SequentialTask base classes
+    providers.py             # Direct API calls to Anthropic, OpenAI, Google, local
+    tasks/                   # Built-in task definitions (lazy-loaded)
+    analysis/                # Cross-task analysis: Fisher tests, ensembles, social networks
+    cli/                     # litmod CLI: ls, show, smoke, run, annotate, cloud
+    integrations/            # ClickHouse adapter (being migrated to lltk)
+    annotate.py              # FastAPI human-annotation web app
+scripts/
+    batch_social_network.py  # Batch runner for SocialNetworkTask (Colab/HPC/cloud)
+    analyze_social_networks.py  # Network statistics across parsed texts
+    hpc/                     # Passage export, SLURM scripts, Colab notebooks
+    cloud/                   # Vast.ai standalone entry point
+tests/                       # Test suite (pytest)
 ```
 
 ## License

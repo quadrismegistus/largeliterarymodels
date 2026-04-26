@@ -1,4 +1,4 @@
-"""LLM provider backends: Anthropic, OpenAI, Google GenAI.
+"""LLM provider backends: Anthropic, OpenAI, Google GenAI, Claude CLI.
 
 Each provider function takes a standard set of arguments and returns the
 response text as a string. No litellm — direct SDK calls only.
@@ -24,6 +24,8 @@ def route_provider(model):
     model_lower = model.lower()
     if model_lower.startswith(("local/", "ollama/", "vllm/", "lmstudio/")):
         return call_local
+    if model_lower.startswith("claude-cli/"):
+        return call_claude_cli
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
         return call_anthropic
     elif "gpt" in model_lower or "o1" in model_lower or "o3" in model_lower or model_lower.startswith("openai/"):
@@ -34,13 +36,13 @@ def route_provider(model):
         raise ValueError(
             f"Cannot determine provider for model '{model}'. "
             f"Model name should contain 'claude', 'gpt', or 'gemini', "
-            f"or use a prefix like 'anthropic/', 'openai/', 'google/', or 'local/'."
+            f"or use a prefix like 'anthropic/', 'openai/', 'google/', 'claude-cli/', or 'local/'."
         )
 
 
 def _strip_prefix(model):
     """Remove provider prefix like 'anthropic/' or 'openai/' from model name."""
-    for prefix in ("anthropic/", "openai/", "google/",
+    for prefix in ("anthropic/", "openai/", "google/", "claude-cli/",
                    "local/", "ollama/", "vllm/", "lmstudio/"):
         if model.lower().startswith(prefix):
             return model[len(prefix):]
@@ -116,6 +118,63 @@ def call_anthropic(prompt, model="claude-sonnet-4-20250514", system_prompt=None,
 
     response = client.messages.create(**api_kwargs)
     return response.content[0].text
+
+
+def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
+                    temperature=0.7, max_tokens=4096, images=None, **kwargs):
+    """Call Claude via the `claude` CLI tool (`claude -p --bare`).
+
+    Uses the locally installed Claude Code CLI, which authenticates via
+    the user's existing subscription. No ANTHROPIC_API_KEY needed.
+
+    Model string after prefix selects the model:
+        claude-cli/opus   → --model claude-opus-4-6
+        claude-cli/sonnet → --model claude-sonnet-4-6
+        claude-cli/haiku  → --model claude-haiku-4-5-20251001
+        claude-cli/<full> → --model <full>  (pass-through)
+    """
+    import json
+    import shutil
+    import subprocess
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise RuntimeError(
+            "Claude CLI not found. Install from https://claude.com/claude-code"
+        )
+
+    model_name = _strip_prefix(model)
+    model_map = {
+        "opus": "claude-opus-4-6",
+        "sonnet": "claude-sonnet-4-6",
+        "haiku": "claude-haiku-4-5-20251001",
+    }
+    model_name = model_map.get(model_name, model_name)
+
+    cmd = [
+        claude_bin, "-p", "--bare",
+        "--output-format", "json",
+        "--model", model_name,
+    ]
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
+    cmd.append(prompt)
+
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=300,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI failed (exit {result.returncode}): "
+            f"{result.stderr[:500]}"
+        )
+
+    try:
+        data = json.loads(result.stdout)
+        return data.get("result", result.stdout)
+    except json.JSONDecodeError:
+        return result.stdout
 
 
 def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,

@@ -56,8 +56,12 @@ EXAMPLES = [
 ]
 
 
+DEFAULT_OCR_MODEL = 'lmstudio/qwen/qwen3.6-35b-a3b'
+
+
 class OCRCleanTask(Task):
     name = "clean_ocr"
+    model = DEFAULT_OCR_MODEL
     schema = None
     system_prompt = SYSTEM_PROMPT
     examples = EXAMPLES

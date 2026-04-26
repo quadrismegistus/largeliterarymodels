@@ -54,6 +54,8 @@ _LAZY_IMPORTS = {
     'format_word_for_translation': ('.translate_word', 'format_word_for_translation'),
 
     'SocialNetworkTask': ('.extract_social_network', 'SocialNetworkTask'),
+
+    'OCRCleanTask': ('.clean_ocr', 'OCRCleanTask'),
 }
 
 

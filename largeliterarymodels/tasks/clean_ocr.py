@@ -37,23 +37,14 @@ Do NOT:
 - Change punctuation style (keep long dashes, semicolons, period usage)
 - Add or remove content — output must be the same text, just cleaned
 
-Return ONLY the cleaned text. No commentary, no explanations, no markdown."""
+Return ONLY the cleaned text. No commentary, no explanations, no markdown.
 
+Example input:
+THe Hiſtory of the moſt Renowned and Victorious Princeſs ELIZABETH, Late Queen of England. Containing all the moſt Im-
+portant and Remarkable Paſſages of State, both at Home and Abroad (ſo far as they were linked with Engliſh Affairs) during her Long and Proſperous Reign. VVritten by Mr. Cambden.
 
-EXAMPLES = [
-    (
-        "THe Hiſtory of the moſt Renowned and Victorious Princeſs "
-        "ELIZABETH, Late Queen of England. Containing all the moſt Im-\n"
-        "portant and Remarkable Paſſages of State, both at Home and "
-        "Abroad (ſo far as they were linked with Engliſh Affairs) during "
-        "her Long and Proſperous Reign. VVritten by Mr. Cambden.",
-        "The History of the most Renowned and Victorious Princess "
-        "ELIZABETH, Late Queen of England. Containing all the most "
-        "Important and Remarkable Passages of State, both at Home and "
-        "Abroad (so far as they were linked with English Affairs) during "
-        "her Long and Prosperous Reign. Written by Mr. Cambden.",
-    ),
-]
+Example output:
+The History of the most Renowned and Victorious Princess ELIZABETH, Late Queen of England. Containing all the most Important and Remarkable Passages of State, both at Home and Abroad (so far as they were linked with English Affairs) during her Long and Prosperous Reign. Written by Mr. Cambden."""
 
 
 DEFAULT_OCR_MODEL = 'lmstudio/qwen/qwen3.6-35b-a3b'
@@ -64,7 +55,6 @@ class OCRCleanTask(Task):
     model = DEFAULT_OCR_MODEL
     schema = None
     system_prompt = SYSTEM_PROMPT
-    examples = EXAMPLES
     retries = 1
     temperature = 0.1
 

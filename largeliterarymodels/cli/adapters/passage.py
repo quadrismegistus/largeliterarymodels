@@ -4,6 +4,23 @@ Serves PassageContentTask, PassageContentTaskV1, PassageFormTask, PassageTask â€
 any task whose prompt is built from (passage text, title, author, year).
 """
 
+import pandas as pd
+
+
+def _get_passages(ids, scheme='p500'):
+    """Fetch passage text from lltk.passages for the given text _ids."""
+    from largeliterarymodels.analysis._ch import _default_client
+    client = _default_client()
+    if not ids:
+        return pd.DataFrame(columns=['_id', 'scheme', 'seq', 'text', 'n_words'])
+    ids_sql = ', '.join("'" + i.replace("'", "''") + "'" for i in ids)
+    return client.query_df(
+        f"SELECT _id, scheme, seq, text, n_words "
+        f"FROM lltk.passages "
+        f"WHERE _id IN ({ids_sql}) AND scheme = '{scheme}' "
+        f"ORDER BY _id, seq"
+    )
+
 
 FIXTURE_META = [
     {
@@ -34,9 +51,8 @@ class PassageAdapter:
     family = 'passage'
 
     def fixtures(self) -> list[dict]:
-        import lltk
         ids = [f['_id'] for f in FIXTURE_META]
-        df = lltk.db.get_passages(ids)
+        df = _get_passages(ids)
         lookup = {(r['_id'], int(r['seq'])): r['text'] for _, r in df.iterrows()}
         out = []
         for f in FIXTURE_META:
@@ -65,12 +81,8 @@ class PassageAdapter:
         The manifest must have columns `_id` and `seq`. Optional columns
         (`title`, `author`, `year`, `tag_label`, `n_words`, ...) are
         preserved on each record and written through to the output CSV.
-        Passage text is fetched via `lltk.db.get_passages` and attached
-        as `text` on each record.
+        Passage text is fetched from lltk.passages via ClickHouse.
         """
-        import lltk
-        import pandas as pd
-
         df = pd.read_csv(source)
         for col in ('title', 'author', 'tag_label'):
             if col in df.columns:
@@ -84,7 +96,7 @@ class PassageAdapter:
 
         ids = list(dict.fromkeys(df['_id'].tolist()))
         wanted = set(zip(df['_id'], df['seq'].astype(int)))
-        pdf = lltk.db.get_passages(ids)
+        pdf = _get_passages(ids)
         pdf = pdf[pdf.apply(
             lambda r: (r['_id'], int(r['seq'])) in wanted, axis=1)]
 

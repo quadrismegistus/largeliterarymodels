@@ -57,11 +57,11 @@ def _load_labeled_embeddings(
         classifiers from learning "French embedding region = X" instead of
         actual textual signal.
     """
-    import lltk
     from largeliterarymodels.integrations import llmtasks
 
     if client is None:
-        client = lltk.db.client
+        from ._ch import _default_client
+        client = _default_client()
 
     labels = llmtasks.read_passage_annotations(
         task_name=task_name,
@@ -357,9 +357,9 @@ def predict_all(
         Wide DataFrame indexed by (_id, scheme, seq) with one column per
         predicted field (binary 0/1). Only includes fields passing thresholds.
     """
-    import lltk
     if client is None:
-        client = lltk.db.client
+        from ._ch import _default_client
+        client = _default_client()
 
     scaler = report.attrs['scaler']
     pca = report.attrs.get('pca')
@@ -459,13 +459,13 @@ def write_propagated(
     Returns the number of rows written.
     """
     from datetime import datetime, timezone
-    import lltk
     from largeliterarymodels.integrations.llmtasks import (
         PASSAGE_TABLE, ensure_schema,
     )
 
     if client is None:
-        client = lltk.db.client
+        from ._ch import _default_client
+        client = _default_client()
 
     ensure_schema(client=client)
     run_id = run_id or f'propagate-{datetime.now(timezone.utc).strftime("%Y%m%d")}'

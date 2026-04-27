@@ -323,8 +323,8 @@ def load_genre_extras(
         client: CH client
     """
     if client is None:
-        import lltk
-        client = lltk.db.client
+        from ._ch import _default_client
+        client = _default_client()
 
     ids_list = list(set(ids))
     if not ids_list:

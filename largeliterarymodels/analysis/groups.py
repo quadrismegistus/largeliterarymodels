@@ -24,25 +24,29 @@ def _halfcent(year) -> Optional[str]:
     return f'{lo}-{lo + 49}'
 
 
-def _load_text_tags(text_ids: list[str]) -> dict[str, set[str]]:
+def _load_text_tags(text_ids: list[str], client=None) -> dict[str, set[str]]:
     """Return {_id: set-of-tags} via lltk.text_genre_tags."""
     if not text_ids:
         return {}
-    import lltk
+    if client is None:
+        from ._ch import _default_client
+        client = _default_client()
     id_list = ",".join(f"'{i}'" for i in text_ids)
-    df = lltk.db.query(
+    df = client.query_df(
         f"SELECT _id, tag FROM lltk.text_genre_tags WHERE _id IN ({id_list})"
     )
     return df.groupby('_id')['tag'].apply(set).to_dict()
 
 
-def _load_text_years(text_ids: list[str]) -> dict[str, Optional[int]]:
+def _load_text_years(text_ids: list[str], client=None) -> dict[str, Optional[int]]:
     """Return {_id: year} via lltk.texts."""
     if not text_ids:
         return {}
-    import lltk
+    if client is None:
+        from ._ch import _default_client
+        client = _default_client()
     id_list = ",".join(f"'{i}'" for i in text_ids)
-    df = lltk.db.query(
+    df = client.query_df(
         f"SELECT _id, year FROM lltk.texts FINAL WHERE _id IN ({id_list})"
     )
     return dict(zip(df['_id'], df['year']))
@@ -56,6 +60,7 @@ def passage_groups(
     include_halfcent: bool = True,
     include_halfcent_tag: bool = True,
     min_group_n: int = 30,
+    client=None,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
     """Build a boolean group matrix for passage-shape data.
 
@@ -77,9 +82,9 @@ def passage_groups(
         raise ValueError("index must have a `_id` level")
 
     text_ids = sorted({tid for tid in index.get_level_values('_id').unique()})
-    tags = _load_text_tags(text_ids) if (include_tags or include_pairs
+    tags = _load_text_tags(text_ids, client=client) if (include_tags or include_pairs
                                           or include_halfcent_tag) else {}
-    years = _load_text_years(text_ids) if (include_halfcent
+    years = _load_text_years(text_ids, client=client) if (include_halfcent
                                              or include_halfcent_tag) else {}
 
     # Per-passage attributes

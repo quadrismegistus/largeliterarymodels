@@ -18,10 +18,8 @@ def fetch_passage_embeddings(
     Returns DataFrame with columns: _id, seq, embedding.
     """
     if client is None:
-        import clickhouse_connect
-        client = clickhouse_connect.get_client(
-            host='localhost', port=8123, username='lltk', password='lltk',
-        )
+        from ._ch import _default_client
+        client = _default_client()
     return client.query_df(
         "SELECT _id, seq, embedding "
         "FROM lltk.passage_embeddings "

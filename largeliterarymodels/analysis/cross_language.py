@@ -59,8 +59,8 @@ def compare_cross_language(
         where period is a string like '1600-1649'.
     """
     if client is None:
-        import lltk
-        client = lltk.db.client
+        from ._ch import _default_client
+        client = _default_client()
 
     specs: list[dict] = []
     for f in fields:

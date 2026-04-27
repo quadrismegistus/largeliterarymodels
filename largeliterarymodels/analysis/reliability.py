@@ -474,8 +474,8 @@ def write_consensus(
     from .. import integrations  # for PASSAGE_TABLE constant
     PASSAGE_TABLE = integrations.llmtasks.PASSAGE_TABLE
     if client is None:
-        import lltk
-        client = lltk.db.client
+        from ._ch import _default_client
+        client = _default_client()
 
     if consensus_df.empty:
         return 0

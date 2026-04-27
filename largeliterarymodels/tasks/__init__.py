@@ -56,6 +56,12 @@ _LAZY_IMPORTS = {
     'SocialNetworkTask': ('.extract_social_network', 'SocialNetworkTask'),
 
     'OCRCleanTask': ('.clean_ocr', 'OCRCleanTask'),
+
+    'PlotGenreTask': ('.classify_plot_genre', 'PlotGenreTask'),
+    'PlotGenreAnnotation': ('.classify_plot_genre', 'PlotGenreAnnotation'),
+
+    'SubgenreTask': ('.classify_subgenre', 'SubgenreTask'),
+    'SubgenreAnnotation': ('.classify_subgenre', 'SubgenreAnnotation'),
 }
 
 

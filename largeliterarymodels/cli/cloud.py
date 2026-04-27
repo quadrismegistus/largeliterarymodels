@@ -494,7 +494,8 @@ def cmd_stop(args):
             return
 
     print(f"Destroying instance {instance_id}...", file=sys.stderr)
-    vastai('destroy', 'instance', instance_id)
+    subprocess.run(['vastai', 'destroy', 'instance', instance_id],
+                   input='y\n', text=True, capture_output=True)
     STATE_FILE.unlink(missing_ok=True)
     print("Instance destroyed. All billing stopped.")
 

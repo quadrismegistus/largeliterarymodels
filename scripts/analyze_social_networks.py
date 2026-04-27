@@ -28,8 +28,13 @@ from largeliterarymodels.analysis.social_networks import (
 )
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
-SN_GLOB = os.path.expanduser(
-    '~/lltk_data/corpora/chadwyck/tasks/social_network/**/*.json')
+SN_GLOBS = [
+    os.path.expanduser('~/lltk_data/corpora/chadwyck/tasks/social_network/**/*.json'),
+    os.path.expanduser('~/lltk_data/corpora/markmark/tasks/social_network/**/*.json'),
+    os.path.expanduser('~/lltk_data/corpora/earlyprint/tasks/social_network/**/*.json'),
+    os.path.expanduser('~/lltk_data/corpora/ecco_tcp/tasks/social_network/**/*.json'),
+    os.path.expanduser('~/lltk_data/corpora/eebo_tcp/tasks/social_network/**/*.json'),
+]
 
 
 def load_parish_names(path):
@@ -186,7 +191,7 @@ def main():
         client = None
         print("No ClickHouse — metadata will be limited", file=sys.stderr)
 
-    files = sorted(glob.glob(SN_GLOB, recursive=True))
+    files = sorted(f for g in SN_GLOBS for f in glob.glob(g, recursive=True))
     print(f"Processing {len(files)} social network files", file=sys.stderr)
 
     rows = []
@@ -355,7 +360,9 @@ def main():
 
     # By decade
     decade_groups = []
-    for decade in range(1590, 1800, 10):
+    min_decade = (df['year'].min() // 10) * 10
+    max_decade = (df['year'].max() // 10) * 10 + 10
+    for decade in range(min_decade, max_decade, 10):
         sub = df[(df['year'] >= decade) & (df['year'] < decade + 10)]
         if len(sub):
             decade_groups.append((f"{decade}s", sub))

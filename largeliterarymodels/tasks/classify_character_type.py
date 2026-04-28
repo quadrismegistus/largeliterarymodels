@@ -187,7 +187,8 @@ Sir, Lady), occupations (merchant, lawyer, clerk), and social markers.
 viscount, lord, lady (with actual peerage, not courtesy)
 - untitled_gentry: esquire, gentleman, gentlewoman, landed families without titles
 - clergy: priests, ministers, bishops, monks, nuns, abbots
-- professional: lawyers, doctors, officers (commissioned), scholars, tutors
+- professional: lawyers, doctors, commissioned officers, scholars, tutors, \
+writers, artists, actors, musicians, government officials, magistrates, administrators
 - merchant: traders, shopkeepers, bankers, shipowners
 - artisan: skilled tradespeople, craftsmen, innkeepers
 - yeoman_farmer: independent small landholders, farmers

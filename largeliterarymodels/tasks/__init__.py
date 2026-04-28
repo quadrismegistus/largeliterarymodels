@@ -72,6 +72,9 @@ _LAZY_IMPORTS = {
 
     'ModernSubgenreTask': ('.classify_subgenre_modern', 'ModernSubgenreTask'),
     'ModernSubgenreAnnotation': ('.classify_subgenre_modern', 'ModernSubgenreAnnotation'),
+
+    'PassageSettingTask': ('.classify_passage_setting', 'PassageSettingTask'),
+    'PassageSettingAnnotation': ('.classify_passage_setting', 'PassageSettingAnnotation'),
 }
 
 

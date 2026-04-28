@@ -365,17 +365,47 @@ echo "Texts: $n_texts, Already done: $n_done"
     print("Starting vLLM server...", file=sys.stderr)
     ssh_run(state, run_script)
 
-    # TODO: make task configurable via --task flag when we have more
-    # cloud-scale sequential tasks beyond SocialNetworkTask
-    batch_cmd = (
-        f'cd {REMOTE_REPO} && '
-        f'python scripts/batch_social_network.py '
-        f'--text-dir {remote_passages} '
-        f'--output-dir {remote_output} '
-        f'--model vllm-qwen36 '
-        f'--workers {workers} '
-        f'2>&1 | tee /workspace/batch_{passages_name}.log'
-    )
+    task = getattr(args, 'task', 'social_network')
+    model = getattr(args, 'model', None) or f'vllm/{VLLM_SERVED_NAME}'
+
+    PASSAGE_TASKS = {'passage_setting'}
+    SUMMARY_TASKS = {'plot_genre', 'subgenre', 'subgenre_modern', 'character_type'}
+
+    if task == 'social_network':
+        batch_cmd = (
+            f'cd {REMOTE_REPO} && '
+            f'python scripts/batch_social_network.py '
+            f'--text-dir {remote_passages} '
+            f'--output-dir {remote_output} '
+            f'--model vllm-qwen36 '
+            f'--workers {workers} '
+            f'2>&1 | tee /workspace/batch_{passages_name}.log'
+        )
+    elif task in PASSAGE_TASKS:
+        batch_cmd = (
+            f'cd {REMOTE_REPO} && '
+            f'python scripts/batch_passage_task.py '
+            f'--task {task} '
+            f'--input {remote_passages} '
+            f'--output {remote_output} '
+            f'--model {model} '
+            f'--workers {workers} '
+            f'2>&1 | tee /workspace/batch_{passages_name}.log'
+        )
+    elif task in SUMMARY_TASKS:
+        batch_cmd = (
+            f'cd {REMOTE_REPO} && '
+            f'python scripts/batch_summary_task.py '
+            f'--task {task} '
+            f'--input {remote_passages} '
+            f'--output {remote_output} '
+            f'--model {model} '
+            f'--workers {workers} '
+            f'2>&1 | tee /workspace/batch_{passages_name}.log'
+        )
+    else:
+        print(f"Unknown task: {task}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Starting batch in tmux session '{session_name}'...", file=sys.stderr)
     ssh_run(state, f"tmux kill-session -t {session_name} 2>/dev/null || true")
@@ -528,6 +558,12 @@ def main(argv=None):
 
     p_run = sub.add_parser('run', help='Start batch processing in tmux')
     p_run.add_argument('passages_dir', help='Name of uploaded passages dir')
+    p_run.add_argument('--task', default='social_network',
+                       help='Task to run (default: social_network). '
+                            'Options: social_network, passage_setting, '
+                            'plot_genre, subgenre, character_type, subgenre_modern')
+    p_run.add_argument('--model', default=None,
+                       help=f'Model to use (default: vllm/{VLLM_SERVED_NAME})')
     p_run.add_argument('--workers', type=int, default=None,
                        help=f'Number of parallel workers (default: {BATCH_WORKERS})')
 

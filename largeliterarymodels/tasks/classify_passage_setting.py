@@ -149,12 +149,50 @@ class PassageSettingAnnotation(BaseModel):
             "mixed: the passage shifts between singulative and iterative."
         )
     )
+    space_traversed: Literal[
+        'none', 'room', 'building', 'grounds', 'neighborhood',
+        'city', 'region', 'country', 'international',
+    ] = Field(
+        description=(
+            "How much PHYSICAL SPACE does the action of this passage traverse? "
+            "This is NOT the setting — it is the RANGE OF MOVEMENT within the passage. "
+            "A drawing-room conversation where nobody moves = 'room'. "
+            "A drawing-room scene where someone arrives from across town = 'city'. "
+            "none: no movement — a gesture, a glance, interior thought, static scene. "
+            "room: movement within a single room. "
+            "building: moving between rooms or floors. "
+            "grounds: house and its immediate surroundings (garden, yard, drive). "
+            "neighborhood: a few streets, a village, a parish. "
+            "city: across a city or large town. "
+            "region: between towns, across a county or district. "
+            "country: cross-country journey. "
+            "international: across borders, overseas voyage."
+        )
+    )
+    time_elapsed: Literal[
+        'moment', 'minutes', 'hours', 'day',
+        'days', 'weeks', 'months', 'years', 'lifetime',
+    ] = Field(
+        description=(
+            "How much STORY TIME passes during this passage? "
+            "moment: seconds — a gesture, a single line of dialogue, a glance. "
+            "minutes: a short conversation, a brief encounter. "
+            "hours: an evening, a dinner party, a visit, a morning's work. "
+            "day: sunrise to sunset, or a single full day. "
+            "days: a few days compressed into the passage. "
+            "weeks: weeks summarized. "
+            "months: months compressed. "
+            "years: years pass in a paragraph or page. "
+            "lifetime: birth-to-death or a large portion of a life."
+        )
+    )
 
 
 SYSTEM_PROMPT = """\
 You are classifying the SETTING of a passage from an English prose fiction text.
 
-You will receive a ~500-1500 word passage with metadata (title, author, year).
+You will receive a ~500-1500 word passage of prose fiction. No title, author, or \
+date is provided — classify based solely on what is in the text.
 
 Determine:
 
@@ -220,12 +258,20 @@ wilderness_biblical, paradise_garden.
 "it was her custom to", "they always"
    - mixed: the passage shifts between singulative and iterative
 
+5. SPACE TRAVERSED — How much physical space does the ACTION traverse? \
+This is NOT the setting — it is the range of movement within the passage. \
+A drawing-room conversation where nobody moves = "room". \
+A drawing-room scene where someone arrives from across town = "city".
+   none / room / building / grounds / neighborhood / city / region / country / international
+
+6. TIME ELAPSED — How much story time passes during this passage?
+   moment / minutes / hours / day / days / weeks / months / years / lifetime
+
 Base classification on WHAT IS IN THE PASSAGE, not what you know about the novel."""
 
 
 EXAMPLES = [
     (
-        "Title: Pamela\nAuthor: Richardson\nYear: 1740\n\n"
         "I took the liberty to go up to my late lady's dressing-room, "
         "and there sat me down and wept. Mrs. Jervis came up to me and "
         "said, 'Why weeping so, Pamela?' I said, 'Oh dear Mrs. Jervis, "
@@ -236,10 +282,11 @@ EXAMPLES = [
             setting_specificity='typed',
             time_specificity='generic',
             narrative_frequency='singulative',
+            space_traversed='room',
+            time_elapsed='minutes',
         ),
     ),
     (
-        "Title: Middlemarch\nAuthor: Eliot\nYear: 1871\n\n"
         "The drawing-room at the Grange was the scene of a Christmas "
         "party. Old Mr. Brooke stood near the fire-place, his thin grey "
         "hair combed carefully across his forehead, one hand in the pocket "
@@ -251,6 +298,8 @@ EXAMPLES = [
             setting_specificity='fully_described',
             time_specificity='named',
             narrative_frequency='singulative',
+            space_traversed='room',
+            time_elapsed='hours',
         ),
     ),
 ]
@@ -267,3 +316,8 @@ class PassageSettingTask(Task):
     examples = EXAMPLES
     retries = 2
     temperature = 0.2
+
+    @staticmethod
+    def format_input(passage_text: str) -> str:
+        """Return passage text only — no title/author/year metadata."""
+        return passage_text.strip()

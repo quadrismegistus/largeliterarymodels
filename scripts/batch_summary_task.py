@@ -29,6 +29,9 @@ sys.stdout.reconfigure(line_buffering=True)
 TASK_MAP = {
     'plot_genre': ('largeliterarymodels.tasks', 'PlotGenreTask'),
     'subgenre': ('largeliterarymodels.tasks', 'SubgenreTask'),
+    'subgenre_modern': ('largeliterarymodels.tasks', 'ModernSubgenreTask'),
+    'character_type': ('largeliterarymodels.tasks', 'CharacterTypeTask'),
+    'passage_setting': ('largeliterarymodels.tasks', 'PassageSettingTask'),
 }
 
 

@@ -50,6 +50,8 @@ def main():
     parser.add_argument('--model', '-m', default='lmstudio/qwen/qwen3.6-27b')
     parser.add_argument('--workers', '-w', type=int, default=1)
     parser.add_argument('--force', action='store_true')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Print full result for each passage')
     parser.add_argument('--limit', type=int, default=0, help='Max passages to process (0=all)')
     args = parser.parse_args()
 
@@ -100,15 +102,18 @@ def main():
         out_path = os.path.join(args.output, out_name)
 
         if os.path.exists(out_path) and not args.force:
-            return 'skip', text_id, seq, 0
+            return 'skip', text_id, seq, 0, None
 
         if not p['text'].strip() or len(p['text']) < 20:
-            return 'empty', text_id, seq, 0
+            return 'empty', text_id, seq, 0, None
 
-        prompt, _ = format_passage(
-            p['text'], title=p['title'], author=p['author'], year=p['year'],
-            _id=p['_id'], section_id=f"p500:{p['seq']}",
-        )
+        if hasattr(task_class, 'format_input'):
+            prompt = task_class.format_input(p['text'])
+        else:
+            prompt, _ = format_passage(
+                p['text'], title=p['title'], author=p['author'], year=p['year'],
+                _id=p['_id'], section_id=f"p500:{p['seq']}",
+            )
 
         t0 = time.time()
         try:
@@ -117,7 +122,7 @@ def main():
         except Exception as e:
             elapsed = time.time() - t0
             print(f"  ERROR {text_id} p{seq}: {e} ({elapsed:.1f}s)", flush=True)
-            return 'error', text_id, seq, elapsed
+            return 'error', text_id, seq, elapsed, None
 
         output = {
             'metadata': {
@@ -132,11 +137,39 @@ def main():
         }
         with open(out_path, 'w') as fh:
             json.dump(output, fh, indent=2)
-        return 'ok', text_id, seq, elapsed
+        return 'ok', text_id, seq, elapsed, result
 
     counts = {'ok': 0, 'skip': 0, 'error': 0, 'empty': 0}
     total_time = 0
     done = 0
+
+    passage_lookup = {(p['_id'], p['seq']): p for p in passages}
+
+    def print_result(done, total, tid, seq, elapsed, result):
+        if args.verbose and result is not None:
+            p = passage_lookup.get((tid, seq), {})
+            year = p.get('year', '?')
+            author = str(p.get('author', '?')).split(',')[0][:20]
+            title = str(p.get('title', '?'))[:30]
+            text = p.get('text', '')
+            preview = f"{text[:60]}...{text[-40:]}" if len(text) > 110 else text[:100]
+            preview = preview.replace('\n', ' ')
+
+            d = result.model_dump()
+            parts = []
+            for k, v in d.items():
+                if k == 'settings_other' and not v:
+                    continue
+                parts.append(f"{k}={v}")
+            detail = '  '.join(parts)
+            print(f"\n  [{done}/{total}] {year} {author}: {title} p{seq} ({elapsed:.1f}s)", flush=True)
+            print(f"    \"{preview}\"", flush=True)
+            print(f"    {detail}", flush=True)
+        else:
+            avg = total_time / counts['ok']
+            remaining = (total - done) * avg / max(args.workers, 1)
+            print(f"  [{done}/{total}] {tid} p{seq} ({elapsed:.1f}s, "
+                  f"avg {avg:.1f}s, ~{remaining/60:.0f}min left)", flush=True)
 
     if args.workers > 1:
         futures = {}
@@ -145,28 +178,22 @@ def main():
                 futures[pool.submit(run_one, p)] = p
             for fut in as_completed(futures):
                 done += 1
-                status, tid, seq, elapsed = fut.result()
+                status, tid, seq, elapsed, result = fut.result()
                 counts[status] += 1
                 if status == 'ok':
                     total_time += elapsed
-                    avg = total_time / counts['ok']
-                    remaining = (len(passages) - done) * avg / args.workers
-                    if done % 50 == 0 or done <= 10:
-                        print(f"  [{done}/{len(passages)}] {tid} p{seq} ({elapsed:.1f}s, "
-                              f"avg {avg:.1f}s, ~{remaining/60:.0f}min left)", flush=True)
+                    if args.verbose or done % 50 == 0 or done <= 10:
+                        print_result(done, len(passages), tid, seq, elapsed, result)
                 elif status == 'skip' and done % 500 == 0:
                     print(f"  [{done}/{len(passages)}] skipping...", flush=True)
     else:
         for i, p in enumerate(passages):
-            status, tid, seq, elapsed = run_one(p)
+            status, tid, seq, elapsed, result = run_one(p)
             counts[status] += 1
             if status == 'ok':
                 total_time += elapsed
-                avg = total_time / counts['ok']
-                remaining = (len(passages) - i - 1) * avg
-                if (i + 1) % 50 == 0 or i < 10:
-                    print(f"  [{i+1}/{len(passages)}] {tid} p{seq} ({elapsed:.1f}s, "
-                          f"avg {avg:.1f}s, ~{remaining/60:.0f}min left)", flush=True)
+                if args.verbose or (i + 1) % 50 == 0 or i < 10:
+                    print_result(i + 1, len(passages), tid, seq, elapsed, result)
             elif status == 'skip' and (i + 1) % 500 == 0:
                 print(f"  [{i+1}/{len(passages)}] skipping...", flush=True)
 

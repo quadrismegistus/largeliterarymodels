@@ -159,7 +159,7 @@ class PassageSettingAnnotation(BaseModel):
             "A drawing-room conversation where nobody moves = 'room'. "
             "A drawing-room scene where someone arrives from across town = 'city'. "
             "none: no movement — a gesture, a glance, interior thought, static scene. "
-            "room: movement within a single room. "
+            "room: movement across a single room — standing, crossing to the window, etc. "
             "building: moving between rooms or floors. "
             "grounds: house and its immediate surroundings (garden, yard, drive). "
             "neighborhood: a few streets, a village, a parish. "

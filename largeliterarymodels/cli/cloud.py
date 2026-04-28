@@ -183,14 +183,21 @@ def cmd_launch(args):
     print(result)
 
     instance_id = None
-    try:
-        parsed = json.loads(result.split('\n')[-1])
-        instance_id = str(parsed.get('new_contract', ''))
-    except (json.JSONDecodeError, IndexError):
-        pass
+    # Try parsing each line as JSON (output may have non-JSON preamble)
+    for line in result.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict) and parsed.get('new_contract'):
+                instance_id = str(parsed['new_contract'])
+                break
+        except (json.JSONDecodeError, ValueError):
+            continue
     if not instance_id:
         for word in result.split():
-            if word.isdigit():
+            if word.isdigit() and len(word) >= 6:
                 instance_id = word
                 break
     if not instance_id:

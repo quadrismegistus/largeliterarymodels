@@ -158,23 +158,21 @@ class PassageSettingAnnotation(BaseModel):
         )
     )
     space_traversed: Literal[
-        'none', 'room', 'building', 'grounds', 'neighborhood',
-        'city', 'region', 'country', 'international',
+        'none', '1m', '10m', '100m', '1km', '10km', '100km', '1000km',
     ] = Field(
         description=(
             "How much PHYSICAL SPACE does the action of this passage traverse? "
             "This is NOT the setting — it is the RANGE OF MOVEMENT within the passage. "
-            "A drawing-room conversation where nobody moves = 'room'. "
-            "A drawing-room scene where someone arrives from across town = 'city'. "
-            "none: no movement — a gesture, a glance, interior thought, static scene. "
-            "room: movement across a single room — standing, crossing to the window, etc. "
-            "building: moving between rooms or floors. "
-            "grounds: house and its immediate surroundings (garden, yard, drive). "
-            "neighborhood: a few streets, a village, a parish. "
-            "city: across a city or large town. "
-            "region: between towns, across a county or district. "
-            "country: cross-country journey. "
-            "international: across borders, overseas voyage."
+            "A drawing-room conversation where nobody moves = 'none'. "
+            "A drawing-room scene where someone arrives from across town = '1km'. "
+            "none: no movement — static scene, interior thought, pure dialogue in place. "
+            "1m: a gesture, reaching, turning — body-scale movement. "
+            "10m: crossing a room, moving to a window or door. "
+            "100m: moving through a building, across a garden or courtyard. "
+            "1km: across a neighborhood, a village, a few streets. "
+            "10km: across a city, between nearby villages. "
+            "100km: between towns, across a county, a day's journey. "
+            "1000km: cross-country, overseas, international travel."
         )
     )
     time_elapsed: Literal[
@@ -266,11 +264,13 @@ wilderness_biblical, paradise_garden.
 "it was her custom to", "they always"
    - mixed: the passage shifts between singulative and iterative
 
-5. SPACE TRAVERSED — How much physical space does the ACTION traverse? \
-This is NOT the setting — it is the range of movement within the passage. \
-A drawing-room conversation where nobody moves = "room". \
-A drawing-room scene where someone arrives from across town = "city".
-   none / room / building / grounds / neighborhood / city / region / country / international
+5. SPACE TRAVERSED — What is the MAXIMUM physical distance covered by any movement \
+in this passage? This is NOT the setting — it is the farthest reach of movement. \
+If a character leaves a bedroom, drives to London, and enters an office, the answer \
+is the drive to London (~100km), not the final office-crossing (~10m). \
+A drawing-room conversation where nobody moves = "none". \
+A drawing-room scene where someone arrives from across town = "1km".
+   none / 1m / 10m / 100m / 1km / 10km / 100km / 1000km
 
 6. TIME ELAPSED — How much story time passes during this passage?
    moment / minutes / hours / day / days / weeks / months / years / lifetime
@@ -290,7 +290,7 @@ EXAMPLES = [
             setting_specificity='typed',
             time_specificity='generic',
             narrative_frequency='singulative',
-            space_traversed='room',
+            space_traversed='10m',
             time_elapsed='minutes',
         ),
     ),
@@ -306,7 +306,7 @@ EXAMPLES = [
             setting_specificity='fully_described',
             time_specificity='named',
             narrative_frequency='singulative',
-            space_traversed='room',
+            space_traversed='10m',
             time_elapsed='hours',
         ),
     ),

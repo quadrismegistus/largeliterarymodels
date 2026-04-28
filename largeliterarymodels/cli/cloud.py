@@ -549,6 +549,42 @@ def cmd_ssh(args):
     os.execvp(cmd[0], cmd)
 
 
+def cmd_attach(args):
+    """Attach to the running tmux batch session."""
+    state = load_state()
+    if not state.get('instance_id'):
+        print("No instance.", file=sys.stderr)
+        sys.exit(1)
+    cmd = ssh_cmd(state) + ['-t', 'tmux attach -t batch 2>/dev/null || tmux attach']
+    os.execvp(cmd[0], cmd)
+
+
+def cmd_cancel(args):
+    """Cancel the running batch (kill tmux session)."""
+    state = load_state()
+    if not state.get('instance_id'):
+        print("No instance.", file=sys.stderr)
+        sys.exit(1)
+    r = ssh_run(state, 'tmux kill-session -t batch 2>/dev/null; '
+                       'tmux kill-server 2>/dev/null; echo done',
+                capture=True, check=False)
+    print("Batch cancelled. vLLM still running — use 'stop' to destroy instance.",
+          file=sys.stderr)
+    state['running'] = None
+    save_state(state)
+
+
+def cmd_log(args):
+    """Tail the batch log."""
+    state = load_state()
+    if not state.get('instance_id'):
+        print("No instance.", file=sys.stderr)
+        sys.exit(1)
+    n = args.lines or 30
+    cmd = ssh_cmd(state) + [f'tail -{n} /workspace/batch*.log 2>/dev/null || echo "No log found"']
+    os.execvp(cmd[0], cmd)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='litmod cloud',
@@ -577,6 +613,11 @@ def main(argv=None):
     sub.add_parser('status', help='Check progress and running cost')
     sub.add_parser('download', help='Download results to local machine')
     sub.add_parser('stop', help='Destroy instance (stops all billing)')
+    sub.add_parser('attach', help='Attach to running batch tmux session')
+    sub.add_parser('cancel', help='Cancel running batch (keeps instance)')
+
+    p_log = sub.add_parser('log', help='Tail the batch log')
+    p_log.add_argument('--lines', '-n', type=int, default=30)
 
     p_ssh = sub.add_parser('ssh', help='Open interactive SSH session')
     p_ssh.add_argument('ssh_command', nargs='*', help='Optional command to run')
@@ -591,6 +632,9 @@ def main(argv=None):
         'status': cmd_status,
         'download': cmd_download,
         'stop': cmd_stop,
+        'attach': cmd_attach,
+        'cancel': cmd_cancel,
+        'log': cmd_log,
         'ssh': cmd_ssh,
     }
     commands[args.command](args)

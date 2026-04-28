@@ -377,7 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help='skip confirmation prompts')
     sp.add_argument('cloud_command',
                     choices=['launch', 'setup', 'upload', 'run', 'status',
-                             'download', 'stop', 'ssh'],
+                             'download', 'stop', 'attach', 'cancel', 'log', 'ssh'],
                     help='cloud subcommand')
     sp.add_argument('cloud_args', nargs=argparse.REMAINDER, help='arguments for subcommand')
     sp.set_defaults(func=cmd_cloud)

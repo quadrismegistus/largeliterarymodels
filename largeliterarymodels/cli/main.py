@@ -195,6 +195,8 @@ def cmd_batch(args) -> int:
     task_map = {
         'plot_genre': 'PlotGenreTask',
         'subgenre': 'SubgenreTask',
+        'character_type': 'CharacterTypeTask',
+        'subgenre_modern': 'ModernSubgenreTask',
     }
     if args.task not in task_map:
         raise SystemExit(f"Unknown task: {args.task}. Available: {list(task_map.keys())}")
@@ -355,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser('batch',
                         help='run summary-based task over social network exports')
-    sp.add_argument('task', choices=['plot_genre', 'subgenre'])
+    sp.add_argument('task', choices=['plot_genre', 'subgenre', 'character_type', 'subgenre_modern'])
     sp.add_argument('--input', '-i', required=True,
                     help='dir of social network JSONs')
     sp.add_argument('--output', '-o', default=None,

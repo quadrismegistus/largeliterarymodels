@@ -62,6 +62,16 @@ _LAZY_IMPORTS = {
 
     'SubgenreTask': ('.classify_subgenre', 'SubgenreTask'),
     'SubgenreAnnotation': ('.classify_subgenre', 'SubgenreAnnotation'),
+
+    'MajorGenreTask': ('.classify_major_genre', 'MajorGenreTask'),
+    'MajorGenreAnnotation': ('.classify_major_genre', 'MajorGenreAnnotation'),
+
+    'CharacterTypeTask': ('.classify_character_type', 'CharacterTypeTask'),
+    'CharacterTypeAnnotation': ('.classify_character_type', 'CharacterTypeAnnotation'),
+    'CharacterAnnotation': ('.classify_character_type', 'CharacterAnnotation'),
+
+    'ModernSubgenreTask': ('.classify_subgenre_modern', 'ModernSubgenreTask'),
+    'ModernSubgenreAnnotation': ('.classify_subgenre_modern', 'ModernSubgenreAnnotation'),
 }
 
 

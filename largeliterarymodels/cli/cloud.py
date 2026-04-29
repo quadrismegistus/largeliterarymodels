@@ -345,9 +345,14 @@ def cmd_run(args):
         sys.exit(1)
 
     passages_name = args.passages_dir
+    task = getattr(args, 'task', 'social_network')
     remote_passages = f'{REMOTE_PASSAGES}/{passages_name}'
-    remote_output = f'{REMOTE_RESULTS}/{passages_name}'
-    session_name = f'batch_{passages_name}'
+    if task != 'social_network':
+        remote_output = f'{REMOTE_RESULTS}/{passages_name}_{task}'
+        session_name = f'batch_{passages_name}_{task}'
+    else:
+        remote_output = f'{REMOTE_RESULTS}/{passages_name}'
+        session_name = f'batch_{passages_name}'
     workers = args.workers or BATCH_WORKERS
 
     run_script = f"""
@@ -389,7 +394,6 @@ echo "Texts: $n_texts, Already done: $n_done"
     print("Starting vLLM server...", file=sys.stderr)
     ssh_run(state, run_script)
 
-    task = getattr(args, 'task', 'social_network')
     model = getattr(args, 'model', None) or f'vllm/{VLLM_SERVED_NAME}'
 
     PASSAGE_TASKS = {'passage_setting', 'passage_narrativity'}
@@ -435,7 +439,7 @@ echo "Texts: $n_texts, Already done: $n_done"
     ssh_run(state, f"tmux kill-session -t {session_name} 2>/dev/null || true")
     ssh_run(state, f"tmux new-session -d -s {session_name} '{batch_cmd}'")
 
-    state['running'] = passages_name
+    state['running'] = passages_name if task == 'social_network' else f'{passages_name}_{task}'
     state['run_started_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
     save_state(state)
 
@@ -470,18 +474,22 @@ def cmd_status(args):
 
     for name in state.get('uploaded', []):
         remote_passages = f'{REMOTE_PASSAGES}/{name}'
-        remote_output = f'{REMOTE_RESULTS}/{name}'
         r = ssh_run(state, (
             f'n_texts=$(ls {remote_passages}/*.jsonl 2>/dev/null | wc -l); '
-            f'n_done=$(ls {remote_output}/*.json 2>/dev/null | wc -l); '
-            f'echo "$n_texts $n_done"'
+            f'for d in {REMOTE_RESULTS}/{name}*/; do '
+            f'  [ -d "$d" ] || continue; '
+            f'  dn=$(basename "$d"); '
+            f'  n=$(ls "$d"/*.json 2>/dev/null | wc -l); '
+            f'  echo "$n_texts $n $dn"; '
+            f'done'
         ), capture=True, check=False)
         if r.returncode == 0:
-            parts = r.stdout.strip().split()
-            if len(parts) == 2:
-                n_texts, n_done = int(parts[0]), int(parts[1])
-                pct = (n_done / n_texts * 100) if n_texts else 0
-                print(f"  {name}: {n_done}/{n_texts} done ({pct:.0f}%)")
+            for line in r.stdout.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    n_texts, n_done, dn = int(parts[0]), int(parts[1]), parts[2]
+                    pct = (n_done / n_texts * 100) if n_texts else 0
+                    print(f"  {dn}: {n_done}/{n_texts} done ({pct:.0f}%)")
 
     running = state.get('running')
     if running:
@@ -510,17 +518,24 @@ def cmd_download(args):
     os.makedirs(LOCAL_RESULTS, exist_ok=True)
 
     for name in state.get('uploaded', []):
-        remote_output = f'{REMOTE_RESULTS}/{name}'
-        local_dir = LOCAL_RESULTS / name
-        r = ssh_run(state, f'ls {remote_output}/*.json 2>/dev/null | wc -l',
+        r = ssh_run(state, f'ls -d {REMOTE_RESULTS}/{name}*/ 2>/dev/null',
                     capture=True, check=False)
-        n = int(r.stdout.strip()) if r.returncode == 0 else 0
-        if n == 0:
+        if r.returncode != 0 or not r.stdout.strip():
             print(f"  {name}: no results yet")
             continue
-        print(f"Downloading {n} results for {name}...", file=sys.stderr)
-        rsync_from(state, remote_output, local_dir)
-        print(f"  {name}: {n} files → {local_dir}")
+        for remote_dir in r.stdout.strip().splitlines():
+            remote_dir = remote_dir.rstrip('/')
+            dir_name = os.path.basename(remote_dir)
+            local_dir = LOCAL_RESULTS / dir_name
+            r2 = ssh_run(state, f'ls {remote_dir}/*.json 2>/dev/null | wc -l',
+                         capture=True, check=False)
+            n = int(r2.stdout.strip()) if r2.returncode == 0 else 0
+            if n == 0:
+                print(f"  {dir_name}: no results yet")
+                continue
+            print(f"Downloading {n} results for {dir_name}...", file=sys.stderr)
+            rsync_from(state, remote_dir, local_dir)
+            print(f"  {dir_name}: {n} files → {local_dir}")
 
     print(f"\nResults in {LOCAL_RESULTS}/")
     print(f"Ingest locally: lltk ingest-tasks social_network {LOCAL_RESULTS}/<dir>")

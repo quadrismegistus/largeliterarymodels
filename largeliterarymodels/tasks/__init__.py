@@ -75,6 +75,9 @@ _LAZY_IMPORTS = {
 
     'PassageSettingTask': ('.classify_passage_setting', 'PassageSettingTask'),
     'PassageSettingAnnotation': ('.classify_passage_setting', 'PassageSettingAnnotation'),
+
+    'PassageNarrativityTask': ('.classify_passage_narrativity', 'PassageNarrativityTask'),
+    'PassageNarrativityAnnotation': ('.classify_passage_narrativity', 'PassageNarrativityAnnotation'),
 }
 
 

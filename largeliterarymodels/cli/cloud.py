@@ -375,7 +375,7 @@ echo "Texts: $n_texts, Already done: $n_done"
     task = getattr(args, 'task', 'social_network')
     model = getattr(args, 'model', None) or f'vllm/{VLLM_SERVED_NAME}'
 
-    PASSAGE_TASKS = {'passage_setting'}
+    PASSAGE_TASKS = {'passage_setting', 'passage_narrativity'}
     SUMMARY_TASKS = {'plot_genre', 'subgenre', 'subgenre_modern', 'character_type'}
 
     if task == 'social_network':

@@ -26,6 +26,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 TASK_MAP = {
     'passage_setting': ('largeliterarymodels.tasks', 'PassageSettingTask'),
+    'passage_narrativity': ('largeliterarymodels.tasks', 'PassageNarrativityTask'),
 }
 
 

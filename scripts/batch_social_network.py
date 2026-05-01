@@ -207,7 +207,7 @@ def main():
         print(f"Single text: {args.text_id}", file=sys.stderr)
     elif args.text_dir:
         text_dir_mode = True
-        jsonl_files = sorted(Path(args.text_dir).glob('*.jsonl'))
+        jsonl_files = sorted(Path(args.text_dir).rglob('*.jsonl'))
         texts = []
         for f in jsonl_files:
             first_line = json.loads(f.read_text().split('\n', 1)[0])

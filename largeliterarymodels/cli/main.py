@@ -6,7 +6,7 @@ Subcommands:
     litmod smoke    <TaskName> --model M[,M2,...]
     litmod run      <TaskName> --input CSV --model M [--output CSV]
     litmod annotate <TaskName> [--annotator name] [--port N]
-    litmod cloud    <launch|setup|upload|run|status|download|stop|ssh>
+    litmod cloud    <launch|setup|upload|run|status|download|stop|sync|attach|cancel|log|ssh>
 """
 
 import argparse
@@ -16,6 +16,7 @@ import random
 import sys
 import time
 
+from .cloud import SUMMARY_TASK_MAP
 from .models import resolve_model
 from .output import compare_print, header_for, pretty_print
 from .registry import list_tasks, resolve
@@ -46,7 +47,7 @@ def cmd_show(args) -> int:
     print("--- fixtures ---")
     try:
         fx = adapter.fixtures()
-    except Exception as e:  # noqa: BLE001
+    except (SystemExit, Exception) as e:  # noqa: BLE001 — adapters raise SystemExit on missing data
         print(f"(failed to load fixtures: {e})")
         return 0
     for r in fx:
@@ -137,19 +138,25 @@ def cmd_run(args) -> int:
         prompts.append(p)
         metas.append(m)
 
-    if args.shuffle_seed is not None:
+    # Shuffle for even progress/ETA across eras, but write output rows in
+    # the original manifest order.
+    order = list(range(len(prompts)))
+    if not args.no_shuffle:
         rng = random.Random(args.shuffle_seed)
-        order = list(range(len(prompts)))
         rng.shuffle(order)
         prompts = [prompts[i] for i in order]
         metas = [metas[i] for i in order]
-        records = [records[i] for i in order]
 
     task = task_cls()
     t0 = time.time()
     results = task.map(prompts, model=model, metadata_list=metas,
                        num_workers=args.num_workers, verbose=True)
     elapsed = time.time() - t0
+
+    unshuffled = [None] * len(results)
+    for pos, orig in enumerate(order):
+        unshuffled[orig] = results[pos]
+    results = unshuffled
     print(f"\ntask.map done: {len(results)} in {elapsed/60:.1f} min "
           f"({elapsed/max(1,len(results)):.2f}s/record)",
           file=sys.stderr, flush=True)
@@ -192,12 +199,7 @@ def cmd_batch(args) -> int:
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
 
-    task_map = {
-        'plot_genre': 'PlotGenreTask',
-        'subgenre': 'SubgenreTask',
-        'character_type': 'CharacterTypeTask',
-        'subgenre_modern': 'ModernSubgenreTask',
-    }
+    task_map = SUMMARY_TASK_MAP
     if args.task not in task_map:
         raise SystemExit(f"Unknown task: {args.task}. Available: {list(task_map.keys())}")
 
@@ -357,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser('batch',
                         help='run summary-based task over social network exports')
-    sp.add_argument('task', choices=['plot_genre', 'subgenre', 'character_type', 'subgenre_modern'])
+    sp.add_argument('task', choices=sorted(SUMMARY_TASK_MAP))
     sp.add_argument('--input', '-i', required=True,
                     help='dir of social network JSONs')
     sp.add_argument('--output', '-o', default=None,
@@ -376,9 +378,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--yes', '-y', action='store_true',
                     help='skip confirmation prompts')
     sp.add_argument('cloud_command',
-                    choices=['launch', 'setup', 'upload', 'run', 'status',
-                             'download', 'stop', 'attach', 'cancel', 'log', 'ssh'],
-                    help='cloud subcommand')
+                    help='cloud subcommand: launch|setup|upload|run|status|'
+                         'download|stop|sync|attach|cancel|log|ssh '
+                         '(validated by the cloud parser)')
     sp.add_argument('cloud_args', nargs=argparse.REMAINDER, help='arguments for subcommand')
     sp.set_defaults(func=cmd_cloud)
 
@@ -394,7 +396,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--limit', type=int, default=0,
                     help='debug: run only the first N records (0 = all)')
     sp.add_argument('--shuffle-seed', type=int, default=42,
-                    help='shuffle prompt order (deterministic). Use None to disable.')
+                    help='seed for deterministic prompt-order shuffle '
+                         '(output CSV keeps manifest order)')
+    sp.add_argument('--no-shuffle', action='store_true',
+                    help='process prompts in manifest order')
     sp.set_defaults(func=cmd_run)
 
     return p

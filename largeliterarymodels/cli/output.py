@@ -6,6 +6,7 @@ Field-type dispatched so it works for any task without per-task hand-coding:
 - scalar enums, strs, numbers → key: value per line
 """
 
+import json
 import typing
 
 
@@ -93,13 +94,21 @@ def compare_print(results_by_model: dict, header: str) -> None:
         cells = [_fmt(v).ljust(col_w) for v in values]
         print(f"{mark} {label.ljust(label_w)}  {'  '.join(cells)}", flush=True)
 
+    def _canon(v):
+        # Hashable stand-in for any field value; lists compare
+        # order-insensitively, nested dicts (unhashable) via JSON.
+        if isinstance(v, list):
+            return frozenset(json.dumps(x, sort_keys=True, default=str)
+                             for x in v)
+        if isinstance(v, dict):
+            return json.dumps(v, sort_keys=True, default=str)
+        return v
+
     def _disagree(values):
         vals = [v for v in values if v is not None]
         if len(vals) < 2:
             return False
-        if isinstance(vals[0], list):
-            return len({frozenset(v) for v in vals}) > 1
-        return len(set(vals)) > 1
+        return len({_canon(v) for v in vals}) > 1
 
     header_cells = [t.ljust(col_w) for t in tags]
     print(f"  {'field'.ljust(label_w)}  {'  '.join(header_cells)}", flush=True)

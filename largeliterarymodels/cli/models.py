@@ -20,10 +20,12 @@ MODEL_TAGS: dict[str, str] = {
     # Llama (via LM Studio)
     'llama-70b':     'lmstudio/meta-llama-3.1-70b-instruct',
 
-    # Anthropic (family name already disambiguates)
+    # Anthropic (family name already disambiguates; rolling aliases so all
+    # three tags behave the same — pin a dated ID explicitly if you need
+    # byte-exact reproducibility)
     'sonnet':        'claude-sonnet-4-6',
     'opus':          'claude-opus-4-7',
-    'haiku':         'claude-haiku-4-5-20251001',
+    'haiku':         'claude-haiku-4-5',
 
     # Google Gemini
     'gemini-flash':  'gemini-2.5-flash',

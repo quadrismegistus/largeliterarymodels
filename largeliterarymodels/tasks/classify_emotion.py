@@ -1,7 +1,16 @@
-"""Emotion classification task: identify emotions in a passage using Plutchik's Wheel of Emotions."""
+"""Emotion classification task: identify emotions in a passage using the
+Feelings Wheel (Willcox).
 
-from pydantic import BaseModel, Field
+Taxonomy note: the vocabulary below is the Willcox/Junto "Feelings Wheel"
+(6 primaries — Happy, Surprise, Fear, Anger, Disgust, Sad — with synonym
+rings), NOT Plutchik's Wheel of Emotions (8 primaries organized by intensity,
+including trust and anticipation). The two are often conflated; cite the
+Feelings Wheel in any write-up of results from this task.
+"""
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 from largeliterarymodels.task import Task
+from ._emotion_common import CLASSIFICATION_PRINCIPLES_CORE
 
 EMOTION_WHEEL = {
     "Happy": {
@@ -69,6 +78,21 @@ for _primary, _tiers in EMOTION_WHEEL.items():
     ALL_EMOTIONS.update(_tiers["tertiary"])
 ALL_EMOTIONS = frozenset(ALL_EMOTIONS)
 
+# Case-insensitive lookup so 'joyful' normalizes to 'Joyful' instead of
+# failing validation; anything outside the vocabulary raises and feeds the
+# task's retry loop.
+_CANONICAL = {e.lower(): e for e in ALL_EMOTIONS}
+
+
+def normalize_emotion(value: str) -> str:
+    """Return the canonical vocabulary spelling, or raise ValueError."""
+    canon = _CANONICAL.get(value.strip().lower())
+    if canon is None:
+        raise ValueError(
+            f"emotion {value!r} is not in the Feelings Wheel vocabulary"
+        )
+    return canon
+
 
 def _format_wheel_for_prompt():
     lines = []
@@ -82,7 +106,7 @@ def _format_wheel_for_prompt():
 
 class EmotionInstance(BaseModel):
     emotion: str = Field(
-        description="Name of the emotion, drawn from the Plutchik Wheel vocabulary. "
+        description="Name of the emotion, drawn from the Feelings Wheel vocabulary. "
         "Prefer the most specific (tertiary) term that fits. "
         "Use a secondary or primary term only when the emotion is clearly present "
         "but no tertiary term captures it precisely."
@@ -91,6 +115,11 @@ class EmotionInstance(BaseModel):
         description="A short quotation from the passage (verbatim) that indicates "
         "or evokes this emotion. Keep under ~30 words."
     )
+
+    @field_validator("emotion")
+    @classmethod
+    def _emotion_in_vocabulary(cls, v):
+        return normalize_emotion(v)
 
 
 class EmotionAnnotation(BaseModel):
@@ -107,23 +136,35 @@ class EmotionAnnotation(BaseModel):
         "Must be one of the emotions listed above.",
     )
     emotional_valence: float = Field(
-        default=0.0,
+        default=0.0, ge=-1.0, le=1.0,
         description="Overall emotional valence of the passage from -1.0 (entirely "
         "negative: sad, fearful, angry, disgusted) to +1.0 (entirely positive: "
         "happy, surprised-positive). 0.0 for neutral or balanced.",
     )
     confidence: float = Field(
-        default=0.5,
+        default=0.5, ge=0.0, le=1.0,
         description="Overall confidence 0.0 to 1.0. Lower for ambiguous or "
         "emotionally flat passages.",
     )
 
+    @model_validator(mode="after")
+    def _dominant_consistent(self):
+        if self.dominant_emotion:
+            self.dominant_emotion = normalize_emotion(self.dominant_emotion)
+            listed = {e.emotion for e in self.emotions}
+            if self.dominant_emotion not in listed:
+                raise ValueError(
+                    f"dominant_emotion {self.dominant_emotion!r} must appear "
+                    f"in `emotions` (listed: {sorted(listed)})"
+                )
+        return self
 
-SYSTEM_PROMPT = f"""You are annotating passages from literary texts for emotional content using Plutchik's Wheel of Emotions.
+
+SYSTEM_PROMPT = f"""You are annotating passages from literary texts for emotional content using the Feelings Wheel (Willcox).
 
 You will receive a passage with optional metadata (title, author, year). Identify which emotions from the vocabulary below are represented, implied, or invoked in the text.
 
-## Emotion vocabulary (Plutchik's Wheel)
+## Emotion vocabulary (Feelings Wheel)
 
 {_format_wheel_for_prompt()}
 
@@ -131,13 +172,8 @@ You will receive a passage with optional metadata (title, author, year). Identif
 
 ## Classification principles
 
-- **Represented**: emotions explicitly named or described in the text ("she felt a pang of jealousy").
-- **Implied**: emotions strongly suggested by action, dialogue, or situation without being named ("he slammed the door and refused to speak" → Frustrated, Hostile).
-- **Invoked**: emotions the passage is designed to evoke in the reader through tone, imagery, or dramatic irony (a child's death scene invokes Sad/Despair even if no character's grief is described).
-- **Quote verbatim**: copy a short phrase directly from the passage — do not paraphrase.
-- **One entry per emotion**: if the same emotion appears multiple times, pick the strongest instance.
-- **Empty is valid**: if the passage is emotionally flat or purely expository, return an empty list.
-- **Dominant emotion**: choose the single emotion that best characterizes the passage's overall emotional register.
+{CLASSIFICATION_PRINCIPLES_CORE}
+- **Dominant emotion**: choose the single emotion that best characterizes the passage's overall emotional register; it must also appear in the emotions list.
 - **Valence**: rate the overall emotional direction. Most literary passages skew mixed or negative; do not default to positive."""
 
 
@@ -145,7 +181,69 @@ class EmotionTask(Task):
     name = "classify_emotion"
     schema = EmotionAnnotation
     system_prompt = SYSTEM_PROMPT
-    examples = []
+    examples = [
+        (
+            "PASSAGE: The wind rose in the night, and Ellen sat alone by the "
+            "cold hearth long after the candle had guttered out. He would not "
+            "come back; she had known it since morning, though she had not "
+            "dared to say the word even to herself.",
+            EmotionAnnotation(
+                emotions=[
+                    EmotionInstance(
+                        emotion="Despair",
+                        quote="He would not come back; she had known it since morning",
+                    ),
+                    EmotionInstance(
+                        emotion="Lonely",
+                        quote="Ellen sat alone by the cold hearth long after the candle had guttered out",
+                    ),
+                    EmotionInstance(
+                        emotion="Worried",
+                        quote="she had not dared to say the word even to herself",
+                    ),
+                ],
+                dominant_emotion="Despair",
+                emotional_valence=-0.8,
+                confidence=0.85,
+            ),
+        ),
+        (
+            "PASSAGE: When the letter came at last, Tom read it twice on the "
+            "doorstep, laughing aloud at nothing, and ran the whole mile home "
+            "to tell his mother — though a small cold doubt, even then, "
+            "tugged at the edge of his joy.",
+            EmotionAnnotation(
+                emotions=[
+                    EmotionInstance(
+                        emotion="Joyful",
+                        quote="laughing aloud at nothing",
+                    ),
+                    EmotionInstance(
+                        emotion="Excited",
+                        quote="ran the whole mile home to tell his mother",
+                    ),
+                    EmotionInstance(
+                        emotion="Worried",
+                        quote="a small cold doubt, even then, tugged at the edge of his joy",
+                    ),
+                ],
+                dominant_emotion="Joyful",
+                emotional_valence=0.6,
+                confidence=0.8,
+            ),
+        ),
+        (
+            "PASSAGE: The parish of Elmswell contains four thousand acres of "
+            "arable land, the greater part enclosed in 1782. The soil is a "
+            "heavy clay, and the chief crops are wheat and beans.",
+            EmotionAnnotation(
+                emotions=[],
+                dominant_emotion="",
+                emotional_valence=0.0,
+                confidence=0.9,
+            ),
+        ),
+    ]
     retries = 2
     temperature = 0.2
     max_tokens = 2048

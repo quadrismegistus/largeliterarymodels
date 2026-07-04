@@ -90,16 +90,24 @@ _LAZY_IMPORTS = {
     'EmotionInstanceZh': ('.classify_emotion_zh', 'EmotionInstanceZh'),
     'EMOTION_WHEEL_ZH': ('.classify_emotion_zh', 'EMOTION_WHEEL_ZH'),
     'ALL_EMOTIONS_ZH': ('.classify_emotion_zh', 'ALL_EMOTIONS_ZH'),
+    'EMOTION_GLOSSARY_ZH': ('.classify_emotion_zh', 'EMOTION_GLOSSARY_ZH'),
+    'FEELINGS_WHEEL_PARTIAL_EQUIVALENCES': ('.classify_emotion_zh', 'FEELINGS_WHEEL_PARTIAL_EQUIVALENCES'),
+    'normalize_emotion_zh': ('.classify_emotion_zh', 'normalize_emotion_zh'),
+    # Deprecated aliases (pre-rename export names)
     'EMOTION_GLOSSARY': ('.classify_emotion_zh', 'EMOTION_GLOSSARY'),
     'PLUTCHIK_PARTIAL_EQUIVALENCES': ('.classify_emotion_zh', 'PLUTCHIK_PARTIAL_EQUIVALENCES'),
 
     'AlignmentAsymmetryTask': ('.score_alignment_asymmetry', 'AlignmentAsymmetryTask'),
     'AlignmentAsymmetryAnnotation': ('.score_alignment_asymmetry', 'AlignmentAsymmetryAnnotation'),
+    'prepare_alignment_text': ('.score_alignment_asymmetry', 'prepare_alignment_text'),
+    # Deprecated alias
     'prepare_text': ('.score_alignment_asymmetry', 'prepare_text'),
 
     'ContradictionResponseTask': ('.classify_contradiction_response', 'ContradictionResponseTask'),
     'ContradictionAnnotation': ('.classify_contradiction_response', 'ContradictionAnnotation'),
     'ContradictionStrategy': ('.classify_contradiction_response', 'ContradictionStrategy'),
+    'format_contradiction_for_classification': ('.classify_contradiction_response', 'format_contradiction_for_classification'),
+    # Deprecated alias
     'format_for_classification': ('.classify_contradiction_response', 'format_for_classification'),
 }
 

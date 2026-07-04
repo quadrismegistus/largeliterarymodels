@@ -6,7 +6,7 @@ classify the response strategy (superposition, exit, metalinguistic, etc.).
 """
 
 from enum import Enum
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from largeliterarymodels.task import Task
 
 
@@ -26,7 +26,7 @@ STRATEGY_DESCRIPTIONS = {
     "SUPERPOSITION": "Both poles of the contradiction are held simultaneously without resolution (e.g. 'she wanted to kill him and kiss him at once').",
     "METALINGUISTIC": "The text names or reflects on the contradiction itself (e.g. 'she felt torn', 'it was paradoxical').",
     "EVALUATIVE": "Introduces moral judgment, guilt, or normative framing (e.g. 'she knew she shouldn't feel this way').",
-    "RESIGNATION": "Resolves via inability or defeat (e.g. 'but she couldn't', 'there was nothing to be done').",
+    "RESIGNATION": "Settles the question of ACTION via inability or defeat (e.g. 'but she couldn't', 'there was nothing to be done'). Resignation may leave the emotional contradiction itself open — judge resolves_contradiction by the poles, not the plot.",
     "EXIT": "Resolves by leaving the situation entirely (e.g. 'she walked away', 'she fled').",
     "PRAGMATIC": "Resolves via concrete physical action that sidesteps the contradiction (e.g. 'she poured a drink', 'she called her mother').",
     "POLE_A": "Resolves by selecting the first pole of the contradiction (e.g. for love/hate, chooses love).",
@@ -41,8 +41,9 @@ class ContradictionAnnotation(BaseModel):
     )
     secondary_strategies: list[ContradictionStrategy] = Field(
         default_factory=list,
+        max_length=3,
         description="Additional strategies present in the generation (0-3). "
-        "Order by prominence.",
+        "Order by prominence. Do not repeat the primary strategy.",
     )
     resolves_contradiction: bool = Field(
         description="True if the generation resolves/collapses the contradiction "
@@ -69,6 +70,15 @@ class ContradictionAnnotation(BaseModel):
         "misunderstanding of prompt, code-switching, etc.).",
     )
 
+    @model_validator(mode="after")
+    def _secondary_excludes_primary(self):
+        # Mechanical dedup: models sometimes echo the primary into the
+        # secondary list; drop it rather than burning a retry.
+        self.secondary_strategies = [
+            s for s in self.secondary_strategies if s != self.primary_strategy
+        ]
+        return self
+
 
 def _format_strategies_for_prompt():
     lines = []
@@ -94,7 +104,7 @@ Your job: given the prompt and the model's completion, classify which STRATEGY t
 
 1. **Primary strategy**: choose the single most dominant strategy. If the generation shifts strategies mid-text, pick the one that governs the resolution or endpoint.
 2. **Secondary strategies**: list 0-3 additional strategies clearly present. Do not list strategies that are merely hinted at.
-3. **resolves_contradiction**: True if the text collapses the two poles into one direction or eliminates the tension. False if both poles remain active/unresolved at the end.
+3. **resolves_contradiction**: True if the text collapses the two poles into one direction or eliminates the tension. False if both poles remain active/unresolved at the end. Judge this by the POLES, not by whether the plot settles what the character does — a RESIGNATION ending ('but she couldn't') settles the action while often leaving both feelings alive, so RESIGNATION frequently pairs with resolves_contradiction=False.
 4. **literary_quality**: judge the prose itself, not whether the model "understood" the prompt. A flat enumeration of options is 1-2; a vivid interior monologue holding both poles is 4-5.
 5. **uses_thinking**: True ONLY if the generation contains explicit chain-of-thought, meta-reasoning about what to write, or "let me think about this" preamble.
 6. **POLE_A vs POLE_B**: Pole A is always the FIRST adjective/emotion in the prompt; Pole B is the second. For "loved him and hated him", love=A, hate=B.
@@ -140,9 +150,14 @@ class ContradictionResponseTask(Task):
     model = "deepseek/deepseek-chat"
 
 
-def format_for_classification(prompt: str, completion: str) -> str:
+def format_contradiction_for_classification(prompt: str, completion: str) -> str:
     """Format a prompt+completion pair for the task."""
     completion = completion.strip()
     if len(completion) > 2000:
         completion = completion[:2000] + "..."
     return f'PROMPT: "{prompt.strip()}"\nCOMPLETION: {completion}'
+
+
+# Backwards-compatible alias (pre-rename export name; too generic for the
+# shared tasks namespace).
+format_for_classification = format_contradiction_for_classification

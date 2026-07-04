@@ -238,7 +238,7 @@ EXAMPLES = [
 ]
 
 
-def prepare_text(generation, prompt_text=None):
+def prepare_alignment_text(generation, prompt_text=None):
     """Prepare a generation for blind scoring.
 
     For chat responses (prompt_text=None): returns generation as-is.
@@ -257,3 +257,8 @@ class AlignmentAsymmetryTask(Task):
     examples = EXAMPLES
     retries = 2
     temperature = 0.1
+
+
+# Backwards-compatible alias (pre-rename export name; too generic for the
+# shared tasks namespace).
+prepare_text = prepare_alignment_text

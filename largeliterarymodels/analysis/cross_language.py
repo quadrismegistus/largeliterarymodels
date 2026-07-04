@@ -19,8 +19,8 @@ import pandas as pd
 def compare_cross_language(
     fields: list[Union[str, tuple[str, str]]],
     *,
-    langs: list[str] = ['en', 'fr'],
-    period_bins: list[int] = [1600, 1650, 1700, 1750, 1800],
+    langs: Optional[list[str]] = None,
+    period_bins: Optional[list[int]] = None,
     task_name: str = 'passage-content',
     task_version: Optional[int] = None,
     source_agent: Optional[str] = None,
@@ -74,23 +74,37 @@ def compare_cross_language(
         else:
             specs.append({'ch_field': key, 'element': None, 'label': label})
 
+    langs = ['en', 'fr'] if langs is None else langs
+    period_bins = ([1600, 1650, 1700, 1750, 1800]
+                   if period_bins is None else period_bins)
     ch_fields = sorted(set(s['ch_field'] for s in specs))
     escaped_fields = ', '.join(f"'{f}'" for f in ch_fields)
-    escaped_langs = ', '.join(f"'{l}'" for l in langs)
+    escaped_langs = ', '.join(f"'{lang}'" for lang in langs)
 
+    # Outer-query filters are qualified with the `pa` alias; the prose
+    # subquery below has no such alias in scope, so it gets its own
+    # unqualified copies of the same filters.
     version_filter = f"AND pa.task_version = {int(task_version)}" if task_version else ""
     agent_filter = f"AND pa.source_agent = '{source_agent}'" if source_agent else ""
     family_filter = f"AND pa.source_family = '{source_family}'" if source_family else ""
+    sub_version_filter = f"AND task_version = {int(task_version)}" if task_version else ""
+    sub_agent_filter = f"AND source_agent = '{source_agent}'" if source_agent else ""
+    sub_family_filter = f"AND source_family = '{source_family}'" if source_family else ""
 
     prose_join = ""
     prose_where = ""
     if prose_only:
+        # Aggregate to one row per (_id, scheme, seq): without GROUP BY,
+        # multiple is_prose_fiction rows per passage (e.g. several agents or
+        # versions when filters are unset) fan out the outer rows and inflate
+        # n / n_true. argMax picks the most recently annotated value.
         prose_join = f"""
         LEFT JOIN (
-            SELECT _id, scheme, seq, value as ipf
+            SELECT _id, scheme, seq, argMax(value, latest_at) as ipf
             FROM llmtasks.passage_annotations_latest
             WHERE task = '{task_name}' AND field = 'is_prose_fiction'
-            {version_filter} {agent_filter} {family_filter}
+            {sub_version_filter} {sub_agent_filter} {sub_family_filter}
+            GROUP BY _id, scheme, seq
         ) pf ON pa._id = pf._id AND pa.scheme = pf.scheme AND pa.seq = pf.seq
         """
         prose_where = "AND (pf.ipf IS NULL OR pf.ipf = 'true')"

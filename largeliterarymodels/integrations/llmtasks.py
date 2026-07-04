@@ -39,7 +39,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -339,7 +339,7 @@ def write_passage_annotations(
         task_class=task.__class__.__name__,
         source_family=source_family, source_agent=source_agent,
         task=task_name, task_version=task_version,
-        model=only_model or df['model'].iloc[0] if 'model' in df.columns else 'unknown',
+        model=only_model or (df['model'].iloc[0] if 'model' in df.columns else 'unknown'),
         temperature=getattr(task, 'temperature', 0.2),
         max_tokens=getattr(task, 'max_tokens', 4096),
         system_prompt=getattr(task, 'system_prompt', '') or '',
@@ -415,32 +415,53 @@ def read_passage_annotations(
         use_latest_view: if True, reads from passage_annotations_latest
             (argMax-resolved values); if False, reads raw passage_annotations.
     """
-    import pandas as pd
     if client is None:
         import lltk
         client = lltk.db.client
 
+    def _q(v) -> str:
+        """Escape single quotes for safe SQL string interpolation."""
+        return str(v).replace("'", "''")
+
     table = PASSAGE_LATEST_VIEW if use_latest_view else PASSAGE_TABLE
     where = []
     if ids:
-        id_list = ", ".join(f"'{i}'" for i in ids)
+        id_list = ", ".join(f"'{_q(i)}'" for i in ids)
         where.append(f"_id IN ({id_list})")
     if fields:
-        field_list = ", ".join(f"'{f}'" for f in fields)
+        field_list = ", ".join(f"'{_q(f)}'" for f in fields)
         where.append(f"field IN ({field_list})")
     if source_agent:
-        where.append(f"source_agent = '{source_agent}'")
+        where.append(f"source_agent = '{_q(source_agent)}'")
     if task_name:
-        where.append(f"task = '{task_name}'")
+        where.append(f"task = '{_q(task_name)}'")
     if task_version is not None:
         where.append(f"task_version = {int(task_version)}")
     where_clause = ("WHERE " + " AND ".join(where)) if where else ""
 
-    sql = (f"SELECT _id, scheme, seq, field, value "
+    sql = (f"SELECT _id, scheme, seq, field, value, source_agent, task_version "
            f"FROM {table} {where_clause}")
     long = client.query_df(sql)
     if long.empty:
-        return long
+        return long.drop(columns=['source_agent', 'task_version'],
+                         errors='ignore')
+
+    # Guard the pivot: aggfunc='first' would silently pick an arbitrary row
+    # when several (agent, version) slices coexist per (passage, field) cell.
+    dup_mask = long.duplicated(subset=['_id', 'scheme', 'seq', 'field'],
+                               keep=False)
+    if dup_mask.any():
+        dups = long[dup_mask]
+        offending_agents = sorted(map(str, dups['source_agent'].unique()))
+        offending_versions = sorted(map(str, dups['task_version'].unique()))
+        raise ValueError(
+            f"read_passage_annotations: {int(dup_mask.sum())} rows share the "
+            f"same (_id, scheme, seq, field) pivot cell — pivoting would "
+            f"silently mix annotations. Offending source_agents="
+            f"{offending_agents}, task_versions={offending_versions}. "
+            f"Pin source_agent= and/or task_version= to select one slice."
+        )
+    long = long.drop(columns=['source_agent', 'task_version'])
 
     wide = long.pivot_table(
         index=['_id', 'scheme', 'seq'],

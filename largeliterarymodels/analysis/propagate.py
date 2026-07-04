@@ -180,6 +180,7 @@ def evaluate_classifiers(
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
     from sklearn.decomposition import PCA
+    from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
     from .registry import resolve_task_class
@@ -192,11 +193,28 @@ def evaluate_classifiers(
     targets = _prepare_targets(labels, task_class.schema)
 
     X = emb_matrix.values.astype(np.float32)
+
+    # CV evaluation uses a Pipeline so scaler (+PCA) are fit per fold —
+    # fitting them on the full dataset before CV leaks test-fold statistics
+    # into preprocessing and optimistically biases the scores.
+    use_pca = bool(pca_components) and X.shape[1] > pca_components
+
+    def _make_pipeline():
+        steps = [('scaler', StandardScaler())]
+        if use_pca:
+            steps.append(('pca', PCA(n_components=pca_components)))
+        steps.append(('clf', LogisticRegression(max_iter=1000, C=1.0,
+                                                solver='lbfgs')))
+        return Pipeline(steps)
+
+    # Standalone full-data preprocessing — used ONLY for the final refit
+    # consumed by predict_all (fitting on all labeled data for deployment
+    # is fine; only the CV evaluation above must be leak-free).
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     pca = None
-    if pca_components and X_scaled.shape[1] > pca_components:
+    if use_pca:
         pca = PCA(n_components=pca_components)
         X_reduced = pca.fit_transform(X_scaled)
         log.info("PCA: %d -> %d (%.1f%% variance)",
@@ -219,11 +237,11 @@ def evaluate_classifiers(
 
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         accs, f1s, aucs = [], [], []
-        for train_idx, test_idx in skf.split(X_reduced, y):
-            clf = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs')
-            clf.fit(X_reduced[train_idx], y.values[train_idx])
-            y_pred = clf.predict(X_reduced[test_idx])
-            y_prob = clf.predict_proba(X_reduced[test_idx])[:, 1]
+        for train_idx, test_idx in skf.split(X, y):
+            pipe = _make_pipeline()
+            pipe.fit(X[train_idx], y.values[train_idx])
+            y_pred = pipe.predict(X[test_idx])
+            y_prob = pipe.predict_proba(X[test_idx])[:, 1]
 
             accs.append(accuracy_score(y.values[test_idx], y_pred))
             f1s.append(f1_score(y.values[test_idx], y_pred, zero_division=0))
@@ -254,7 +272,10 @@ def evaluate_classifiers(
     report.attrs['task_name'] = task_name
     report.attrs['task_version'] = task_version
     report.attrs['n_train'] = len(emb_matrix)
-    report.attrs['include_lang'] = True
+    # Reflect whether the language feature was ACTUALLY added by
+    # _load_labeled_embeddings (it is skipped when the lang query returns no
+    # rows) — otherwise predict_all would hstack a column the scaler never saw.
+    report.attrs['include_lang'] = 'lang_fr' in emb_matrix.columns
     return report
 
 
@@ -279,6 +300,7 @@ def calibrate_thresholds(
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import precision_score, recall_score
     from sklearn.decomposition import PCA
+    from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
     from .registry import resolve_task_class
@@ -290,14 +312,19 @@ def calibrate_thresholds(
     )
     targets = _prepare_targets(labels, task_class.schema)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(features.values.astype(np.float32))
-    pca = None
-    if pca_components and X_scaled.shape[1] > pca_components:
-        pca = PCA(n_components=pca_components)
-        X_reduced = pca.fit_transform(X_scaled)
-    else:
-        X_reduced = X_scaled
+    X = features.values.astype(np.float32)
+
+    # Scaler (+PCA) inside a Pipeline so preprocessing is fit per CV fold —
+    # fitting on the full dataset before CV leaks test-fold statistics.
+    use_pca = bool(pca_components) and X.shape[1] > pca_components
+
+    def _make_pipeline():
+        steps = [('scaler', StandardScaler())]
+        if use_pca:
+            steps.append(('pca', PCA(n_components=pca_components)))
+        steps.append(('clf', LogisticRegression(max_iter=1000, C=1.0,
+                                                solver='lbfgs')))
+        return Pipeline(steps)
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     rows = []
@@ -308,10 +335,10 @@ def calibrate_thresholds(
             continue
 
         all_probs = np.zeros(len(y))
-        for train_idx, test_idx in skf.split(X_reduced, y):
-            clf = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs')
-            clf.fit(X_reduced[train_idx], y.values[train_idx])
-            all_probs[test_idx] = clf.predict_proba(X_reduced[test_idx])[:, 1]
+        for train_idx, test_idx in skf.split(X, y):
+            pipe = _make_pipeline()
+            pipe.fit(X[train_idx], y.values[train_idx])
+            all_probs[test_idx] = pipe.predict_proba(X[test_idx])[:, 1]
 
         for thresh in [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95]:
             preds = (all_probs >= thresh).astype(int)
@@ -384,21 +411,29 @@ def predict_all(
 
     log.info("predicting %d fields on full embedding pool", len(field_names))
 
-    # Load all embeddings in batches
+    # Load all embeddings in batches. Keyset pagination on (_id, seq):
+    # LIMIT/OFFSET over a live table re-sorts and re-skips O(n) rows per
+    # batch (O(n^2) total) and is not snapshot-consistent under inserts.
     total = client.query_df(
         "SELECT count() as n FROM lltk.passage_embeddings WHERE scheme = 'p500'"
-    ).iloc[0][0]
+    ).iloc[0, 0]
     log.info("total embeddings to predict: %d", total)
 
     all_preds = []
-    offset = 0
-    while offset < total:
+    n_done = 0
+    last_key: Optional[tuple[str, int]] = None
+    while True:
+        keyset = ""
+        if last_key is not None:
+            last_id_esc = last_key[0].replace("'", "''")
+            keyset = f"AND (_id, seq) > ('{last_id_esc}', {last_key[1]}) "
         batch = client.query_df(
             f"SELECT _id, scheme, seq, embedding "
             f"FROM lltk.passage_embeddings "
             f"WHERE scheme = 'p500' "
+            f"{keyset}"
             f"ORDER BY _id, seq "
-            f"LIMIT {batch_size} OFFSET {offset}"
+            f"LIMIT {batch_size}"
         )
         if batch.empty:
             break
@@ -435,9 +470,13 @@ def predict_all(
 
         pred_df = pd.DataFrame(pred_dict, index=idx)
         all_preds.append(pred_df)
-        offset += batch_size
-        log.info("predicted %d / %d", min(offset, total), total)
+        last_row = batch.iloc[-1]
+        last_key = (str(last_row['_id']), int(last_row['seq']))
+        n_done += len(batch)
+        log.info("predicted %d / %d", n_done, total)
 
+    if not all_preds:
+        return pd.DataFrame()
     return pd.concat(all_preds)
 
 

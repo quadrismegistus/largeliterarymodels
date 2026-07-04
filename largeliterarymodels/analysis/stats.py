@@ -37,8 +37,17 @@ def fisher_tests(
     min_feature_n=20,
     include_feature_pairs=False,
     cross_task_pairs_only=True,
+    haldane=True,
 ):
-    """Run Fisher exact tests for every (group, feature) pair."""
+    """Run Fisher exact tests for every (group, feature) pair.
+
+    Args:
+        haldane: if True (default), apply the Haldane-Anscombe correction to
+            the odds ratio when any cell of the 2x2 table is zero: add 0.5 to
+            all four cells so the ratio is finite instead of a bare inf/0.
+            The Fisher p-value is always computed on the raw counts. Pass
+            haldane=False for the raw (possibly inf) odds ratio.
+    """
     from scipy.stats import fisher_exact
 
     shared_idx = feature_matrix.index.intersection(group_matrix.index)
@@ -66,7 +75,11 @@ def fisher_tests(
                 d = int((~g_vec & ~f_vec).sum())
                 if b == 0 and c == 0:
                     continue
-                odds = (a * d) / (b * c) if (b * c) > 0 else float('inf')
+                if haldane and (a == 0 or b == 0 or c == 0 or d == 0):
+                    # Haldane-Anscombe: +0.5 to all cells on any zero cell.
+                    odds = ((a + 0.5) * (d + 0.5)) / ((b + 0.5) * (c + 0.5))
+                else:
+                    odds = (a * d) / (b * c) if (b * c) > 0 else float('inf')
                 _, p = fisher_exact([[a, b], [c, d]], alternative='two-sided')
                 rate_in = a / (a + b) if (a + b) > 0 else float('nan')
                 rate_out = c / (c + d) if (c + d) > 0 else float('nan')
@@ -115,12 +128,23 @@ def fisher_tests(
     return pd.DataFrame(rows).sort_values('p_value').reset_index(drop=True)
 
 
-def bh_fdr(p_series, alpha=0.05):
-    """Benjamini-Hochberg FDR correction. Returns q-values."""
+def bh_fdr(p_series, alpha=0.05, return_rejected=False):
+    """Benjamini-Hochberg FDR correction. Returns q-values.
+
+    Args:
+        alpha: FDR level used to build the rejection mask (only consulted
+            when return_rejected=True).
+        return_rejected: if True, return a (q_values, rejected) tuple, where
+            rejected is a boolean Series marking q <= alpha. Default False
+            keeps the original single-Series return.
+    """
     p = p_series.values.astype(float)
     n = len(p)
     if n == 0:
-        return p_series.copy()
+        q_series = p_series.copy()
+        if return_rejected:
+            return q_series, pd.Series(dtype=bool, index=p_series.index)
+        return q_series
 
     order = np.argsort(p)
     ranks = np.empty(n, dtype=float)
@@ -134,7 +158,10 @@ def bh_fdr(p_series, alpha=0.05):
     q[order] = q_sorted
     q = np.clip(q, 0.0, 1.0)
 
-    return pd.Series(q, index=p_series.index)
+    q_series = pd.Series(q, index=p_series.index)
+    if return_rejected:
+        return q_series, q_series <= alpha
+    return q_series
 
 
 __all__ = ['fisher_tests', 'bh_fdr', 'group_matrix']

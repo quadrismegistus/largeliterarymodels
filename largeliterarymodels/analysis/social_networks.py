@@ -15,6 +15,7 @@ Usage:
 """
 
 import json
+import re
 from collections import Counter, defaultdict
 from typing import Optional, Union
 
@@ -24,6 +25,19 @@ try:
     import networkx as nx
 except ImportError:
     nx = None
+
+# Passage labels like 'P042' — used for numeric sorting/plotting of
+# trajectories, with a lexicographic fallback for anything else.
+_PASSAGE_RE = re.compile(r'^P(\d+)$')
+
+
+def _passage_sort_key(label) -> tuple:
+    """Sort key: numeric for 'P<digits>' labels, lexicographic otherwise
+    (non-matching labels sort after matching ones)."""
+    m = _PASSAGE_RE.match(str(label or ''))
+    if m:
+        return (0, int(m.group(1)), '')
+    return (1, 0, str(label or ''))
 
 
 def load_result(source: Union[str, dict]) -> dict:
@@ -59,7 +73,6 @@ def build_graph(
         raise ImportError("networkx is required: pip install networkx")
 
     result = load_result(result)
-    chars = _char_lookup(result)
     exclude = set(exclude_types or ['same_as'])
 
     G = nx.Graph()
@@ -203,7 +216,7 @@ def character_trajectories(result: Union[str, dict]) -> dict[str, list[dict]]:
         })
 
     for cid in trajs:
-        trajs[cid].sort(key=lambda x: x.get('passage', ''))
+        trajs[cid].sort(key=lambda x: _passage_sort_key(x.get('passage', '')))
 
     return dict(trajs)
 
@@ -281,43 +294,52 @@ def plot_network(
     figsize: tuple = (12, 10),
     node_color_attr: str = 'gender',
     save: Optional[str] = None,
+    show: bool = True,
 ):
     """Plot a social network graph with matplotlib.
 
     Nodes colored by attribute (default: gender), sized by degree.
+
+    Args:
+        save: if set, save the figure to this path (and skip plt.show()).
+        show: call plt.show() when not saving. Pass show=False for headless
+            batch runs.
     """
     import matplotlib.pyplot as plt
-    plt.rcParams['figure.dpi'] = 300
 
     if nx is None:
         raise ImportError("networkx is required")
 
-    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    # Scope the dpi override to this figure instead of mutating the global
+    # plt.rcParams for the rest of the process.
+    with plt.rc_context({'figure.dpi': 300}):
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
 
-    pos = nx.spring_layout(G, seed=42, k=2.0)
+        pos = nx.spring_layout(G, seed=42, k=2.0)
 
-    color_maps = {
-        'gender': {'male': '#4477AA', 'female': '#CC6677', 'unknown': '#999999'},
-    }
-    cmap = color_maps.get(node_color_attr, {})
-    colors = [cmap.get(G.nodes[n].get(node_color_attr, ''), '#999999') for n in G.nodes()]
+        color_maps = {
+            'gender': {'male': '#4477AA', 'female': '#CC6677', 'unknown': '#999999'},
+        }
+        cmap = color_maps.get(node_color_attr, {})
+        colors = [cmap.get(G.nodes[n].get(node_color_attr, ''), '#999999') for n in G.nodes()]
 
-    degrees = dict(G.degree())
-    sizes = [max(100, degrees.get(n, 1) * 150) for n in G.nodes()]
+        degrees = dict(G.degree())
+        sizes = [max(100, degrees.get(n, 1) * 150) for n in G.nodes()]
 
-    nx.draw_networkx_nodes(G, pos, ax=ax, node_color=colors, node_size=sizes, alpha=0.8)
-    nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3, width=0.8)
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=colors, node_size=sizes, alpha=0.8)
+        nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3, width=0.8)
 
-    labels = {n: G.nodes[n].get('name', n)[:15] for n in G.nodes()}
-    nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=10)
+        labels = {n: G.nodes[n].get('name', n)[:15] for n in G.nodes()}
+        nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=10)
 
-    ax.set_title(title, fontsize=14)
-    ax.axis('off')
-    plt.tight_layout()
+        ax.set_title(title, fontsize=14)
+        ax.axis('off')
+        plt.tight_layout()
 
-    if save:
-        plt.savefig(save, dpi=150, bbox_inches='tight')
-    plt.show()
+        if save:
+            plt.savefig(save, dpi=150, bbox_inches='tight')
+        elif show:
+            plt.show()
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +428,8 @@ class SocialNetwork:
 
     def composite_graph(self):
         """Merge relations, events, and dialogue into a single directed graph."""
+        if nx is None:
+            raise ImportError("networkx is required: pip install networkx")
         if 'composite' not in self._graphs:
             G = nx.DiGraph()
             for c in self.characters:
@@ -593,16 +617,10 @@ class SocialNetwork:
             for a, b, d in G.edges(data=True):
                 lbl = []
                 if d['rel_types']:
-                    # el[(a, b)] = Counter(d['rel_types']).most_common(1)[0][0]
                     lbl.append(Counter(d['rel_types']).most_common(1)[0][0])
                 if d['event_verbs']:
-                    # el[(a, b)] = Counter(d['event_verbs']).most_common(1)[0][0]
                     lbl.append(Counter(d['event_verbs']).most_common(1)[0][0])
-                # if d['n_dialogue'] and not lbl:
-                    # el[(a, b)] = f"dlg:{d['n_dialogue']}"
-                # else:
-                    # el[(a, b)] = ''
-                el[(a,b)] = ' | '.join(lbl)
+                el[(a, b)] = ' | '.join(lbl)
             nx.draw_networkx_edge_labels(G, pos, el, ax=ax, font_size=7)
         n_rels = sum(1 for _, _, d in G.edges(data=True) if d['rel_types'])
         n_evts = sum(1 for _, _, d in G.edges(data=True) if d['event_verbs'])
@@ -632,8 +650,18 @@ class SocialNetwork:
         if not traj:
             ax.set_title(f"{self.title}: no trajectory for {char_id}")
             return ax
-        passages = [int(t['passage'][1:]) for t in traj if t['passage'].startswith('P')]
-        locations = [t['where'] for t in traj if t['passage'].startswith('P')]
+        # Parse 'P<digits>' labels defensively; skip anything else (e.g.
+        # 'P42a' or free-form labels) instead of raising ValueError.
+        passages, locations = [], []
+        for t in traj:
+            m = _PASSAGE_RE.match(str(t.get('passage', '')))
+            if m:
+                passages.append(int(m.group(1)))
+                locations.append(t['where'])
+        if not passages:
+            ax.set_title(f"{self.title}: no plottable P-numbered passages "
+                         f"for {char_id}")
+            return ax
         seen = {}
         for loc in locations:
             if loc not in seen:

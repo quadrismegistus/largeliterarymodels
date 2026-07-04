@@ -11,7 +11,7 @@ bucketing) on top.
 """
 
 from itertools import combinations
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -31,7 +31,7 @@ def _load_text_tags(text_ids: list[str], client=None) -> dict[str, set[str]]:
     if client is None:
         from ._ch import _default_client
         client = _default_client()
-    id_list = ",".join(f"'{i}'" for i in text_ids)
+    id_list = ",".join("'" + str(i).replace("'", "''") + "'" for i in text_ids)
     df = client.query_df(
         f"SELECT _id, tag FROM lltk.text_genre_tags WHERE _id IN ({id_list})"
     )
@@ -45,7 +45,7 @@ def _load_text_years(text_ids: list[str], client=None) -> dict[str, Optional[int
     if client is None:
         from ._ch import _default_client
         client = _default_client()
-    id_list = ",".join(f"'{i}'" for i in text_ids)
+    id_list = ",".join("'" + str(i).replace("'", "''") + "'" for i in text_ids)
     df = client.query_df(
         f"SELECT _id, year FROM lltk.texts FINAL WHERE _id IN ({id_list})"
     )

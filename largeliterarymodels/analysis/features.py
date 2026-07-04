@@ -24,7 +24,6 @@ Usage:
 
 from __future__ import annotations
 
-import typing
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -93,7 +92,8 @@ def _expand_task_features(
         if enc is not None:
             # Ordinal: numeric column, -1 for unknown/empty
             cols[f'{prefix}{f}'] = wide[f].apply(
-                lambda v: enc.get(str(v), -1) if v is not None and str(v) != '' else -1
+                lambda v, enc=enc: (enc.get(str(v), -1)
+                                    if v is not None and str(v) != '' else -1)
             ).astype('int8')
         else:
             # Nominal: dummy-encode

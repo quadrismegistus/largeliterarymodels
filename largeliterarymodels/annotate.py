@@ -13,6 +13,7 @@ Usage:
     # or CLI: python -m largeliterarymodels.annotate classify_passage_form
 """
 
+import hashlib
 import re
 
 import fasthtml.common as fh
@@ -103,7 +104,9 @@ def _get_items(task, prefer_model: str | None = None,
         if metadata.get('_id') and metadata.get('section_id'):
             item_key = f"{metadata['_id']}::{metadata['section_id']}"
         else:
-            item_key = str(hash(prompt))[:12]
+            # Stable across relaunches — builtin hash() is salted per process
+            # (PYTHONHASHSEED), which would orphan saved human annotations.
+            item_key = hashlib.sha1(prompt.encode('utf-8')).hexdigest()[:12]
 
         # Manifest filter: extract (id, seq_int) and check against only_keys
         if only_keys is not None:
@@ -172,6 +175,9 @@ def create_app(task, annotator='default', only_keys: set | None = None):
     )
 
     items = _get_items(task, only_keys=only_keys)
+    # Expose the computed items so callers (e.g. run_annotator) don't have
+    # to re-scan the whole cache just to count them.
+    app.state.annotation_items = items
     schema = task.schema
 
     # Base forms — register routes once; per-request we clone via
@@ -551,8 +557,8 @@ def create_app(task, annotator='default', only_keys: set | None = None):
             mui.Card(
                 mui.CardHeader(mui.H1(f'Human vs LLM: {task.task_name}')),
                 mui.CardBody(
-                    fh.P(f'Annotator: ', fh.Strong(annotator),
-                         f' · Annotated: ', fh.Strong(f'{n_annotated}/{len(items)}'),
+                    fh.P('Annotator: ', fh.Strong(annotator),
+                         ' · Annotated: ', fh.Strong(f'{n_annotated}/{len(items)}'),
                          cls='text-sm text-gray-600 mb-4'),
                     mui.H2('Field agreement', cls='text-lg mb-2'),
                     fh.Table(
@@ -585,13 +591,24 @@ def run_annotator(task, port=8989, annotator='default', host='127.0.0.1',
     """
     import uvicorn
     app = create_app(task, annotator=annotator, only_keys=only_keys)
-    items = _get_items(task, only_keys=only_keys)
+    items = app.state.annotation_items  # computed once inside create_app
     print(f"Annotation app for '{task.task_name}' at http://{host}:{port}")
     print(f"Annotator: {annotator}")
     print(f"Items: {len(items)}"
           + (f" (filtered from manifest of {len(only_keys)} keys)"
              if only_keys else ""))
     print(f"Annotations saved under: {task.human_stash(annotator).root_dir}")
+    if host not in ('127.0.0.1', 'localhost', '::1'):
+        print()
+        print('!' * 72)
+        print(f"WARNING: binding to non-loopback host {host!r}.")
+        print("This app has NO authentication, and FastHTML's static-file")
+        print("route can serve files from the project directory to anyone")
+        print("who can reach this port. Keep host='127.0.0.1' and use an SSH")
+        print("tunnel for remote access, e.g.:")
+        print(f"    ssh -N -L {port}:127.0.0.1:{port} user@this-machine")
+        print('!' * 72)
+        print()
     uvicorn.run(app, host=host, port=port)
 
 
@@ -627,11 +644,11 @@ if __name__ == '__main__':
     for attr_name in dir(tasks):
         obj = getattr(tasks, attr_name)
         if isinstance(obj, type) and hasattr(obj, 'task_name') and hasattr(obj, 'schema'):
-            try:
-                t = obj()
-                task_map[t.task_name] = obj
-            except Exception:
-                pass
+            # task_name is a property (`self.name or self.__class__.__name__`)
+            # — read the class attributes directly rather than instantiating
+            # every task in the catalog just to learn its name.
+            name = getattr(obj, 'name', None) or obj.__name__
+            task_map[name] = obj
 
     if args.task_name not in task_map:
         print(f"Unknown task: {args.task_name}")

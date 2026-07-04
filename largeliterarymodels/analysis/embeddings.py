@@ -1,7 +1,6 @@
 """Passage and text embedding utilities: fetch, pool, center."""
 
 from collections import defaultdict
-from typing import Optional
 
 import numpy as np
 import pandas as pd

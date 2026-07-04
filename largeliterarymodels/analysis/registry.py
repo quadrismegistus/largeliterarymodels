@@ -5,9 +5,6 @@ Task class that defines its schema. The schema is introspected for
 list/bool/enum field classification — no per-task adapter code required.
 """
 
-from typing import Type
-
-
 TASK_REGISTRY: dict[str, str] = {
     # CH task-name → dotted-path importable Task class name
     'passage-content': 'largeliterarymodels.tasks.classify_passage_content:PassageContentTask',
@@ -23,7 +20,7 @@ def register_task(ch_task_name: str, dotted_path: str) -> None:
     TASK_REGISTRY[ch_task_name] = dotted_path
 
 
-def resolve_task_class(ch_task_name: str) -> Type:
+def resolve_task_class(ch_task_name: str) -> type:
     """Import and return the Task class for a CH task name."""
     if ch_task_name not in TASK_REGISTRY:
         raise KeyError(

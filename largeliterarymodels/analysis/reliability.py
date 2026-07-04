@@ -24,7 +24,6 @@ Field-type handling for majority:
 from __future__ import annotations
 
 import json
-import re
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Iterable, Optional
@@ -33,7 +32,6 @@ import pandas as pd
 
 from .adapters import _coerce_to_list, classify_schema_fields
 from .reader import load_task_annotations
-from .registry import resolve_task_class
 
 
 # ── Loading ────────────────────────────────────────────────────────────────
@@ -252,6 +250,32 @@ def _majority_list(votes: list[tuple], ref: Optional[tuple]) -> tuple:
     return tuple(out)
 
 
+def _is_even_split(cast: list, kind: str) -> bool:
+    """True if the cast votes were an even split, i.e. the winning value had
+    to be decided by the reference agent / deterministic fallback rather than
+    an actual majority.
+
+    bool: equal True/False counts. enum: top count shared by >= 2 values.
+    list: any candidate label voted for by exactly half the voters.
+    """
+    if kind == 'bool':
+        return sum(1 for v in cast if v) * 2 == len(cast)
+    if kind == 'enum':
+        counts = Counter(cast)
+        top_n = counts.most_common(1)[0][1]
+        return sum(1 for c in counts.values() if c == top_n) > 1
+    if kind == 'list':
+        all_labels = set()
+        for v in cast:
+            all_labels.update(v)
+        n = len(cast)
+        return any(
+            sum(1 for v in cast if label in v) * 2 == n
+            for label in all_labels
+        )
+    return False
+
+
 def majority_consensus(
     frames: dict[str, pd.DataFrame],
     schema,
@@ -280,8 +304,11 @@ def majority_consensus(
         - consensus_df: wide DataFrame indexed by (_id, scheme, seq) with one
           column per schema field. Bool → True/False, enum → string, list → tuple.
         - tiers_df: same index, one column per field with value in
-          {'unanimous', 'majority', 'no_consensus'} describing agreement level
-          *across the agents actually counted* for that field.
+          {'unanimous', 'majority', 'tie', 'no_consensus', 'single_vote',
+          'no_vote'} describing agreement level *across the agents actually
+          counted* for that field. 'tie' marks even splits (e.g. 2-2 bool
+          votes) whose winning value was decided by the reference agent or a
+          deterministic fallback rather than an actual majority.
     """
     lists, bools, enums, _ = classify_schema_fields(schema)
     kinds = {f: 'list' for f in lists}
@@ -317,7 +344,10 @@ def majority_consensus(
         row = {}
         tiers = {}
         for fname, kind in kinds.items():
-            active = agents_for_field(fname)
+            # Sorted agent order makes the no-reference tie fallback
+            # (votes[0] in _majority_bool) deterministic instead of
+            # depending on the frames dict's insertion order.
+            active = sorted(agents_for_field(fname))
             votes = []
             for agent in active:
                 df = frames[agent]
@@ -343,11 +373,13 @@ def majority_consensus(
             if len(cast) < 2:
                 tiers[fname] = 'single_vote' if cast else 'no_vote'
             else:
-                unique = set()
-                for v in cast:
-                    unique.add(v if not isinstance(v, tuple) else v)
+                unique = set(cast)
                 if len(unique) == 1:
                     tiers[fname] = 'unanimous'
+                elif _is_even_split(cast, kind):
+                    # Even split: the value above was tie-broken, not voted
+                    # in by a majority — don't dress it up as one.
+                    tiers[fname] = 'tie'
                 elif val is not None and val != () and any(
                     (v == val if not isinstance(val, tuple) else set(v) == set(val))
                     for v in cast
@@ -381,10 +413,11 @@ def flagged_for_audit(tiers_df: pd.DataFrame,
             in the 'majority' tier (i.e. 2-of-3 agreement, not unanimous).
             Useful for bool fields where 'no_consensus' is impossible with 3
             voters. Defaults to False — only 'no_consensus' (all-different
-            on enum/list) is flagged.
+            on enum/list) and 'tie' (even splits resolved by tie-breaking,
+            e.g. 2-2 bool votes) are flagged.
     """
     cols = fields or list(tiers_df.columns)
-    flag_values = {'no_consensus'}
+    flag_values = {'no_consensus', 'tie'}
     if include_majority:
         flag_values.add('majority')
     return tiers_df[cols].isin(flag_values).any(axis=1)
@@ -471,8 +504,8 @@ def write_consensus(
             vs majority vs no_consensus.
         dry_run: compute but skip INSERT.
     """
-    from .. import integrations  # for PASSAGE_TABLE constant
-    PASSAGE_TABLE = integrations.llmtasks.PASSAGE_TABLE
+    from ..integrations import llmtasks  # for PASSAGE_TABLE constant
+    PASSAGE_TABLE = llmtasks.PASSAGE_TABLE
     if client is None:
         from ._ch import _default_client
         client = _default_client()
@@ -490,11 +523,10 @@ def write_consensus(
             continue
         for fname in field_cols:
             v = row[fname]
-            if v is None or (isinstance(v, tuple) and len(v) == 0 and False):
-                # keep empty lists (= passage checked but no labels); skip
-                # genuinely missing values (None).
-                if v is None:
-                    continue
+            # Keep empty tuples (= passage checked but no labels); skip
+            # genuinely missing values (None).
+            if v is None:
+                continue
             tier = None
             if tiers_df is not None and fname in tiers_df.columns and key in tiers_df.index:
                 tier = tiers_df.loc[key, fname]

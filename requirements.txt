@@ -1,6 +1,8 @@
-anthropic
-openai
-google-genai
+anthropic>=0.40
+openai>=1.30
+google-genai>=1.0
 hashstash[rec]>=0.4.0
 pydantic>=2.0
-json-repair
+json-repair>=0.25
+tqdm>=4.64
+pandas>=1.5

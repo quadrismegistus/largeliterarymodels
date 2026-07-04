@@ -2,7 +2,6 @@
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from largeliterarymodels.analysis.embeddings import center_by_group, mean_pool_to_text
 

@@ -1,7 +1,6 @@
 """Character resolution task: clean up BookNLP character clusters using LLM."""
 
 from pydantic import BaseModel, Field
-from typing import Optional
 from largeliterarymodels.task import Task
 
 
@@ -129,7 +128,8 @@ def format_character_roster(text, min_count=10, max_chars=50):
     Returns:
         str: Formatted prompt ready for CharacterTask.run().
     """
-    import json, os
+    import json
+    import os
 
     bnlp = text.booknlp
     book_path = bnlp.paths['chardata']

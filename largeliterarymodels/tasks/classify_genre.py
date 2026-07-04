@@ -1,7 +1,6 @@
 """Genre classification task: classify early modern English texts by genre using title/author/metadata."""
 
 from pydantic import BaseModel, Field
-from typing import Optional
 GENRE_VOCAB = frozenset({
     'Fiction', 'Poetry', 'Drama', 'Periodical', 'Essay', 'Treatise',
     'Letters', 'Sermon', 'Biography', 'Nonfiction', 'Legal', 'Speech',

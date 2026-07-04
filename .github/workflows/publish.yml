@@ -5,7 +5,13 @@ on:
     tags: ["v*"]
 
 jobs:
+  # Publishing is gated on the full lint + test matrix passing.
+  test:
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +27,10 @@ jobs:
       - name: Build package
         run: python -m build
 
+      # NOTE: consider switching to PyPI trusted publishing (OIDC) —
+      # pypa/gh-action-pypi-publish with `permissions: id-token: write` —
+      # to retire the long-lived PYPI_TOKEN secret. Requires configuring
+      # the publisher on pypi.org first.
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__

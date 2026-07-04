@@ -25,7 +25,6 @@ Designed to be run alongside PassageContentTask on the same passage. Both share
 from typing import Literal
 from pydantic import BaseModel, Field
 from largeliterarymodels.task import Task
-from largeliterarymodels.tasks.classify_passage import format_passage  # re-exported
 
 
 # ── Vocabularies ──────────────────────────────────────────────────────────

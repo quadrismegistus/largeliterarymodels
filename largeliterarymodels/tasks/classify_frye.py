@@ -6,7 +6,6 @@ text passages — opening, middle, and closing — to assess narrative mode and 
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
 from largeliterarymodels.task import Task
 
 

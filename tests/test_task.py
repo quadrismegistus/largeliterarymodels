@@ -5,7 +5,6 @@ from unittest.mock import patch
 from pydantic import BaseModel, Field
 from hashstash import HashStash
 from largeliterarymodels.task import Task, _schema_repr
-from largeliterarymodels.llm import STASH_PATH
 
 
 class Sentiment(BaseModel):
@@ -170,7 +169,7 @@ class TestSchemaRepr:
 
 class TestBibliographyTask:
     def test_import(self):
-        from largeliterarymodels.tasks import BibliographyTask, BibliographyEntry
+        from largeliterarymodels.tasks import BibliographyTask
         task = BibliographyTask()
         assert task.task_name == "BibliographyTask"
         assert task.retries == 2

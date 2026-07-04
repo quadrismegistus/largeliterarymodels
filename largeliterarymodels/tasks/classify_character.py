@@ -12,7 +12,6 @@ LLM-resolved characters (characters_resolved.json) in the text's booknlp dir.
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
 from largeliterarymodels.task import Task
 import pandas as pd
 import json
@@ -543,7 +542,7 @@ def format_character_intro(booknlp_dir, char_info, title=None, author=None,
     # Build prompt with numbered passages
     parts = [f"Character to classify: {char_info['name']}"]
     total_words = 0
-    for i, (passage_text, tok, mention) in enumerate(passages, 1):
+    for i, (passage_text, _tok, _mention) in enumerate(passages, 1):
         parts.append(f"\nPASSAGE {i}:\n{passage_text}")
         total_words += len(passage_text.split())
 

@@ -19,7 +19,6 @@ Run both per passage or either independently.
 from typing import Literal
 from pydantic import BaseModel, Field
 from largeliterarymodels.task import Task
-from largeliterarymodels.tasks.classify_passage import format_passage  # re-exported
 
 
 # ══════════════════════════════════════════════════════════════════════════

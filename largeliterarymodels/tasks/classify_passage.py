@@ -14,7 +14,6 @@ within a text, often stratified by concreteness score.
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
 from largeliterarymodels.task import Task
 
 

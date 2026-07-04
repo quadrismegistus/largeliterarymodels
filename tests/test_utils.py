@@ -1,7 +1,6 @@
 """Tests for utility functions."""
 
 import os
-import pytest
 from unittest.mock import patch
 from largeliterarymodels.utils import available_models
 

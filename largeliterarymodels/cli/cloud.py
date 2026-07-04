@@ -353,7 +353,7 @@ def cmd_launch(args):
     print(f"SSH: ssh -p {ssh_port} root@{ssh_host}")
     if price is not None:
         print(f"Cost: ${price}/hr")
-    print(f"\nNext: litmod cloud setup")
+    print("\nNext: litmod cloud setup")
 
 
 def cmd_setup(args):
@@ -385,7 +385,7 @@ echo "SETUP COMPLETE"
     ssh_run(state, setup_script)
 
     print("\nSetup complete.")
-    print(f"Next: litmod cloud upload <passages_dir>")
+    print("Next: litmod cloud upload <passages_dir>")
 
 
 def cmd_upload(args):
@@ -527,7 +527,7 @@ echo "Texts: $n_texts, Already done: $n_done"
     print(f"Model: {model}")
     print(f"Workers: {workers}")
     print(f"Output: {remote_output}")
-    print(f"\nMonitor: litmod cloud status")
+    print("\nMonitor: litmod cloud status")
     print(f"SSH in:  ssh -p {state['ssh_port']} root@{state['ssh_host']}")
     print(f"Attach:  tmux attach -t {session_name}")
 
@@ -592,7 +592,7 @@ def cmd_status(args):
             r = ssh_run(state, f'tail -5 {q(log)} 2>/dev/null',
                         capture=True, check=False)
             if r.stdout.strip():
-                print(f"\n  Last log lines:")
+                print("\n  Last log lines:")
                 for line in r.stdout.strip().split('\n'):
                     print(f"    {line}")
         elif status == 'STOPPED':

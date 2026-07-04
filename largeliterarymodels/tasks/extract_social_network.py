@@ -211,7 +211,7 @@ class SocialNetworkTask(SequentialTask):
             story_parts = []
             for s in summaries:
                 story_parts.append(f"[P{s['start']:03d}-P{s['end']:03d}] {s['text']}")
-            parts.append(f"STORY SO FAR:\n" + '\n\n'.join(story_parts))
+            parts.append("STORY SO FAR:\n" + '\n\n'.join(story_parts))
         else:
             parts.append("STORY SO FAR:\n(Beginning of novel)")
         return '\n'.join(parts)

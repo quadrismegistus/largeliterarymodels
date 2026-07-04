@@ -1,8 +1,7 @@
 """Tests for LLM class and extraction helpers (mocked API calls)."""
 
-import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from pydantic import BaseModel, Field
 from hashstash import HashStash
 from largeliterarymodels.llm import (
@@ -184,7 +183,8 @@ class TestValidateParsed:
         assert len(result) == 1
 
     def test_validation_error(self):
-        with pytest.raises(Exception):
+        import pydantic
+        with pytest.raises(pydantic.ValidationError):
             _validate_parsed({"wrong_field": "x"}, SimpleResult)
 
 
@@ -326,7 +326,7 @@ class TestLLMExtract:
         stash = HashStash(engine="memory").clear()
         llm = LLM(model="gpt-4o-mini", stash=stash)
         examples = [("example input", SimpleResult(answer="yes", confidence=0.9))]
-        result = llm.extract("question", schema=SimpleResult, examples=examples)
+        llm.extract("question", schema=SimpleResult, examples=examples)
         # verify examples made it into the system prompt
         call_kwargs = mock_call.call_args[1]
         assert "Example 1" in call_kwargs["system_prompt"]

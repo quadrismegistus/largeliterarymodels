@@ -16,7 +16,7 @@ SequentialTask          -- chunks + rolling state (social network, passage annot
   ├── providers.py      -- direct SDK calls (no litellm): route_provider() dispatches
   ├── analysis/         -- cross-task analysis: Fisher tests, ensembles, social networks
   ├── cli/              -- litmod ls|show|smoke|run|annotate|cloud
-  └── annotate.py       -- FastAPI human-annotation web app (auto-generates forms from Pydantic)
+  └── annotate.py       -- FastHTML human-annotation web app (auto-generates forms from Pydantic)
 ```
 
 ## Relationship to lltk

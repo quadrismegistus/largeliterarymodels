@@ -375,16 +375,29 @@ pip install largeliterarymodels
 |------|------|-------|--------|
 | `GenreTask` | Base | Title/author metadata | Genre, subgenre, translation status, confidence |
 | `GenreTaskLite` | Base | Title/author metadata | Constrained genre tags (form + mode) |
+| `MajorGenreTask` | Base | Title/author metadata | Major genre |
 | `FryeTask` | Base | Text passages | Frye mode, mythos, referential mode |
-| `PassageContentTask` | Sequential | Passage list | 43 binary content flags per passage |
-| `PassageFormTask` | Sequential | Passage list | Formal/stylistic features per passage |
+| `PassageTask` | Base | ~1K-word passage | Narratological annotation |
+| `PassageContentTask` | Base | Passage | 43 binary content flags |
+| `PassageFormTask` | Base | Passage | Formal/stylistic features |
+| `PassageNarrativityTask` | Base | Passage | Discourse mode, focalization, narrator presence |
+| `PassageSettingTask` | Base | Passage | Setting classification |
+| `EmotionTask` | Base | Passage | Feelings Wheel (Willcox) emotions, valence |
+| `EmotionTaskZh` | Base | Passage (EN or ZH) | 七情/TCM Chinese-taxonomy emotions |
 | `SocialNetworkTask` | Sequential | Passage list | Characters, relations, events, dialogue, summaries |
+| `PlotGenreTask` | Base | Social-network summary | Plot shape + genre tags |
+| `SubgenreTask` | Base | Social-network summary | Subgenre + fiction verification |
+| `ModernSubgenreTask` | Base | Social-network summary | Modern (post-1800) subgenre |
+| `CharacterTypeTask` | Base | Social-network summary | Character archetypes + social class |
 | `CharacterTask` | Base | BookNLP character roster | Merged/cleaned character list |
 | `CharacterIntroTask` | Base | Character first-mention passages | Introduction mode, social class |
 | `TranslationTask` | Base | Word in context | Historical translation + connotations |
 | `BibliographyTask` | Base | OCR bibliography pages | Structured bibliography entries |
+| `OCRCleanTask` | Base | OCR text | Cleaned text |
+| `ContradictionResponseTask` | Base | Prompt + LLM completion | Contradiction-handling strategy |
+| `AlignmentAsymmetryTask` | Base | LLM generation | Agency/deference/assertiveness scores |
 
-**Base tasks** process a single prompt and return a Pydantic model. **Sequential tasks** process a list of passages in chunks with rolling state and return an aggregated dict.
+**Base tasks** process a single prompt and return a Pydantic model. **Sequential tasks** process a list of passages in chunks with rolling state and return an aggregated dict. Run `litmod ls` for the tasks wired into the CLI.
 
 ## Project Structure
 
@@ -398,7 +411,7 @@ largeliterarymodels/
     analysis/                # Cross-task analysis: Fisher tests, ensembles, social networks
     cli/                     # litmod CLI: ls, show, smoke, run, annotate, cloud
     integrations/            # ClickHouse adapter (being migrated to lltk)
-    annotate.py              # FastAPI human-annotation web app
+    annotate.py              # FastHTML human-annotation web app
 scripts/
     batch_social_network.py  # Batch runner for SocialNetworkTask (Colab/HPC/cloud)
     analyze_social_networks.py  # Network statistics across parsed texts

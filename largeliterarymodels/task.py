@@ -41,13 +41,26 @@ class Task:
     name = None  # defaults to class name if not set
     schema = None
     system_prompt = None
-    examples = []
+    examples = ()  # immutable default; subclasses may use lists
     retries = 1
     temperature = DEFAULT_TEMPERATURE
     max_tokens = DEFAULT_MAX_TOKENS
 
+    # Attributes settable via __init__ kwargs even when the class doesn't
+    # declare them (subclasses commonly set `model` as a class attribute,
+    # but the base class leaves it to _get_llm's DEFAULT_MODEL fallback).
+    _DYNAMIC_ATTRS = {'model'}
+
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
+            if not hasattr(type(self), k) and k not in self._DYNAMIC_ATTRS:
+                import warnings
+                warnings.warn(
+                    f"{type(self).__name__}({k}=...): unknown attribute — "
+                    f"possible typo? Known: name, schema, system_prompt, "
+                    f"examples, retries, temperature, max_tokens, model.",
+                    stacklevel=2,
+                )
             setattr(self, k, v)
         self._stash = None
         self._human_stashes = {}
@@ -133,7 +146,7 @@ class Task:
             **kwargs,
         )
 
-    def _imap_kwargs(self, model=None, system_prompt=None, examples=None,
+    def _imap_kwargs(self, system_prompt=None, examples=None,
                      images_list=None, metadata_list=None,
                      num_workers=4, force=False, verbose=False, **kwargs):
         """Build kwargs for extract_imap/extract_map."""
@@ -164,9 +177,11 @@ class Task:
         llm = self._get_llm(model)
         yield from llm.extract_imap(
             prompts=prompts,
-            **self._imap_kwargs(model, system_prompt, examples, images_list,
-                                metadata_list, num_workers, force, verbose,
-                                **kwargs),
+            **self._imap_kwargs(system_prompt=system_prompt, examples=examples,
+                                images_list=images_list,
+                                metadata_list=metadata_list,
+                                num_workers=num_workers, force=force,
+                                verbose=verbose, **kwargs),
         )
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
@@ -181,9 +196,11 @@ class Task:
         llm = self._get_llm(model)
         return llm.extract_map(
             prompts=prompts,
-            **self._imap_kwargs(model, system_prompt, examples, images_list,
-                                metadata_list, num_workers, force, verbose,
-                                **kwargs),
+            **self._imap_kwargs(system_prompt=system_prompt, examples=examples,
+                                images_list=images_list,
+                                metadata_list=metadata_list,
+                                num_workers=num_workers, force=force,
+                                verbose=verbose, **kwargs),
         )
 
     @property
@@ -271,6 +288,11 @@ class SequentialTask(Task):
 
     chunk_size = 10
     max_tokens = 8192
+    # Bump (e.g. to 'v2') when system_prompt/format_context change materially:
+    # folds into the chunk cache key so stale generations aren't served.
+    # None preserves legacy keys, so existing caches — including in-flight
+    # batch runs — stay valid.
+    prompt_version = None
 
     def build_state(self):
         """Initialize the rolling state. Override in subclasses."""
@@ -399,6 +421,8 @@ class SequentialTask(Task):
                 'chunk': chunk_idx, 'model': model,
                 'chunk_size': chunk_size,
             }
+            if self.prompt_version is not None:
+                chunk_cache_key['prompt_version'] = self.prompt_version
 
             try:
                 raw = llm.generate(
@@ -416,14 +440,21 @@ class SequentialTask(Task):
 
             try:
                 result = self.parse_response(raw)
-            except (json.JSONDecodeError, Exception) as e:
+            except Exception as e:
                 if verbose:
                     print(f"  [Chunk {chunk_idx:02d}] PARSE FAILED: {e!s:.80s}",
                           file=sys.stderr)
                 all_results.append(None)
                 continue
 
-            state = self.update_state(state, result, chunk_idx, start, end)
+            # A bad chunk result must not kill a multi-hour run: keep the
+            # parsed result but carry the previous state forward.
+            try:
+                state = self.update_state(state, result, chunk_idx, start, end)
+            except Exception as e:
+                if verbose:
+                    print(f"  [Chunk {chunk_idx:02d}] STATE UPDATE FAILED: "
+                          f"{e!s:.80s}", file=sys.stderr)
             all_results.append(result)
 
             if verbose:

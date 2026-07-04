@@ -1,5 +1,6 @@
 """Core LLM class: unified interface for text generation with HashStash caching."""
 
+import hashlib
 import json
 import logging
 import os
@@ -7,14 +8,14 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashstash import HashStash
 from tqdm import tqdm
-from .providers import route_provider, check_api_keys
+from .providers import route_provider, _load_image_bytes
 
 log = logging.getLogger(__name__)
 
-# Model constants
-CLAUDE_OPUS = "claude-opus-4-6"
+# Model constants (rolling aliases; keep in sync with cli/models.py MODEL_TAGS)
+CLAUDE_OPUS = "claude-opus-4-7"
 CLAUDE_SONNET = "claude-sonnet-4-6"
-CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
+CLAUDE_HAIKU = "claude-haiku-4-5"
 GPT_4O = "gpt-4o"
 GPT_4O_MINI = "gpt-4o-mini"
 GEMINI_PRO = "gemini-2.5-pro"
@@ -41,6 +42,20 @@ def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPER
     )
 
 
+def _image_cache_id(img):
+    """Content-derived cache identifier for one image input.
+
+    Paths are used as-is; bytes and PIL images are hashed so two images of
+    equal size never share a key and PIL images cache-hit across runs.
+    """
+    if isinstance(img, str):
+        return img
+    if isinstance(img, bytes):
+        return f"<bytes:{hashlib.md5(img).hexdigest()}>"
+    data, _ = _load_image_bytes(img)
+    return f"<image:{hashlib.md5(data).hexdigest()}>"
+
+
 def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
               max_tokens=DEFAULT_MAX_TOKENS, schema_name=None, images=None,
               metadata=None):
@@ -50,8 +65,8 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
         metadata: Optional dict of user-defined metadata (e.g. page_number,
                   source_file). Stored in the key for retrieval via task.df
                   but does not affect the LLM call.
-        images: Optional list of image paths. Paths are included in the key
-                for cache differentiation; the actual bytes are not stored.
+        images: Optional list of images. Paths are keyed as-is; bytes and
+                PIL images are keyed by content hash (bytes are not stored).
     """
     key = {
         "prompt": prompt,
@@ -63,12 +78,7 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
     if schema_name:
         key["schema"] = schema_name
     if images:
-        # Store paths/identifiers for cache key differentiation
-        key["images"] = [
-            img if isinstance(img, str) else f"<bytes:{len(img)}>"
-            if isinstance(img, bytes) else f"<image:{id(img)}>"
-            for img in images
-        ]
+        key["images"] = [_image_cache_id(img) for img in images]
     if metadata:
         key["metadata"] = metadata
     return key
@@ -359,10 +369,20 @@ class LLM:
         if not force and key in self.stash:
             cached = self.stash[key]
             if isinstance(cached, str):
-                return _validate_parsed(_parse_json_response(cached), schema)
-            return cached
+                try:
+                    return _validate_parsed(_parse_json_response(cached), schema)
+                except Exception as e:
+                    # Schema changed since the response was cached — fall
+                    # through and recompute (matches extract_imap behavior).
+                    log.warning(
+                        "extract: cached response for %s no longer parses/"
+                        "validates (%s); recomputing", s_name, e,
+                    )
+            else:
+                return cached
 
         last_error = None
+        raw = None
         for attempt in range(1 + retries):
             if attempt == 0:
                 call_system = full_system
@@ -379,30 +399,35 @@ class LLM:
                     f"{user_prompt}"
                 )
 
-            raw = _call_provider(
-                prompt=call_prompt,
-                model=self.model,
-                system_prompt=call_system,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                images=images,
-                **kwargs,
-            )
-
+            # Provider call inside the try so transient network/API errors
+            # consume a retry instead of aborting (parity with extract_imap).
             try:
+                raw = _call_provider(
+                    prompt=call_prompt,
+                    model=self.model,
+                    system_prompt=call_system,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    images=images,
+                    **kwargs,
+                )
                 parsed = _parse_json_response(raw)
                 result = _validate_parsed(parsed, schema)
                 self.stash[key] = raw
                 return result
-            except (ValueError, json.JSONDecodeError, Exception) as e:
+            except Exception as e:
                 last_error = e
                 continue
 
-        print(f"Raw response: {raw}")
+        log.error(
+            "extract giving up on %s after %d attempts (model=%s). "
+            "Last error: %s. Raw (truncated): %s",
+            s_name, 1 + retries, self.model, last_error, (raw or '')[:400],
+        )
         raise ValueError(
             f"Failed to extract valid {s_name} after {1 + retries} attempts. "
-            f"Last error: {last_error}"
-            f"Raw response: {raw}"
+            f"Last error: {last_error}. "
+            f"Raw response (truncated): {(raw or '')[:400]}"
         )
 
     def map(self, prompts, system_prompt=None, temperature=None,
@@ -422,7 +447,9 @@ class LLM:
             **kwargs: Additional provider-specific arguments.
 
         Returns:
-            list[str]: Generated texts in the same order as prompts.
+            list[str | None]: Generated texts in the same order as prompts.
+                Entries are None for prompts whose provider call failed
+                after logging (the rest of the batch still completes).
         """
         system_prompt, temperature, max_tokens = self._resolve(
             system_prompt, temperature, max_tokens,
@@ -453,15 +480,20 @@ class LLM:
 
         def _do_one(item):
             i, prompt, key, images = item
-            result = _call_provider(
-                prompt=prompt,
-                model=self.model,
-                system_prompt=system_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                images=images,
-                **kwargs,
-            )
+            try:
+                result = _call_provider(
+                    prompt=prompt,
+                    model=self.model,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    images=images,
+                    **kwargs,
+                )
+            except Exception as e:
+                log.error("map: prompt %d failed (model=%s): %s",
+                          i, self.model, e)
+                return i, None
             self.stash[key] = result
             return i, result
 
@@ -505,6 +537,7 @@ class LLM:
             tuple: (index, result) where result is a validated Pydantic model
                 instance (or list thereof), or None on failure.
         """
+        prompts = list(prompts)
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
 
@@ -543,6 +576,8 @@ class LLM:
                 tqdm.write(f"[{i}] <verbose formatter error: {e}>")
 
         to_compute = []
+        seen_keys = {}   # frozen key -> first index submitted
+        dup_of = {}      # first index -> [duplicate indices awaiting its result]
 
         for i, prompt in enumerate(prompts):
             images = images_list[i] if images_list else None
@@ -565,6 +600,12 @@ class LLM:
                         _emit_verbose(i, prompt, metadata, cached, from_cache=True)
                     yield i, cached
                     continue
+            # Duplicate prompts in one batch share a single API call.
+            frozen = json.dumps(key, sort_keys=True, default=str)
+            if frozen in seen_keys:
+                dup_of.setdefault(seen_keys[frozen], []).append(i)
+                continue
+            seen_keys[frozen] = i
             to_compute.append((i, prompt, key, images))
 
         total = len(prompts)
@@ -636,11 +677,12 @@ class LLM:
             for future in tqdm(as_completed(futures), total=len(to_compute),
                                desc=f"Extracting {s_name} ({self.model})"):
                 i, result = future.result()
-                if verbose:
-                    prompt = prompts[i]
-                    metadata = metadata_list[i] if metadata_list else None
-                    _emit_verbose(i, prompt, metadata, result, from_cache=False)
-                yield i, result
+                for j in (i, *dup_of.get(i, ())):
+                    if verbose:
+                        prompt = prompts[j]
+                        metadata = metadata_list[j] if metadata_list else None
+                        _emit_verbose(j, prompt, metadata, result, from_cache=(j != i))
+                    yield j, result
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 

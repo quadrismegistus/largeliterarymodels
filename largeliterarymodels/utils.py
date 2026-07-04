@@ -10,11 +10,13 @@ def available_models(verbose=False):
     keys = check_api_keys(verbose=verbose)
     models = []
     if "ANTHROPIC_API_KEY" in keys:
-        models.extend(["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"])
+        models.extend(["claude-sonnet-4-6", "claude-haiku-4-5"])
     if "OPENAI_API_KEY" in keys:
         models.extend(["gpt-4o-mini", "gpt-4o"])
     if "GEMINI_API_KEY" in keys:
         models.extend(["gemini-2.5-flash", "gemini-2.5-pro"])
+    if "DEEPSEEK_API_KEY" in keys:
+        models.extend(["deepseek/deepseek-chat"])
     return models
 
 

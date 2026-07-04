@@ -19,7 +19,7 @@ class TestTaskInit:
         assert task.name is None
         assert task.task_name == "Task"
         assert task.schema is None
-        assert task.examples == []
+        assert task.examples == ()  # immutable default
 
     def test_kwargs_override(self):
         task = Task(name="custom", retries=3)

@@ -30,6 +30,9 @@ MODEL_TAGS: dict[str, str] = {
     # Google Gemini
     'gemini-flash':  'gemini-2.5-flash',
     'gemini-pro':    'gemini-2.5-pro',
+
+    # DeepSeek (hosted API; requires DEEPSEEK_API_KEY)
+    'deepseek-chat': 'deepseek/deepseek-chat',
 }
 
 

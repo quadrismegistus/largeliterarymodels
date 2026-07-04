@@ -11,12 +11,31 @@ import base64
 import io
 import os
 
+# SDK clients are memoized per (provider, credentials, base_url, timeout):
+# each client owns an httpx connection pool, and constructing one per call
+# churns TCP connections/file descriptors under parallel batch runs.
+_CLIENT_CACHE = {}
+
+
+def _cached_client(cache_key, factory):
+    client = _CLIENT_CACHE.get(cache_key)
+    if client is None:
+        client = factory()
+        _CLIENT_CACHE[cache_key] = client
+    return client
+
 
 def _get_key(env_var):
     key = os.getenv(env_var)
     if not key:
         raise RuntimeError(f"Missing {env_var} in environment")
     return key
+
+
+# DeepSeek's hosted API models. Bare names like 'deepseek-r1:8b' are local
+# checkpoints and must NOT route to the paid API — use an explicit
+# 'ollama/'/'lmstudio/' prefix for those.
+_DEEPSEEK_API_MODELS = ("deepseek-chat", "deepseek-reasoner")
 
 
 def route_provider(model):
@@ -28,7 +47,7 @@ def route_provider(model):
         return call_claude_cli
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
         return call_anthropic
-    elif model_lower.startswith("deepseek/") or "deepseek" in model_lower:
+    elif model_lower.startswith("deepseek/") or model_lower in _DEEPSEEK_API_MODELS:
         return call_deepseek
     elif "gpt" in model_lower or "o1" in model_lower or "o3" in model_lower or model_lower.startswith("openai/"):
         return call_openai
@@ -37,7 +56,7 @@ def route_provider(model):
     else:
         raise ValueError(
             f"Cannot determine provider for model '{model}'. "
-            f"Model name should contain 'claude', 'gpt', 'gemini', or 'deepseek', "
+            f"Model name should contain 'claude', 'gpt', or 'gemini', "
             f"or use a prefix like 'anthropic/', 'openai/', 'google/', 'deepseek/', 'claude-cli/', or 'local/'."
         )
 
@@ -74,12 +93,28 @@ def _load_image_bytes(image):
         return buf.getvalue(), mime
 
 
-def call_anthropic(prompt, model="claude-sonnet-4-20250514", system_prompt=None,
-                   temperature=0.7, max_tokens=4096, images=None, **kwargs):
+# Model families where the API rejects sampling params (temperature/top_p).
+# Substring check against the stripped model id; extend as new families ship.
+_NO_TEMPERATURE_MODELS = ("opus-4-7", "opus-4-8", "sonnet-5", "fable", "mythos")
+
+
+def _supports_temperature(model):
+    model_lower = model.lower()
+    return not any(tag in model_lower for tag in _NO_TEMPERATURE_MODELS)
+
+
+def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
+                   temperature=0.7, max_tokens=4096, images=None,
+                   timeout=None, **kwargs):
     """Call Anthropic's Claude API directly."""
     from anthropic import Anthropic
 
-    client = Anthropic(api_key=_get_key("ANTHROPIC_API_KEY"))
+    api_key = _get_key("ANTHROPIC_API_KEY")
+    client = _cached_client(
+        ("anthropic", api_key, timeout),
+        lambda: Anthropic(api_key=api_key) if timeout is None
+        else Anthropic(api_key=api_key, timeout=timeout),
+    )
     model = _strip_prefix(model)
 
     # Build content blocks
@@ -104,8 +139,8 @@ def call_anthropic(prompt, model="claude-sonnet-4-20250514", system_prompt=None,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}],
     )
-    # claude-opus-4-7 and later deprecate `temperature`; skip when unsupported.
-    if temperature is not None and 'opus-4-7' not in model:
+    # Newer model families reject sampling params entirely; skip when unsupported.
+    if temperature is not None and _supports_temperature(model):
         api_kwargs["temperature"] = temperature
     # Mark system (which includes few-shot examples per llm._build_extract_prompt)
     # as cacheable. Task batches reuse the same system across hundreds-to-thousands
@@ -132,7 +167,7 @@ def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
     Model string after prefix selects the model:
         claude-cli/opus   → --model claude-opus-4-6
         claude-cli/sonnet → --model claude-sonnet-4-6
-        claude-cli/haiku  → --model claude-haiku-4-5-20251001
+        claude-cli/haiku  → --model claude-haiku-4-5
         claude-cli/<full> → --model <full>  (pass-through)
     """
     import json
@@ -149,7 +184,7 @@ def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
     model_map = {
         "opus": "claude-opus-4-6",
         "sonnet": "claude-sonnet-4-6",
-        "haiku": "claude-haiku-4-5-20251001",
+        "haiku": "claude-haiku-4-5",
     }
     model_name = model_map.get(model_name, model_name)
 
@@ -182,11 +217,17 @@ def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
 
 
 def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,
-                temperature=0.7, max_tokens=4096, images=None, **kwargs):
+                temperature=0.7, max_tokens=4096, images=None,
+                timeout=None, **kwargs):
     """Call OpenAI's API directly."""
     from openai import OpenAI
 
-    client = OpenAI(api_key=_get_key("OPENAI_API_KEY"))
+    api_key = _get_key("OPENAI_API_KEY")
+    client = _cached_client(
+        ("openai", api_key, timeout),
+        lambda: OpenAI(api_key=api_key) if timeout is None
+        else OpenAI(api_key=api_key, timeout=timeout),
+    )
     model = _strip_prefix(model)
 
     # Build content
@@ -218,33 +259,30 @@ def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,
 
 
 def call_deepseek(prompt, model="deepseek/deepseek-chat", system_prompt=None,
-                  temperature=0.7, max_tokens=4096, images=None, **kwargs):
-    """Call DeepSeek's API (OpenAI-compatible)."""
+                  temperature=0.7, max_tokens=4096, images=None,
+                  timeout=None, **kwargs):
+    """Call DeepSeek's API (OpenAI-compatible, text-only)."""
     from openai import OpenAI
 
-    client = OpenAI(
-        api_key=_get_key("DEEPSEEK_API_KEY"),
-        base_url="https://api.deepseek.com",
+    if images:
+        raise ValueError(
+            "DeepSeek's chat API is text-only; images are not supported."
+        )
+
+    api_key = _get_key("DEEPSEEK_API_KEY")
+    client = _cached_client(
+        ("deepseek", api_key, timeout),
+        lambda: OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        if timeout is None
+        else OpenAI(api_key=api_key, base_url="https://api.deepseek.com",
+                    timeout=timeout),
     )
     model = _strip_prefix(model)
-
-    if images:
-        content = []
-        for img in images:
-            data, mime = _load_image_bytes(img)
-            b64 = base64.b64encode(data).decode("utf-8")
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            })
-        content.append({"type": "text", "text": prompt})
-    else:
-        content = prompt
 
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": content})
+    messages.append({"role": "user", "content": prompt})
 
     response = client.chat.completions.create(
         model=model,
@@ -256,7 +294,8 @@ def call_deepseek(prompt, model="deepseek/deepseek-chat", system_prompt=None,
 
 
 def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
-                temperature=0.7, max_tokens=4096, images=None, **kwargs):
+                temperature=0.7, max_tokens=4096, images=None,
+                timeout=None, **kwargs):
     """Call Google's GenAI API directly."""
     from google import genai
     from google.genai import types
@@ -265,7 +304,16 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY in environment")
 
-    client = genai.Client(api_key=api_key)
+    def _make_google_client():
+        if timeout is None:
+            return genai.Client(api_key=api_key)
+        # google-genai takes timeout in milliseconds via http_options.
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=int(timeout * 1000)),
+        )
+
+    client = _cached_client(("google", api_key, timeout), _make_google_client)
     model = _strip_prefix(model)
 
     config = types.GenerateContentConfig(
@@ -338,7 +386,8 @@ def _resolve_local_base_url(model: str) -> str:
 
 
 def call_local(prompt, model="llama3.3", system_prompt=None,
-               temperature=0.7, max_tokens=4096, images=None, **kwargs):
+               temperature=0.7, max_tokens=4096, images=None,
+               timeout=None, **kwargs):
     """Call a local OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp server).
 
     Routing is prefix-pinned: `lmstudio/<model>` always hits LM Studio (port
@@ -358,7 +407,11 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     from openai import OpenAI
 
     base_url = _resolve_local_base_url(model)
-    client = OpenAI(api_key="local", base_url=base_url)
+    client = _cached_client(
+        ("local", base_url, timeout),
+        lambda: OpenAI(api_key="local", base_url=base_url) if timeout is None
+        else OpenAI(api_key="local", base_url=base_url, timeout=timeout),
+    )
     model = _strip_prefix(model)
 
     if images:
@@ -383,19 +436,16 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     # max_tokens gets burned in `reasoning_content` leaving empty `content`. The
     # OpenAI-compat layer forwards this to Qwen's chat template.
     extra_body = {"cache_prompt": True}
-    effective_max = max_tokens
-    model_lower = model.lower()
-    if "qwen" in model_lower:
+    if "qwen" in model.lower():
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-    effective_max = max_tokens
 
     try:
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=effective_max,
-            extra_body=extra_body or None,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
         )
     except Exception as e:
         msg = str(e).lower()
@@ -416,6 +466,7 @@ def check_api_keys(verbose=False):
         "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+        "DEEPSEEK_API_KEY": os.getenv("DEEPSEEK_API_KEY"),
     }
     available = {k: v for k, v in keys.items() if v}
     if verbose:
@@ -442,6 +493,7 @@ def set_api_keys():
         ("ANTHROPIC_API_KEY", "Anthropic (Claude)"),
         ("OPENAI_API_KEY", "OpenAI (GPT)"),
         ("GEMINI_API_KEY", "Google (Gemini)"),
+        ("DEEPSEEK_API_KEY", "DeepSeek"),
     ]
     for env_var, label in providers:
         existing = os.getenv(env_var)

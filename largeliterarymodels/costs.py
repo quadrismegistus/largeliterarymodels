@@ -37,9 +37,13 @@ def resolve_model(model: str) -> str:
         return model
     if model in p['aliases']:
         return p['aliases'][model]
-    for key in p['models']:
-        if model in key:
-            return key
+    matches = [key for key in p['models'] if model in key]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise ValueError(
+            f"Ambiguous model {model!r} matches {matches}; use the full ID."
+        )
     raise ValueError(f"Unknown model: {model}. Available: {list(p['models'].keys())}")
 
 
@@ -75,17 +79,14 @@ def estimate(
         cache_write_cost = (cached_tokens / mtok) * m['cache_5m_write']
         cache_hit_cost = ((n_calls - 1) * cached_tokens / mtok) * m['cache_hit']
         uncached_input_cost = (n_calls * uncached_per_call / mtok) * m['input']
-        first_uncached_cost = (uncached_per_call / mtok) * m['input']
     elif cached_tokens > 0 and n_calls == 1:
         cache_write_cost = (cached_tokens / mtok) * m['cache_5m_write']
         cache_hit_cost = 0
         uncached_input_cost = (uncached_per_call / mtok) * m['input']
-        first_uncached_cost = uncached_input_cost
     else:
         cache_write_cost = 0
         cache_hit_cost = 0
         uncached_input_cost = (n_calls * input_tokens / mtok) * m['input']
-        first_uncached_cost = 0
 
     output_cost = (n_calls * output_tokens / mtok) * m['output']
     total = cache_write_cost + cache_hit_cost + uncached_input_cost + output_cost

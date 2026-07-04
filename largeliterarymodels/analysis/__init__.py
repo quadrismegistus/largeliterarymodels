@@ -17,98 +17,83 @@ Example:
     groups = passage_groups(feats.index, include_halfcent=True)
     results = fisher_tests(feats, groups)
     results['q_value'] = bh_fdr(results['p_value'])
+
+Submodules are lazy-loaded (PEP 562, same pattern as
+largeliterarymodels.tasks) so `import largeliterarymodels.analysis`
+doesn't eagerly pull pandas/numpy/clickhouse into every process.
 """
 
-from .adapters import wide_to_features, classify_schema_fields
-from .features import (
-    build_feature_matrix,
-    fit_partition_model,
-    load_genre_extras,
-    period_dummies,
-    DEFAULT_ORDINAL_ENCODINGS,
-)
-from .groups import passage_groups
-from .reader import joint_feature_matrix, load_task_annotations
-from .registry import TASK_REGISTRY, register_task, resolve_task_class
-from .reliability import (
-    audit_disagrees_with_reference,
-    flagged_for_audit,
-    load_agent_annotations,
-    majority_consensus,
-    pairwise_agreement,
-    per_field_trust,
-    write_consensus,
-)
-from .propagate import (
-    evaluate_classifiers, calibrate_thresholds, predict_all, write_propagated,
-)
-from .cross_language import compare_cross_language
-from .embeddings import center_by_group, fetch_passage_embeddings, mean_pool_to_text
-from .social_networks import (
-    SocialNetwork,
-    build_dialogue_graph,
-    build_directed_graph,
-    build_event_graph,
-    build_graph,
-    character_trajectories,
-    compare,
-    load_result,
-    location_summary,
-    network_metrics,
-    plot_network,
-    relation_type_counts,
-    event_verb_counts,
-)
-from .stats import bh_fdr, fisher_tests, group_matrix
+import importlib
 
-__all__ = [
-    'joint_feature_matrix',
-    'load_task_annotations',
-    'passage_groups',
-    'wide_to_features',
-    'classify_schema_fields',
-    'build_feature_matrix',
-    'fit_partition_model',
-    'load_genre_extras',
-    'period_dummies',
-    'DEFAULT_ORDINAL_ENCODINGS',
-    'TASK_REGISTRY',
-    'register_task',
-    'resolve_task_class',
-    'fisher_tests',
-    'bh_fdr',
-    'group_matrix',
-    # propagation
-    'evaluate_classifiers',
-    'calibrate_thresholds',
-    'predict_all',
-    'write_propagated',
+_LAZY_IMPORTS = {
+    # adapters
+    'wide_to_features': '.adapters',
+    'classify_schema_fields': '.adapters',
+    # features
+    'build_feature_matrix': '.features',
+    'fit_partition_model': '.features',
+    'load_genre_extras': '.features',
+    'period_dummies': '.features',
+    'DEFAULT_ORDINAL_ENCODINGS': '.features',
+    # groups
+    'passage_groups': '.groups',
+    # reader
+    'joint_feature_matrix': '.reader',
+    'load_task_annotations': '.reader',
+    # registry
+    'TASK_REGISTRY': '.registry',
+    'register_task': '.registry',
+    'resolve_task_class': '.registry',
     # reliability / ensemble consensus
-    'load_agent_annotations',
-    'per_field_trust',
-    'pairwise_agreement',
-    'majority_consensus',
-    'flagged_for_audit',
-    'audit_disagrees_with_reference',
-    'write_consensus',
+    'audit_disagrees_with_reference': '.reliability',
+    'flagged_for_audit': '.reliability',
+    'load_agent_annotations': '.reliability',
+    'majority_consensus': '.reliability',
+    'pairwise_agreement': '.reliability',
+    'per_field_trust': '.reliability',
+    'write_consensus': '.reliability',
+    # propagation
+    'evaluate_classifiers': '.propagate',
+    'calibrate_thresholds': '.propagate',
+    'predict_all': '.propagate',
+    'write_propagated': '.propagate',
     # cross-language comparison
-    'compare_cross_language',
+    'compare_cross_language': '.cross_language',
     # embeddings
-    'fetch_passage_embeddings',
-    'mean_pool_to_text',
-    'center_by_group',
+    'center_by_group': '.embeddings',
+    'fetch_passage_embeddings': '.embeddings',
+    'mean_pool_to_text': '.embeddings',
     # social networks
-    'SocialNetwork',
-    'build_graph',
-    'build_directed_graph',
-    'build_dialogue_graph',
-    'build_event_graph',
-    'compare',
-    'load_result',
-    'character_trajectories',
-    'location_summary',
-    'network_metrics',
-    'plot_network',
-    'relation_type_counts',
-    'event_verb_counts',
-]
+    'SocialNetwork': '.social_networks',
+    'build_dialogue_graph': '.social_networks',
+    'build_directed_graph': '.social_networks',
+    'build_event_graph': '.social_networks',
+    'build_graph': '.social_networks',
+    'character_trajectories': '.social_networks',
+    'compare': '.social_networks',
+    'load_result': '.social_networks',
+    'location_summary': '.social_networks',
+    'network_metrics': '.social_networks',
+    'plot_network': '.social_networks',
+    'relation_type_counts': '.social_networks',
+    'event_verb_counts': '.social_networks',
+    # stats
+    'bh_fdr': '.stats',
+    'fisher_tests': '.stats',
+    'group_matrix': '.stats',
+}
+
+__all__ = list(_LAZY_IMPORTS)
+
+
+def __getattr__(name):
+    if name in _LAZY_IMPORTS:
+        module = importlib.import_module(_LAZY_IMPORTS[name], __name__)
+        value = getattr(module, name)
+        globals()[name] = value  # cache for subsequent access
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return __all__

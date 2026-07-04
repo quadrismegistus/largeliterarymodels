@@ -2,7 +2,6 @@
 
 import json
 import os
-import pandas as pd
 from hashstash import HashStash
 from .llm import (
     LLM, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, STASH_PATH,
@@ -228,6 +227,7 @@ class Task:
         Key metadata (model, prompt snippet, temperature) and user-defined
         metadata are included as columns.
         """
+        import pandas as pd
         rows = []
         is_list, item_schema = _unwrap_schema(self.schema)
         for key, result in self.results:
@@ -336,6 +336,7 @@ class SequentialTask(Task):
         Returns:
             tuple: (pd.DataFrame with 'text' and 'n_words' columns, source_label)
         """
+        import pandas as pd
         if isinstance(source, list):
             rows = [{'text': t, 'n_words': len(t.split()), 'seq': i}
                     for i, t in enumerate(source)]

@@ -38,6 +38,87 @@ def _save_annotation(task, annotator: str, item_key: str, annotation: dict):
     task.human_stash(annotator)[item_key] = annotation
 
 
+def _cohens_kappa(pairs: list[tuple]) -> float:
+    """Cohen's kappa for a list of (label_a, label_b) pairs."""
+    n = len(pairs)
+    if n == 0:
+        return float('nan')
+    po = sum(1 for a, b in pairs if a == b) / n
+    labels = {v for pair in pairs for v in pair}
+    pe = sum(
+        (sum(1 for a, _ in pairs if a == lab) / n)
+        * (sum(1 for _, b in pairs if b == lab) / n)
+        for lab in labels
+    )
+    if pe >= 1.0:
+        # Both annotators used a single identical label distribution;
+        # agreement is uninformative rather than perfect.
+        return float('nan')
+    return (po - pe) / (1 - pe)
+
+
+def inter_annotator_agreement(task, annotators: list[str],
+                              fields: list[str] | None = None):
+    """Human-vs-human agreement across annotators' saved annotations.
+
+    For every annotator pair and every scalar (bool/str/int) schema field,
+    computes percent agreement and Cohen's kappa over the items both
+    annotators completed.
+
+    Args:
+        task: The Task whose human_stash annotations to compare.
+        annotators: Annotator IDs (each has its own JSONL stash).
+        fields: Restrict to these field names (default: all scalar fields
+            found in the annotations).
+
+    Returns:
+        pd.DataFrame with columns: field, annotator_a, annotator_b,
+        n_items, percent_agreement, kappa — sorted by field.
+    """
+    import itertools
+
+    import pandas as pd
+
+    stashes = {a: _load_annotations(task, a) for a in annotators}
+    rows = []
+    for a, b in itertools.combinations(annotators, 2):
+        shared = sorted(set(stashes[a]) & set(stashes[b]))
+        if not shared:
+            continue
+        field_names = fields
+        if field_names is None:
+            field_names = sorted({
+                k for key in shared
+                for k in (*stashes[a][key], *stashes[b][key])
+            })
+        for field in field_names:
+            pairs = []
+            for key in shared:
+                va = stashes[a][key].get(field)
+                vb = stashes[b][key].get(field)
+                if va is None or vb is None:
+                    continue
+                if isinstance(va, (list, dict)) or isinstance(vb, (list, dict)):
+                    continue  # scalar fields only
+                pairs.append((va, vb))
+            if not pairs:
+                continue
+            agree = sum(1 for va, vb in pairs if va == vb) / len(pairs)
+            rows.append({
+                'field': field,
+                'annotator_a': a,
+                'annotator_b': b,
+                'n_items': len(pairs),
+                'percent_agreement': agree,
+                'kappa': _cohens_kappa(pairs),
+            })
+    return pd.DataFrame(rows).sort_values(
+        ['field', 'annotator_a', 'annotator_b']).reset_index(drop=True) \
+        if rows else pd.DataFrame(columns=[
+            'field', 'annotator_a', 'annotator_b', 'n_items',
+            'percent_agreement', 'kappa'])
+
+
 _HEADER_RE = re.compile(r'^(Title|Author|Year):\s*(.+?)\s*$', re.MULTILINE)
 
 

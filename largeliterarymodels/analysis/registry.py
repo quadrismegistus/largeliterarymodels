@@ -6,9 +6,19 @@ list/bool/enum field classification — no per-task adapter code required.
 """
 
 TASK_REGISTRY: dict[str, str] = {
-    # CH task-name → dotted-path importable Task class name
-    'passage-content': 'largeliterarymodels.tasks.classify_passage_content:PassageContentTask',
-    'passage-form':    'largeliterarymodels.tasks.classify_passage_form:PassageFormTask',
+    # CH task-name → dotted-path importable Task class name.
+    # Naming convention: Task.name with its 'classify_'/'score_' verb
+    # stripped and underscores hyphenated ('classify_passage_content' →
+    # 'passage-content'). If an ingest pipeline stores a different task
+    # name, override with register_task().
+    'passage-content':        'largeliterarymodels.tasks.classify_passage_content:PassageContentTask',
+    'passage-form':           'largeliterarymodels.tasks.classify_passage_form:PassageFormTask',
+    'passage-narrativity':    'largeliterarymodels.tasks.classify_passage_narrativity:PassageNarrativityTask',
+    'passage-setting':        'largeliterarymodels.tasks.classify_passage_setting:PassageSettingTask',
+    'emotion':                'largeliterarymodels.tasks.classify_emotion:EmotionTask',
+    'emotion-zh':             'largeliterarymodels.tasks.classify_emotion_zh:EmotionTaskZh',
+    'contradiction-response': 'largeliterarymodels.tasks.classify_contradiction_response:ContradictionResponseTask',
+    'alignment-asymmetry':    'largeliterarymodels.tasks.score_alignment_asymmetry:AlignmentAsymmetryTask',
 }
 
 

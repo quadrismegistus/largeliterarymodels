@@ -1,24 +1,39 @@
 """Task → adapter registry for the litmod CLI."""
 
 from .adapters.passage import PassageAdapter
+from .adapters.text import TextAdapter
+from .adapters.word import WordAdapter
+from .adapters.work import WorkAdapter
 
 
 FAMILIES: dict[str, str] = {
-    'PassageContentTask':   'passage',
-    'PassageContentTaskV1': 'passage',
-    'PassageFormTask':      'passage',
-    'PassageTask':          'passage',
+    # passage family fetches text from lltk.passages via ClickHouse
+    'PassageContentTask':       'passage',
+    'PassageContentTaskV1':     'passage',
+    'PassageFormTask':          'passage',
+    'PassageTask':              'passage',
+    'PassageNarrativityTask':   'passage',
+    'PassageSettingTask':       'passage',
+    # work family classifies from title/author/year metadata (no CH)
+    'GenreTask':                'work',
+    'GenreTaskLite':            'work',
+    'MajorGenreTask':           'work',
+    # text family annotates raw passage text supplied inline (no CH)
+    'EmotionTask':              'text',
+    'EmotionTaskZh':            'text',
+    # word family keys on (word, pos) entries (no CH)
+    'TranslationTask':          'word',
     # Future families — register when their adapters exist:
-    # 'GenreTask':          'work',
-    # 'FryeTask':           'work',
     # 'BibliographyTask':   'work_long',
     # 'CharacterIntroTask': 'character',
-    # 'TranslationTask':    'word',
 }
 
 
 ADAPTERS = {
     'passage': PassageAdapter,
+    'text': TextAdapter,
+    'word': WordAdapter,
+    'work': WorkAdapter,
 }
 
 

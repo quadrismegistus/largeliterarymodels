@@ -212,3 +212,9 @@ data/
 uv.lock
 .sesskey
 .claude
+
+# Generated figures (keep out of git; notebooks retain rendered outputs)
+figures/
+
+# Vast.ai instance state (contains live SSH coordinates)
+.vastai.json

@@ -28,6 +28,8 @@ def route_provider(model):
         return call_claude_cli
     if "claude" in model_lower or model_lower.startswith("anthropic/"):
         return call_anthropic
+    elif model_lower.startswith("deepseek/") or "deepseek" in model_lower:
+        return call_deepseek
     elif "gpt" in model_lower or "o1" in model_lower or "o3" in model_lower or model_lower.startswith("openai/"):
         return call_openai
     elif "gemini" in model_lower or model_lower.startswith("google/"):
@@ -35,15 +37,15 @@ def route_provider(model):
     else:
         raise ValueError(
             f"Cannot determine provider for model '{model}'. "
-            f"Model name should contain 'claude', 'gpt', or 'gemini', "
-            f"or use a prefix like 'anthropic/', 'openai/', 'google/', 'claude-cli/', or 'local/'."
+            f"Model name should contain 'claude', 'gpt', 'gemini', or 'deepseek', "
+            f"or use a prefix like 'anthropic/', 'openai/', 'google/', 'deepseek/', 'claude-cli/', or 'local/'."
         )
 
 
 def _strip_prefix(model):
     """Remove provider prefix like 'anthropic/' or 'openai/' from model name."""
-    for prefix in ("anthropic/", "openai/", "google/", "claude-cli/",
-                   "local/", "ollama/", "vllm/", "lmstudio/"):
+    for prefix in ("anthropic/", "openai/", "google/", "deepseek/",
+                   "claude-cli/", "local/", "ollama/", "vllm/", "lmstudio/"):
         if model.lower().startswith(prefix):
             return model[len(prefix):]
     return model
@@ -188,6 +190,44 @@ def call_openai(prompt, model="gpt-4o-mini", system_prompt=None,
     model = _strip_prefix(model)
 
     # Build content
+    if images:
+        content = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            b64 = base64.b64encode(data).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content
+
+
+def call_deepseek(prompt, model="deepseek/deepseek-chat", system_prompt=None,
+                  temperature=0.7, max_tokens=4096, images=None, **kwargs):
+    """Call DeepSeek's API (OpenAI-compatible)."""
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=_get_key("DEEPSEEK_API_KEY"),
+        base_url="https://api.deepseek.com",
+    )
+    model = _strip_prefix(model)
+
     if images:
         content = []
         for img in images:

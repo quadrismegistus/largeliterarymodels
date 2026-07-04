@@ -133,33 +133,11 @@ class Task:
             **kwargs,
         )
 
-    def map(self, prompts, model=None, system_prompt=None, examples=None,
-            images_list=None, metadata_list=None,
-            num_workers=4, force=False, verbose=False, **kwargs):
-        """Extract structured data from multiple inputs, with parallelism.
-
-        Args:
-            prompts: List of input texts.
-            model: Override the default model.
-            system_prompt: Override the task's system_prompt.
-            examples: Override the task's few-shot examples.
-            images_list: List of image lists, one per prompt (or None).
-            metadata_list: List of metadata dicts, one per prompt (or None).
-            num_workers: Number of parallel threads.
-            force: Bypass cache.
-            verbose: If True, print a compact per-call summary as each
-                result lands. If a callable, use it as a custom formatter
-                (see LLM.extract_map for the signature).
-            **kwargs: Additional arguments passed to LLM.extract_map().
-
-        Returns:
-            list: Validated Pydantic model instances in prompt order.
-        """
-        if self.schema is None:
-            raise ValueError(f"Task '{self.name}' has no schema defined.")
-        llm = self._get_llm(model)
-        return llm.extract_map(
-            prompts=prompts,
+    def _imap_kwargs(self, model=None, system_prompt=None, examples=None,
+                     images_list=None, metadata_list=None,
+                     num_workers=4, force=False, verbose=False, **kwargs):
+        """Build kwargs for extract_imap/extract_map."""
+        return dict(
             schema=self.schema,
             system_prompt=system_prompt or self.system_prompt,
             examples=examples if examples is not None else self.examples,
@@ -170,6 +148,42 @@ class Task:
             force=force,
             verbose=verbose,
             **kwargs,
+        )
+
+    def imap(self, prompts, model=None, system_prompt=None, examples=None,
+             images_list=None, metadata_list=None,
+             num_workers=4, force=False, verbose=False, **kwargs):
+        """Extract structured data, yielding (index, result) as each completes.
+
+        Cached items yield first, then API results in completion order.
+        Each result is cached the moment it completes, so partial runs
+        are resumable.
+        """
+        if self.schema is None:
+            raise ValueError(f"Task '{self.name}' has no schema defined.")
+        llm = self._get_llm(model)
+        yield from llm.extract_imap(
+            prompts=prompts,
+            **self._imap_kwargs(model, system_prompt, examples, images_list,
+                                metadata_list, num_workers, force, verbose,
+                                **kwargs),
+        )
+
+    def map(self, prompts, model=None, system_prompt=None, examples=None,
+            images_list=None, metadata_list=None,
+            num_workers=4, force=False, verbose=False, **kwargs):
+        """Extract structured data from multiple inputs, with parallelism.
+
+        Like imap but collects all results into a list in prompt order.
+        """
+        if self.schema is None:
+            raise ValueError(f"Task '{self.name}' has no schema defined.")
+        llm = self._get_llm(model)
+        return llm.extract_map(
+            prompts=prompts,
+            **self._imap_kwargs(model, system_prompt, examples, images_list,
+                                metadata_list, num_workers, force, verbose,
+                                **kwargs),
         )
 
     @property

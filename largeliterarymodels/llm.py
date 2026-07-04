@@ -473,11 +473,15 @@ class LLM:
 
         return results
 
-    def extract_map(self, prompts, schema, system_prompt=None, examples=None,
-                    temperature=None, max_tokens=None, images_list=None,
-                    metadata_list=None, num_workers=4,
-                    force=False, retries=1, verbose=False, **kwargs):
-        """Extract structured data from multiple prompts, with caching and parallelism.
+    def extract_imap(self, prompts, schema, system_prompt=None, examples=None,
+                     temperature=None, max_tokens=None, images_list=None,
+                     metadata_list=None, num_workers=4,
+                     force=False, retries=1, verbose=False, **kwargs):
+        """Extract structured data from multiple prompts, yielding as each completes.
+
+        Yields (index, result) tuples in completion order — cached items first,
+        then API results as threads finish. Each result is cached to the stash
+        the moment it completes, so partial runs are resumable.
 
         Args:
             prompts: List of input texts.
@@ -497,8 +501,9 @@ class LLM:
                 (i: int, prompt: str, metadata: dict|None, result) -> str.
             **kwargs: Additional provider-specific arguments.
 
-        Returns:
-            list: Validated Pydantic model instances (or lists thereof) in prompt order.
+        Yields:
+            tuple: (index, result) where result is a validated Pydantic model
+                instance (or list thereof), or None on failure.
         """
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
@@ -537,7 +542,6 @@ class LLM:
             except Exception as e:
                 tqdm.write(f"[{i}] <verbose formatter error: {e}>")
 
-        results = [None] * len(prompts)
         to_compute = []
 
         for i, prompt in enumerate(prompts):
@@ -549,22 +553,25 @@ class LLM:
                 cached = self.stash[key]
                 if isinstance(cached, str):
                     try:
-                        results[i] = _validate_parsed(_parse_json_response(cached), schema)
-                    except Exception:
-                        to_compute.append((i, prompt, key, images))
+                        result = _validate_parsed(_parse_json_response(cached), schema)
+                        if verbose:
+                            _emit_verbose(i, prompt, metadata, result, from_cache=True)
+                        yield i, result
                         continue
+                    except Exception:
+                        pass
                 else:
-                    results[i] = cached
-                if verbose and results[i] is not None:
-                    _emit_verbose(i, prompt, metadata, results[i], from_cache=True)
-            else:
-                to_compute.append((i, prompt, key, images))
+                    if verbose:
+                        _emit_verbose(i, prompt, metadata, cached, from_cache=True)
+                    yield i, cached
+                    continue
+            to_compute.append((i, prompt, key, images))
 
         total = len(prompts)
         fresh = len(to_compute)
         n_cached = total - fresh
         if total >= 10:
-            log.info("extract_map: %d/%d cached, %d API calls needed (model=%s)",
+            log.info("extract_imap: %d/%d cached, %d API calls needed (model=%s)",
                      n_cached, total, fresh, self.model)
             if n_cached == 0 and fresh >= 100:
                 try:
@@ -573,14 +580,14 @@ class LLM:
                     has_old_entries = False
                 if has_old_entries:
                     log.warning(
-                        "extract_map: 0/%d cached despite existing entries in %s's stash. "
+                        "extract_imap: 0/%d cached despite existing entries in %s's stash. "
                         "System prompt, examples, schema, temperature, or max_tokens may "
                         "have changed since the last run — previous cache keys are unreachable.",
                         total, s_name,
                     )
 
         if not to_compute:
-            return results
+            return
 
         def _do_one(item):
             i, prompt, key, images = item
@@ -590,7 +597,7 @@ class LLM:
                 call_prompt = prompt
                 if attempt > 0:
                     log.warning(
-                        "extract_map retry %d/%d for prompt %d (model=%s): %s",
+                        "extract_imap retry %d/%d for prompt %d (model=%s): %s",
                         attempt, retries, i, self.model, last_error,
                     )
                     call_prompt = (
@@ -615,27 +622,48 @@ class LLM:
                 except Exception as e:
                     last_error = e
                     continue
-            # Exhausted retries — return None so the pool drains cleanly and
-            # the pilot continues past individual failures rather than hanging.
             log.error(
-                "extract_map giving up on prompt %d after %d attempts (model=%s). "
+                "extract_imap giving up on prompt %d after %d attempts (model=%s). "
                 "Last error: %s. Raw (truncated): %s",
                 i, 1 + retries, self.model, last_error,
                 (raw or '')[:400],
             )
             return i, None
 
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+        try:
             futures = {executor.submit(_do_one, item): item for item in to_compute}
             for future in tqdm(as_completed(futures), total=len(to_compute),
                                desc=f"Extracting {s_name} ({self.model})"):
                 i, result = future.result()
-                results[i] = result
                 if verbose:
                     prompt = prompts[i]
                     metadata = metadata_list[i] if metadata_list else None
                     _emit_verbose(i, prompt, metadata, result, from_cache=False)
+                yield i, result
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
+    def extract_map(self, prompts, schema, system_prompt=None, examples=None,
+                    temperature=None, max_tokens=None, images_list=None,
+                    metadata_list=None, num_workers=4,
+                    force=False, retries=1, verbose=False, **kwargs):
+        """Extract structured data from multiple prompts, with caching and parallelism.
+
+        Like extract_imap but collects all results into a list in prompt order.
+
+        Returns:
+            list: Validated Pydantic model instances (or lists thereof) in prompt order.
+        """
+        results = [None] * len(prompts)
+        for i, result in self.extract_imap(
+            prompts, schema, system_prompt=system_prompt, examples=examples,
+            temperature=temperature, max_tokens=max_tokens,
+            images_list=images_list, metadata_list=metadata_list,
+            num_workers=num_workers, force=force, retries=retries,
+            verbose=verbose, **kwargs,
+        ):
+            results[i] = result
         return results
 
     def __repr__(self):

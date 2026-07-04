@@ -78,6 +78,29 @@ _LAZY_IMPORTS = {
 
     'PassageNarrativityTask': ('.classify_passage_narrativity', 'PassageNarrativityTask'),
     'PassageNarrativityAnnotation': ('.classify_passage_narrativity', 'PassageNarrativityAnnotation'),
+
+    'EmotionTask': ('.classify_emotion', 'EmotionTask'),
+    'EmotionAnnotation': ('.classify_emotion', 'EmotionAnnotation'),
+    'EmotionInstance': ('.classify_emotion', 'EmotionInstance'),
+    'EMOTION_WHEEL': ('.classify_emotion', 'EMOTION_WHEEL'),
+    'ALL_EMOTIONS': ('.classify_emotion', 'ALL_EMOTIONS'),
+
+    'EmotionTaskZh': ('.classify_emotion_zh', 'EmotionTaskZh'),
+    'EmotionAnnotationZh': ('.classify_emotion_zh', 'EmotionAnnotationZh'),
+    'EmotionInstanceZh': ('.classify_emotion_zh', 'EmotionInstanceZh'),
+    'EMOTION_WHEEL_ZH': ('.classify_emotion_zh', 'EMOTION_WHEEL_ZH'),
+    'ALL_EMOTIONS_ZH': ('.classify_emotion_zh', 'ALL_EMOTIONS_ZH'),
+    'EMOTION_GLOSSARY': ('.classify_emotion_zh', 'EMOTION_GLOSSARY'),
+    'PLUTCHIK_PARTIAL_EQUIVALENCES': ('.classify_emotion_zh', 'PLUTCHIK_PARTIAL_EQUIVALENCES'),
+
+    'AlignmentAsymmetryTask': ('.score_alignment_asymmetry', 'AlignmentAsymmetryTask'),
+    'AlignmentAsymmetryAnnotation': ('.score_alignment_asymmetry', 'AlignmentAsymmetryAnnotation'),
+    'prepare_text': ('.score_alignment_asymmetry', 'prepare_text'),
+
+    'ContradictionResponseTask': ('.classify_contradiction_response', 'ContradictionResponseTask'),
+    'ContradictionAnnotation': ('.classify_contradiction_response', 'ContradictionAnnotation'),
+    'ContradictionStrategy': ('.classify_contradiction_response', 'ContradictionStrategy'),
+    'format_for_classification': ('.classify_contradiction_response', 'format_for_classification'),
 }
 
 

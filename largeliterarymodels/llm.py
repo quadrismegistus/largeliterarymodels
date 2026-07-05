@@ -615,10 +615,7 @@ class LLM:
             log.info("extract_imap: %d/%d cached, %d API calls needed (model=%s)",
                      n_cached, total, fresh, self.model)
             if n_cached == 0 and fresh >= 100:
-                try:
-                    has_old_entries = next(iter(self.stash.items()), None) is not None
-                except Exception:
-                    has_old_entries = False
+                has_old_entries = next(iter(self.stash.items()), None) is not None
                 if has_old_entries:
                     log.warning(
                         "extract_imap: 0/%d cached despite existing entries in %s's stash. "

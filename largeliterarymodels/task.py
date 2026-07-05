@@ -204,12 +204,24 @@ class Task:
 
     @property
     def results(self):
-        """Iterate over all cached (key_dict, parsed_result) pairs.
+        """Iterate over cached (key_dict, parsed_result) pairs, latest per key.
+
+        The stash is append-mode: a key rewritten (e.g. via force=True) keeps
+        its full history on disk, and bare items() yields every version.
+        Request latest-only so .df never double-counts rewritten keys; fall
+        back to last-wins dedup for stash engines without the kwarg.
 
         Yields:
             tuple: (key_dict, validated pydantic object or list thereof)
         """
-        for key, raw in self.stash.items():
+        try:
+            pairs = self.stash.items(all_results=False)
+        except TypeError:
+            latest = {}
+            for key, raw in self.stash.items():
+                latest[json.dumps(key, sort_keys=True, default=str)] = (key, raw)
+            pairs = latest.values()
+        for key, raw in pairs:
             if not isinstance(raw, str):
                 continue
             try:

@@ -195,3 +195,36 @@ class TestTaskKwargs:
             warnings.simplefilter("always")
             Task(model="opus")
         assert not w
+
+
+class TestTaskResultsLatestOnly:
+    """Rewritten cache keys (force=True reruns) must not double-count in
+    Task.results / Task.df — append-mode stashes keep full history on disk,
+    and bare items() yields every version (hashstash 1.0 review finding)."""
+
+    def _task_with_rewritten_key(self, tmp_path):
+        from hashstash import HashStash
+
+        class T(Task):
+            name = "results_dedupe_test"
+            schema = Out
+
+        task = T()
+        task._stash = HashStash(str(tmp_path / "stash"), engine="pairtree",
+                                append_mode=True)
+        key = {"prompt": "p", "model": "m"}
+        task._stash[key] = '{"x": 1}'
+        task._stash[key] = '{"x": 2}'  # rewrite, e.g. force=True rerun
+        return task
+
+    def test_results_yields_latest_only(self, tmp_path):
+        task = self._task_with_rewritten_key(tmp_path)
+        results = list(task.results)
+        assert len(results) == 1
+        assert results[0][1].x == 2
+
+    def test_df_does_not_double_count(self, tmp_path):
+        task = self._task_with_rewritten_key(tmp_path)
+        df = task.df
+        assert len(df) == 1
+        assert df.iloc[0]["x"] == 2

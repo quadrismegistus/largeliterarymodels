@@ -49,7 +49,7 @@ def load(path=PRICING_FILE):
 def models(p, provider=None):
     """-> [(provider, name, rates)] over the requested providers."""
     out = []
-    for prov in ("anthropic", "openai", "deepseek"):
+    for prov in ("anthropic", "openai", "deepseek", "google"):
         if provider and prov != provider:
             continue
         for name, r in p.get(prov, {}).items():
@@ -59,7 +59,7 @@ def models(p, provider=None):
 
 def resolve(p, name):
     name = p.get("aliases", {}).get(name, name)
-    for prov in ("anthropic", "openai", "deepseek"):
+    for prov in ("anthropic", "openai", "deepseek", "google"):
         if name in p.get(prov, {}):
             return prov, name, p[prov][name]
     raise SystemExit("unknown model: %s" % name)
@@ -98,7 +98,7 @@ def main():
     ap.add_argument("--output", type=int, default=0)
     ap.add_argument("--cache-write", type=int, default=0)
     ap.add_argument("--ttl", choices=("5m", "1h"), default="5m")
-    ap.add_argument("--provider", choices=("anthropic", "openai", "deepseek"))
+    ap.add_argument("--provider", choices=("anthropic", "openai", "deepseek", "google"))
     ap.add_argument("--model", help="price one model instead of the table")
     ap.add_argument("--batch", action="store_true", help="apply the batch discount")
     ap.add_argument("--times", type=int, default=1, help="multiply (e.g. 3 coder arms)")

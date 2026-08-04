@@ -5,7 +5,12 @@
   "sources": {
     "anthropic": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing",
-    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing"
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "google": {
+      "url": "https://ai.google.dev/gemini-api/docs/pricing#standard",
+      "fetched": "2026-08-04",
+      "tier": "Paid Tier, Standard column (Flex/Priority tiers exist and are omitted)"
+    }
   },
   "fields": {
     "input": "fresh (uncached) input tokens",
@@ -13,7 +18,7 @@
     "cache_write_5m": "prompt cache write, 5-minute TTL (Anthropic; OpenAI gpt-5.6-* only). null = not offered or not separately billed.",
     "cache_write_1h": "prompt cache write, 1-hour TTL. Anthropic only.",
     "output": "output tokens. For REASONING models this includes reasoning tokens, which are invisible in the response but billed.",
-    "reasoning": "true if the model emits billed reasoning tokens \u2014 output-token estimates from a non-reasoning workload are FLOORS for these.",
+    "reasoning": "true if the model emits billed reasoning tokens — output-token estimates from a non-reasoning workload are FLOORS for these.",
     "batch_discount": "fraction off input and output for asynchronous batch APIs. Anthropic and OpenAI both offer 0.5."
   },
   "caveats": {
@@ -22,7 +27,11 @@
     "openai_long_context": "gpt-5.5, gpt-5.4 and the -pro variants show <272K-context pricing here; longer contexts may be priced differently.",
     "counterfactual_use": "Pricing a workload measured on model A against model B is a COUNTERFACTUAL, not a quote: output volume and tokenization both differ. Price a swap from a small pilot on the target model.",
     "deepseek_peak_pricing": "DeepSeek has ANNOUNCED but not implemented peak/off-peak pricing: during peak hours (09:00-12:00 and 14:00-18:00 Beijing, UTC+8) prices will be 2x. No effective date. Registration P's deepseek arm ran 14:00-15:00 UTC = 22:00-23:00 Beijing, i.e. off-peak, so the $0.81 is a regular-rate figure and would be $1.63 under the announced peak policy.",
-    "openai_other_tiers": "The OpenAI page also carries Flex and Fast-mode tables besides Standard and Batch. Only Standard rates are recorded here; a Flex run would price differently."
+    "openai_other_tiers": "The OpenAI page also carries Flex and Fast-mode tables besides Standard and Batch. Only Standard rates are recorded here; a Flex run would price differently.",
+    "google_long_context": "2.5-pro and 3.1-pro roughly double input and raise output ~50% on >200k-token prompts; the table carries the <=200k rates. Extraction workloads here never approach the boundary.",
+    "google_output_includes_thinking": "Every Gemini output price includes thought tokens. The framework sends the off-equivalent by default (budget 0 on 2.5, level minimal on 3.x), so flash-tier workloads bill near-zero thoughts; the pro tiers cannot disable thinking and their reasoning flag is true.",
+    "google_modality_rates": "Some Gemini rows price audio input higher than text/image/video; the table carries the text rate.",
+    "local_models": "lmstudio/ollama/vllm/local routes cost $0 API-side and are priced as zero with a note; electricity and hardware are not modeled."
   },
   "anthropic": {
     "claude-fable-5": {
@@ -440,7 +449,10 @@
     "openai/gpt-5.4-mini": "gpt-5.4-mini",
     "deepseek/deepseek-v4-pro": "deepseek-v4-pro",
     "deepseek/deepseek-v4-flash": "deepseek-v4-flash",
-    "gpt-4o-mini-2024-07-18": "gpt-4o-mini"
+    "gpt-4o-mini-2024-07-18": "gpt-4o-mini",
+    "gemini-pro": "gemini-2.5-pro",
+    "gemini-flash": "gemini-2.5-flash",
+    "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview"
   },
   "batch_discount": {
     "anthropic": 0.5,
@@ -449,6 +461,91 @@
     "_verified": "2026-08-04, from each provider's own pricing page",
     "_anthropic": "Stated in prose AND given its own table: 'a 50% discount on both input and output tokens'.",
     "_openai": "NOT stated in prose. A separate Batch table exists per model category and is 50% of Standard throughout; the discount is evident only by comparing the two tables.",
-    "_deepseek": "NO Batch API. Confirmed absent from the pricing page rather than assumed."
+    "_deepseek": "NO Batch API. Confirmed absent from the pricing page rather than assumed.",
+    "google": 0.5,
+    "_google": "Uniform 50% on input AND output across every listed model. CAVEAT: cached-read prices are halved on the flash tiers but NOT on 2.5-pro/3.1-pro (Batch cached = Standard cached there), so a flat 0.5 slightly under-prices high-cache batch workloads on the pros."
+  },
+  "google": {
+    "gemini-3.6-flash": {
+      "input": 1.5,
+      "cached": 0.15,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 7.5,
+      "reasoning": false,
+      "note": "explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    },
+    "gemini-3.5-flash": {
+      "input": 1.5,
+      "cached": 0.15,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 9.0,
+      "reasoning": false,
+      "note": "explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    },
+    "gemini-3.5-flash-lite": {
+      "input": 0.3,
+      "cached": 0.03,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 2.5,
+      "reasoning": false,
+      "note": "explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    },
+    "gemini-3.1-flash-lite": {
+      "input": 0.25,
+      "cached": 0.025,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 1.5,
+      "reasoning": false,
+      "note": "text/image/video rate; audio 2x. explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    },
+    "gemini-3.1-pro-preview": {
+      "input": 2.0,
+      "cached": 0.2,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 12.0,
+      "reasoning": true,
+      "note": "<=200k-token prompts; >200k: in $4.00 / out $18.00 / cached $0.40. Thinking unavoidable (level floor 'low'). explicit context caching adds $4.50/1M tok/hr storage (not modeled)"
+    },
+    "gemini-3-flash-preview": {
+      "input": 0.5,
+      "cached": 0.05,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 3.0,
+      "reasoning": false,
+      "note": "text/image/video rate; audio 2x. explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    },
+    "gemini-2.5-pro": {
+      "input": 1.25,
+      "cached": 0.125,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 10.0,
+      "reasoning": true,
+      "note": "<=200k-token prompts; >200k: in $2.50 / out $15.00 / cached $0.25. Thinking cannot be disabled. explicit context caching adds $4.50/1M tok/hr storage (not modeled)"
+    },
+    "gemini-2.5-flash": {
+      "input": 0.3,
+      "cached": 0.03,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 2.5,
+      "reasoning": false,
+      "note": "text/image/video rate; audio higher. explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    },
+    "gemini-2.5-flash-lite": {
+      "input": 0.1,
+      "cached": 0.01,
+      "cache_write_5m": null,
+      "cache_write_1h": null,
+      "output": 0.4,
+      "reasoning": false,
+      "note": "explicit context caching adds $1.00/1M tok/hr storage (not modeled)"
+    }
   }
 }

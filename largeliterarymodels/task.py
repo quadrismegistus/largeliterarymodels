@@ -14,6 +14,31 @@ from .llm import (
 log = logging.getLogger(__name__)
 
 
+def _merge_per_item(dst, src_items):
+    """Accumulate batch-local per-item rows into a caller's dict.
+
+    Preserves the documented accumulation semantics of a reused
+    per_item_usage dict while letting the usage_log collect into a fresh
+    one — the direct-write arrangement double-counted: batch 2's receipt
+    carried batch 1's tokens.
+    """
+    for i, entry in src_items.items():
+        row = dst.setdefault(i, {
+            "index": i, "calls": 0, "input_tokens": 0,
+            "output_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "reasoning_tokens": 0,
+            "response_model": None,
+        })
+        for k in ("calls", "input_tokens", "output_tokens",
+                  "cache_read_tokens", "cache_write_tokens",
+                  "reasoning_tokens"):
+            row[k] = row.get(k, 0) + entry.get(k, 0)
+        if entry.get("response_model"):
+            row["response_model"] = entry["response_model"]
+        if "duplicate_of" in entry:
+            row["duplicate_of"] = entry["duplicate_of"]
+
+
 class Task:
     """A reusable structured extraction task.
 
@@ -234,15 +259,46 @@ class Task:
         if self.schema is None:
             raise ValueError(f"Task '{self.name}' has no schema defined.")
         llm = self._get_llm(model)
-        yield from llm.extract_imap(
-            prompts=prompts,
-            **self._imap_kwargs(system_prompt=system_prompt, examples=examples,
-                                images_list=images_list,
-                                metadata_list=metadata_list,
-                                num_workers=num_workers, force=force,
-                                verbose=verbose, errors=errors,
-                                per_item_usage=per_item_usage, **kwargs),
-        )
+        if not self.usage_log:
+            yield from llm.extract_imap(
+                prompts=prompts,
+                **self._imap_kwargs(system_prompt=system_prompt,
+                                    examples=examples,
+                                    images_list=images_list,
+                                    metadata_list=metadata_list,
+                                    num_workers=num_workers, force=force,
+                                    verbose=verbose, errors=errors,
+                                    per_item_usage=per_item_usage, **kwargs),
+            )
+            return
+        # usage_log covers imap too — it is the resumable long-run path,
+        # which is exactly where a durable receipt matters most. Same
+        # fresh-dict-then-merge shape as map(); the receipt lands in the
+        # finally so a consumer that stops iterating early still gets one
+        # for the calls that were made.
+        prompts = list(prompts)
+        log_items = {}
+        log_errors = errors if errors is not None else {}
+        try:
+            yield from llm.extract_imap(
+                prompts=prompts,
+                **self._imap_kwargs(system_prompt=system_prompt,
+                                    examples=examples,
+                                    images_list=images_list,
+                                    metadata_list=metadata_list,
+                                    num_workers=num_workers, force=force,
+                                    verbose=verbose, errors=log_errors,
+                                    per_item_usage=log_items, **kwargs),
+            )
+        finally:
+            try:
+                self._append_usage_log(llm, log_items, metadata_list,
+                                       log_errors)
+            except Exception as e:  # noqa: BLE001
+                log.error("usage_log: failed to append receipt (%s: %s)",
+                          type(e).__name__, e)
+            if per_item_usage is not None:
+                _merge_per_item(per_item_usage, log_items)
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
             images_list=None, metadata_list=None,
@@ -272,24 +328,41 @@ class Task:
         if self.schema is None:
             raise ValueError(f"Task '{self.name}' has no schema defined.")
         llm = self._get_llm(model)
-        # With usage_log on, per-item usage is collected whether or not the
-        # caller asked for it — the durable record needs the rows either way.
-        log_items = {} if (self.usage_log and per_item_usage is None) \
-            else per_item_usage
+        # With usage_log on, per-item usage is ALWAYS collected into a fresh
+        # internal dict, then merged into the caller's afterwards. Logging
+        # directly from a caller-supplied dict double-counted: callers may
+        # reuse one dict across batches (accumulation is its documented
+        # behaviour), and a record claiming to describe one batch carried
+        # every previous batch's tokens inside it.
+        log_items = {} if self.usage_log else None
+        pass_items = log_items if self.usage_log else per_item_usage
+        log_errors = errors if errors is not None else (
+            {} if self.usage_log else None)
         results = llm.extract_map(
             prompts=prompts,
             **self._imap_kwargs(system_prompt=system_prompt, examples=examples,
                                 images_list=images_list,
                                 metadata_list=metadata_list,
                                 num_workers=num_workers, force=force,
-                                verbose=verbose, errors=errors,
-                                per_item_usage=log_items, **kwargs),
+                                verbose=verbose, errors=log_errors,
+                                per_item_usage=pass_items, **kwargs),
         )
         if self.usage_log:
-            self._append_usage_log(llm, log_items, metadata_list)
+            # A receipt must never fail the run it receipts: the results
+            # exist, the stash holds them, and an unwritable log line is a
+            # diagnostic, not a crash.
+            try:
+                self._append_usage_log(llm, log_items, metadata_list,
+                                       log_errors)
+            except Exception as e:  # noqa: BLE001
+                log.error("usage_log: failed to append receipt (%s: %s) — "
+                          "the run itself succeeded and the stash holds "
+                          "its results", type(e).__name__, e)
+            if per_item_usage is not None:
+                _merge_per_item(per_item_usage, log_items)
         return results
 
-    def _append_usage_log(self, llm, per_item, metadata_list):
+    def _append_usage_log(self, llm, per_item, metadata_list, errors=None):
         """Append this batch's usage receipts as one JSONL record.
 
         The stash stores only response text, so token counts (and any
@@ -310,6 +383,11 @@ class Task:
             row = dict(entry)
             if metadata_list and i < len(metadata_list) and metadata_list[i]:
                 row["metadata"] = metadata_list[i]
+            if errors and i in errors:
+                # Spend on an item that produced no annotation is still
+                # spend, but a per-annotation cost table must not read it
+                # as an annotation's price.
+                row["failed"] = True
             items.append(row)
         # Batch totals from the per-item rows, not the Task-lifetime
         # tracker: a record claiming to describe THIS batch must not carry
@@ -321,7 +399,10 @@ class Task:
         served = {}
         for e in items:
             rm = e.get("response_model")
-            if rm:
+            # Rows that made no call (de-duplicated twins) carry a copied
+            # response_model for provenance, but counting them made
+            # response_models sum to 3 beside calls: 2 in the same dict.
+            if rm and e.get("calls", 0) > 0:
                 served[rm] = served.get(rm, 0) + 1
         batch["response_models"] = served
         record = {

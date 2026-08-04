@@ -263,3 +263,102 @@ class TestCacheAwarePricing:
             "cache_write_tokens": 5_000, "output_tokens": 2_000,
         })
         assert not any("BELOW" in w for w in est["warnings"])
+
+
+class TestReviewFindings:
+    """Each test pins a defect from the Opus review of this branch."""
+
+    def test_floor_gate_survives_an_alias(self):
+        """S1 — the flagship feature was inert on every alias: the floor
+        lookup got the raw string, cache_floor('haiku') is None, and the
+        exact names print_estimate/dry_run default to under-estimated 2x
+        in the cheaper-than-reality direction."""
+        by_alias = costs.price("haiku", cached=10_000_000,
+                               prefix_tokens=3_000)
+        by_name = costs.price("claude-haiku-4-5", cached=10_000_000,
+                              prefix_tokens=3_000)
+        assert by_alias["usd"] == by_name["usd"]
+        assert any("BELOW" in w for w in by_alias["warnings"])
+
+    def test_pricing_aliases_agree_with_model_tags(self):
+        """S2 — `litmod price --model sonnet` must price the model
+        `litmod run --model sonnet` actually bills. The adopted table said
+        sonnet->claude-sonnet-5; MODEL_TAGS says claude-sonnet-4-6 — a 33%
+        under-estimate on the package's own default model."""
+        from largeliterarymodels.cli.models import MODEL_TAGS
+        p = costs._load()
+        for tag, target in MODEL_TAGS.items():
+            if tag in p["aliases"] and tag != "_note":
+                priced = costs.resolve(tag)[1]
+                ran = costs.resolve(target)[1]
+                assert priced == ran, (tag, priced, ran)
+
+    def test_unknown_variant_does_not_silently_prefix_match(self):
+        """S5 — variant suffixes are different PRODUCTS: gpt-5.6 priced as
+        gpt-5, a 'mini' at its parent's rate, a flash-lite at 5x. Snapshot
+        suffixes are the same product's checkpoints and must still work."""
+        for wrong in ("gpt-5.6", "gpt-5.5-mini-x", "gemini-3.6-flash-lite",
+                      "o3-deep-research-9"):
+            with pytest.raises(ValueError):
+                costs.resolve(wrong)
+        assert costs.resolve("claude-sonnet-4-6-20260219")[1] == \
+            "claude-sonnet-4-6"
+        assert costs.resolve("gemini-2.5-flash-002")[1] == "gemini-2.5-flash"
+
+    def test_batch_lines_sum_to_usd(self):
+        """S7 — components at list price under a discounted headline:
+        $18.00 of lines under a $9.00 total."""
+        est = costs.price("claude-sonnet-4-6", fresh=5_000_000,
+                          output=1_000_000, batch=True)
+        assert sum(est["lines"].values()) == pytest.approx(est["usd"],
+                                                           abs=1e-4)
+
+    def test_no_contradictory_floor_advisory_on_null_cache(self):
+        """S11 — 'has NO cache tier' and 'assumes the prefix caches' are
+        not both sayable about one model in one breath."""
+        p = costs._load()
+        null_model = next(name for prov in costs._PROVIDERS
+                          for name, r in p.get(prov, {}).items()
+                          if r["cached"] is None)
+        est = costs.price(null_model, cached=1_000_000, prefix_tokens=100)
+        assert any("NO cache tier" in w for w in est["warnings"])
+        assert not any("no measured cache floor" in w
+                       for w in est["warnings"])
+
+    def test_claude_cli_models_price(self):
+        """S12 — MajorGenreTask's default model string must not make
+        print_report raise."""
+        assert costs.resolve("claude-cli/sonnet")[1].startswith(
+            "claude-sonnet")
+
+    def test_compare_applies_the_floor_gate(self):
+        """S6 — table mode is where non-monotonic floors reorder the
+        ranking; the flag was accepted and silently discarded there."""
+        rows = costs.compare(cached=10_000_000, prefix_tokens=2_000)
+        by_name = {r["model"]: r for r in rows}
+        assert any("BELOW" in w
+                   for w in by_name["claude-haiku-4-5"]["warnings"])
+        assert not any("BELOW" in w
+                       for w in by_name["claude-opus-5"]["warnings"]), \
+            "opus-5's floor is 512; a 2,000-token prefix caches there"
+
+    def test_price_run_shim_agrees_with_costs(self, capsys):
+        """S8 — the standalone reimplementation had already diverged
+        (no dated rows, no floor gate, table-flag reasoning). Now it IS
+        the module."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "price_run", "scripts/price_run.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod.selftest() == 0
+
+
+class TestProvidersCoupling:
+    def test_lazy_imports_exist(self):
+        """costs.py imports five names from providers lazily — a rename
+        there would otherwise break pricing at call time, in the field,
+        instead of here."""
+        from largeliterarymodels.providers import (  # noqa: F401
+            cache_minimum_tokens, _THINKING_CANNOT_DISABLE,
+            _GOOGLE_THINKING_CANNOT_DISABLE, _family_match, _strip_prefix)

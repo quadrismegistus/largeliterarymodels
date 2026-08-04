@@ -369,3 +369,32 @@ class TestPriceShell:
         rc, out = self._run(["price", "--fresh", "1000000", "--batch"],
                             capsys)
         assert "deepseek does not" in out
+
+
+class TestPriceShellReviewFindings:
+    def _run(self, argv, capsys):
+        from largeliterarymodels.cli.main import build_parser
+        args = build_parser().parse_args(argv)
+        rc = args.func(args)
+        out = capsys.readouterr()
+        return rc, out.out, out.err
+
+    def test_unknown_model_exits_cleanly(self, capsys):
+        """S9 — a typo got a traceback instead of the module's genuinely
+        good error message and a nonzero rc."""
+        rc, out, err = self._run(["price", "--fresh", "1000",
+                                  "--model", "claude-nonexistent-99"],
+                                 capsys)
+        assert rc == 1
+        assert "model_pricing.json" in err
+
+    def test_negative_times_refused(self, capsys):
+        rc, out, err = self._run(["price", "--fresh", "1000",
+                                  "--times", "-3"], capsys)
+        assert rc == 2
+
+    def test_prefix_tokens_reaches_table_mode(self, capsys):
+        """S6 — accepted-and-ignored is worse than absent."""
+        rc, out, err = self._run(["price", "--cached", "10000000",
+                                  "--prefix-tokens", "2000"], capsys)
+        assert rc == 0 and "!no-cache" in out

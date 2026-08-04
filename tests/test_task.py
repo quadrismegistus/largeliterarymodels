@@ -1498,3 +1498,93 @@ class TestUsageLogSidecar:
         t._stash = HashStash(engine="memory").clear()
         t.map(["a"], num_workers=1)
         assert not (tmp_path / "usage_logs").exists()
+
+
+class TestUsageLogReviewFindings:
+    def _task(self, tmp_path, monkeypatch):
+        import largeliterarymodels.task as task_mod
+        monkeypatch.setattr(task_mod, "STASH_PATH", str(tmp_path / "stash"))
+
+        class T(Task):
+            schema = Sentiment
+            system_prompt = "Assess."
+            retries = 0
+            usage_log = True
+        T.name = "usage_log_review"
+        t = T()
+        t._stash = HashStash(engine="memory").clear()
+        return t, tmp_path / "usage_logs" / "usage_log_review.jsonl"
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_caller_dict_reuse_does_not_double_count(self, mock_call,
+                                                     tmp_path, monkeypatch):
+        """S3 — two batches sharing one per_item_usage dict wrote batch 1's
+        tokens inside batch 2's record, falsifying the commit's stated
+        invariant on exactly the path the pinned test skipped."""
+        import json as _json
+
+        def provider(**kw):
+            kw["usage_sink"]({"input_tokens": 10, "output_tokens": 5})
+            return '{"sentiment": "positive", "confidence": 0.9}'
+        mock_call.side_effect = provider
+        task, path = self._task(tmp_path, monkeypatch)
+        shared = {}
+        task.map(["a"], num_workers=1, per_item_usage=shared)
+        task.map(["b"], num_workers=1, per_item_usage=shared, force=True)
+        records = [_json.loads(l) for l in open(path)]
+        assert records[1]["batch"]["output_tokens"] == 5, \
+            "batch 2's record must not carry batch 1's tokens"
+        # And the caller's documented accumulation semantics survive.
+        assert shared[0]["calls"] == 2
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_receipt_failure_does_not_lose_results(self, mock_call,
+                                                   tmp_path, monkeypatch,
+                                                   caplog):
+        """S4 — an opt-in receipt must never fail the run it receipts:
+        results exist, the stash holds them, an unwritable log line is a
+        diagnostic."""
+        mock_call.return_value = '{"sentiment": "positive", "confidence": 0.9}'
+        task, path = self._task(tmp_path, monkeypatch)
+        monkeypatch.setattr(type(task), "_append_usage_log",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                PermissionError("read-only fs")))
+        results = task.map(["a"], num_workers=1)
+        assert results[0] is not None
+        assert "usage_log: failed to append" in caplog.text
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_imap_writes_a_receipt_too(self, mock_call, tmp_path,
+                                       monkeypatch):
+        """S10 — imap is the resumable long-run path, where a durable
+        receipt matters most; it wrote nothing."""
+        import json as _json
+
+        def provider(**kw):
+            kw["usage_sink"]({"input_tokens": 10, "output_tokens": 5})
+            return '{"sentiment": "positive", "confidence": 0.9}'
+        mock_call.side_effect = provider
+        task, path = self._task(tmp_path, monkeypatch)
+        list(task.imap(["a", "b"]))
+        rec = _json.loads(open(path).read())
+        assert rec["batch"]["calls"] == 2
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_failed_items_are_marked_in_the_log(self, mock_call, tmp_path,
+                                                monkeypatch):
+        """S10b — spend on an item that produced no annotation must not
+        read as an annotation's price."""
+        import json as _json
+
+        def provider(**kw):
+            kw["usage_sink"]({"input_tokens": 10, "output_tokens": 5})
+            if kw["prompt"].endswith("bad"):
+                return "not json"
+            return '{"sentiment": "positive", "confidence": 0.9}'
+        mock_call.side_effect = provider
+        task, path = self._task(tmp_path, monkeypatch)
+        task.map(["good", "bad"], num_workers=1, fail_fast=False)
+        rec = _json.loads(open(path).read())
+        by_index = {r["index"]: r for r in rec["items"]}
+        assert by_index[1].get("failed") is True
+        assert "failed" not in by_index[0]

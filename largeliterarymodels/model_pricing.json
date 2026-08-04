@@ -440,8 +440,8 @@
     }
   },
   "aliases": {
-    "sonnet": "claude-sonnet-5",
-    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-7",
     "haiku": "claude-haiku-4-5",
     "anthropic/claude-sonnet-5": "claude-sonnet-5",
     "anthropic/claude-haiku-4-5": "claude-haiku-4-5",
@@ -452,7 +452,8 @@
     "gpt-4o-mini-2024-07-18": "gpt-4o-mini",
     "gemini-pro": "gemini-2.5-pro",
     "gemini-flash": "gemini-2.5-flash",
-    "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview"
+    "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+    "_note": "bare tags mirror cli/models.py MODEL_TAGS — the model `litmod run --model sonnet` actually bills. Pinned by a test against MODEL_TAGS."
   },
   "batch_discount": {
     "anthropic": 0.5,

@@ -89,7 +89,10 @@ def resolve(model, on=None):
         on = datetime.date.fromisoformat(on)
 
     name = model
-    for prefix in ("anthropic/", "openai/", "deepseek/", "google/"):
+    for prefix in ("anthropic/", "openai/", "deepseek/", "google/",
+                   "claude-cli/"):
+        # claude-cli/ included: MajorGenreTask's default model string is
+        # claude-cli/sonnet, and pricing its runs must not raise.
         if name.lower().startswith(prefix):
             name = name[len(prefix):]
             break
@@ -103,10 +106,20 @@ def resolve(model, on=None):
 
     hit = _find(name)
     if hit is None:
-        # Dated snapshot ids (claude-sonnet-5-20260101) and similar: longest
-        # table name that prefixes the requested id.
-        candidates = [(prov, n) for prov in _PROVIDERS for n in p.get(prov, {})
-                      if name.startswith(n) and not _DATED_VARIANT_RE.match(n)]
+        # Prefix fallback for SNAPSHOT-SHAPED remainders only. An
+        # unconstrained longest-prefix rule silently priced gpt-5.6 as
+        # gpt-5, a 'mini' at its parent's rate, and a flash-lite at 5x —
+        # variant suffixes are different PRODUCTS, and a wrong row without
+        # a warning is a wrong invoice with confidence. Date/latest
+        # suffixes are the same product's checkpoints and resolve.
+        candidates = []
+        for prov in _PROVIDERS:
+            for n in p.get(prov, {}):
+                if (name.startswith(n) and not _DATED_VARIANT_RE.match(n)
+                        and re.fullmatch(
+                            r"(-\d{8}|-\d{4}-\d{2}-\d{2}|-latest|-\d{3})",
+                            name[len(n):])):
+                    candidates.append((prov, n))
         if candidates:
             hit = max(candidates, key=lambda pn: len(pn[1]))
     if hit is None:
@@ -254,8 +267,17 @@ def price(model, fresh=0, cached=0, output=0, cache_write_5m=0,
     w5 = r["input"] if w5 is None else w5
     w1 = r["input"] if w1 is None else w1
 
-    if prefix_tokens is not None and (cached or cache_write_5m or cache_write_1h):
-        floor = cache_floor(model)
+    if prefix_tokens is not None and (cached or cache_write_5m or cache_write_1h) \
+            and r["cached"] is not None:
+        # The RESOLVED table name, not the caller's string: the floor lookup
+        # requires a real model id, so cache_floor("haiku") is None and the
+        # gate silently no-oped on every alias — precisely the names
+        # print_estimate/dry_run default to, a 2x under-estimate in the
+        # cheaper-than-reality direction. (Skipped entirely when the model
+        # has no cache tier: the cached:null warning already re-bills at
+        # full rate, and a second "assumes the prefix caches" advisory
+        # would contradict it.)
+        floor = cache_floor(name)
         if floor is not None and prefix_tokens < floor:
             # The assumed caching will not happen: below the floor the
             # provider declines silently and every token bills as fresh
@@ -299,8 +321,11 @@ def price(model, fresh=0, cached=0, output=0, cache_write_5m=0,
         "cache_writes_1h": cache_write_1h * w1 / M,
         "output": output * r["output"] / M,
     }
-    lines = {k: round(v * times, 6) for k, v in lines.items() if v}
-    usd_list = round(sum(lines.values()), 4)
+    usd_list = round(sum(v * times for v in lines.values()), 4)
+    # Lines carry the DISCOUNTED figures so they sum to usd: components at
+    # list price under a discounted headline printed $18.00 of lines under
+    # a $9.00 total.
+    lines = {k: round(v * times * disc, 6) for k, v in lines.items() if v}
     usd = round(usd_list * disc, 4)
 
     if r.get("reasoning") or thinking_unavoidable(model):
@@ -376,12 +401,17 @@ def print_report(model, report, batch=False, on=None):
 
 
 def compare(fresh=0, cached=0, output=0, cache_write_5m=0, batch=False,
-            on=None, providers=None, times=1):
+            on=None, providers=None, times=1, prefix_tokens=None):
     """Price one workload against every model in the table, cheapest first.
 
     Counterfactual by construction — see the module docstring. Reasoning
     floors are marked; `cached: null` models surface with the cached
-    volume priced at full input rate rather than hidden.
+    volume priced at full input rate rather than hidden. `prefix_tokens`
+    applies the cache-floor gate PER MODEL — table mode is where it
+    matters most, since floors are non-monotonic (haiku 4,096 / sonnet-5
+    1,024 / opus-5 512 / gemini-3.x 4,096): one instrument caches on some
+    rows and not others, which is exactly the difference that reorders
+    the ranking.
     """
     p = _load()
     rows = []
@@ -391,7 +421,7 @@ def compare(fresh=0, cached=0, output=0, cache_write_5m=0, batch=False,
                 continue
             est = price(name, fresh=fresh, cached=cached, output=output,
                         cache_write_5m=cache_write_5m, batch=batch, on=on,
-                        times=times)
+                        times=times, prefix_tokens=prefix_tokens)
             rows.append(est)
     rows.sort(key=lambda e: e["usd"])
     return rows
@@ -460,6 +490,11 @@ def print_estimate(input_tokens, output_tokens, n_calls=1, cached_tokens=0,
             e = estimate(model, input_tokens, output_tokens, n_calls,
                          cached_tokens)
             flag = " *floor" if any("FLOOR" in w for w in e["warnings"]) else ""
+            if any("BELOW" in w for w in e["warnings"]):
+                # The reason, not just a changed number: below the floor
+                # the cache savings read $0.00, and without this note the
+                # row looks like caching simply doesn't help.
+                flag += " !prefix under cache floor — will not cache"
             print(f"{e['model']:<28s} ${e['total']:>8.2f} "
                   f"${e['without_cache']:>9.2f} ${e['cache_savings']:>7.2f}"
                   f"{flag}")

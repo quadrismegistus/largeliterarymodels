@@ -302,10 +302,14 @@ What the numbers know that a naive rate-card lookup does not:
 
 The stash stores only response text, so token counts die with the process —
 a past run cannot be priced from the stash. `Task(usage_log=True)` appends
-one JSONL record per batch (batch totals + per-item rows incl.
-`response_model`) to `data/usage_logs/<task>.jsonl`;
+one JSONL record per `map()`/`imap()` batch (batch totals + per-item rows
+incl. `response_model`, with failed items marked so spend on a
+non-annotation never reads as an annotation's price; single `run()` calls
+are not logged) to `data/usage_logs/<task>.jsonl`;
 `costs.price_report(rec["model"], rec["batch"])` prices it later. Additive:
-no stash value or key is touched.
+no stash value or key is touched, and a receipt-write failure logs an
+error rather than failing the run it receipts. Caveat for fan-out jobs:
+appends from multiple *processes* to one file are not locked.
 
 ## Provider routing
 

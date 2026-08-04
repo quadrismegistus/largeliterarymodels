@@ -131,12 +131,24 @@ def cmd_price(args) -> int:
     """
     from largeliterarymodels import costs
 
+    if args.times < 1:
+        print(f"--times {args.times}: a workload runs a positive number of "
+              f"times; a negative price is not a refund.", file=sys.stderr)
+        return 2
+
     kw = dict(fresh=args.fresh, cached=args.cached, output=args.output,
               cache_write_5m=args.cache_write, batch=args.batch,
-              on=args.on, times=args.times)
+              on=args.on, times=args.times,
+              prefix_tokens=args.prefix_tokens)
 
     if args.model:
-        est = costs.price(args.model, prefix_tokens=args.prefix_tokens, **kw)
+        try:
+            est = costs.price(args.model, **kw)
+        except ValueError as e:
+            # The module's error names the table and its fetch date; a
+            # traceback buries that under frames nobody asked for.
+            print(str(e), file=sys.stderr)
+            return 1
         print(f"{est['provider']}/{est['model']}"
               f"{'  [batch]' if args.batch else ''}: ${est['usd']:.4f}"
               f"   (prices fetched {est['pricing_date']})")
@@ -148,6 +160,8 @@ def cmd_price(args) -> int:
 
     rows = costs.compare(providers=[args.provider] if args.provider else None,
                          **kw)
+    floored = sum(1 for est in rows
+                  if any("BELOW" in w for w in est["warnings"]))
     print(f"workload: {args.fresh:,} fresh + {args.cached:,} cached input, "
           f"{args.output:,} output"
           + (f", x{args.times}" if args.times > 1 else "")
@@ -159,10 +173,16 @@ def cmd_price(args) -> int:
     print("  " + "-" * 56)
     for est in rows:
         floor = any("FLOOR" in w for w in est["warnings"])
+        under = any("BELOW" in w for w in est["warnings"])
         print(f"  {est['provider']:<10} {est['model']:<32} "
-              f"{est['usd']:>10.2f}{' *floor' if floor else ''}")
+              f"{est['usd']:>10.2f}{' *floor' if floor else ''}"
+              f"{' !no-cache' if under else ''}")
     print("\n  *floor: the model cannot stop reasoning; a non-reasoning "
           "workload priced against it is a floor, not an estimate.")
+    if floored:
+        print(f"  !no-cache: prefix under this model's cache floor "
+              f"({floored} rows re-billed at full input rate — floors are "
+              f"non-monotonic, which is exactly what reorders this table).")
     return 0
 
 

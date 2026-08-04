@@ -1,12 +1,17 @@
 """Task class: reusable structured extraction tasks with their own cache."""
 
+import hashlib
 import json
+import logging
 import os
 from hashstash import HashStash
 from .llm import (
     LLM, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, STASH_PATH,
-    _parse_json_response, _validate_parsed, _unwrap_schema,
+    UsageTracker, _build_extract_prompt, _diagnose_partial_response,
+    _parse_json_response, _retry_prompt, _validate_parsed, _unwrap_schema,
 )
+
+log = logging.getLogger(__name__)
 
 
 class Task:
@@ -35,6 +40,16 @@ class Task:
         result = task.run("Extract entries from this page.",
                           images=["page1.png"],
                           metadata={"page": 1, "source": "mish_biblio.pdf"})
+
+    Schema note: a list-typed field carries a small reliability tax. Observed
+    across Anthropic, OpenAI and DeepSeek, a model occasionally returns the
+    bare value of a list field instead of the whole object — e.g.
+    ``["SEQUENCE", "SPECIFICITY"]`` rather than ``{"relations": [...], ...}``.
+    Rates are low (1 in ~2,000 on one measured run) and a retry recovers it,
+    since llm._diagnose_partial_response names the offending field in the
+    reprompt rather than complaining about JSON that parsed fine. Worth knowing
+    when choosing between one list field and several booleans, and worth
+    budgeting a retry for.
     """
 
     name = None  # defaults to class name if not set
@@ -44,6 +59,12 @@ class Task:
     retries = 1
     temperature = DEFAULT_TEMPERATURE
     max_tokens = DEFAULT_MAX_TOKENS
+    # Prompt-cache lifetime for the instrument: None = 5-minute default,
+    # "1h" for long or resumed runs. The 1-hour write costs 2x base input vs
+    # 1.25x, so it pays back only across three or more reads — and a "1h"
+    # request reads an already-warm 5-minute entry instead of upgrading it,
+    # so set this before a run rather than partway through.
+    cache_ttl = None
 
     # Attributes settable via __init__ kwargs even when the class doesn't
     # declare them (subclasses commonly set `model` as a class attribute,
@@ -63,6 +84,7 @@ class Task:
             setattr(self, k, v)
         self._stash = None
         self._human_stashes = {}
+        self._usage = None
 
     @property
     def task_name(self):
@@ -104,6 +126,25 @@ class Task:
             )
         return self._human_stashes[annotator]
 
+    @property
+    def usage(self):
+        """Token usage accumulated across this task's calls.
+
+        A receipt rather than an assumption: a run whose prompt cache silently
+        stopped working produces identical output at roughly ten times the
+        input price, and thinking tokens bill as output. Read after a run:
+
+            results = task.map(prompts)
+            print(task.usage.summary_line())
+            task.usage.report()['cache_hit_rate']
+
+        Counts only live provider calls — cache hits from the local stash never
+        reach a provider, so a fully-cached run reports zero.
+        """
+        if self._usage is None:
+            self._usage = UsageTracker()
+        return self._usage
+
     def _get_llm(self, model=None):
         """Get an LLM instance using this task's stash."""
         return LLM(
@@ -111,6 +152,10 @@ class Task:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stash=self.stash,
+            cache_ttl=self.cache_ttl,
+            # One tracker per Task, shared by every LLM it builds, so counts
+            # accumulate across run/map calls instead of resetting per call.
+            usage=self.usage,
         )
 
     def run(self, prompt, model=None, system_prompt=None, examples=None,
@@ -147,7 +192,8 @@ class Task:
 
     def _imap_kwargs(self, system_prompt=None, examples=None,
                      images_list=None, metadata_list=None,
-                     num_workers=4, force=False, verbose=False, **kwargs):
+                     num_workers=4, force=False, verbose=False,
+                     errors=None, per_item_usage=None, **kwargs):
         """Build kwargs for extract_imap/extract_map."""
         return dict(
             schema=self.schema,
@@ -159,17 +205,24 @@ class Task:
             retries=self.retries,
             force=force,
             verbose=verbose,
+            errors=errors,
+            per_item_usage=per_item_usage,
             **kwargs,
         )
 
     def imap(self, prompts, model=None, system_prompt=None, examples=None,
              images_list=None, metadata_list=None,
-             num_workers=4, force=False, verbose=False, **kwargs):
+             num_workers=4, force=False, verbose=False, errors=None,
+             per_item_usage=None, **kwargs):
         """Extract structured data, yielding (index, result) as each completes.
 
         Cached items yield first, then API results in completion order.
         Each result is cached the moment it completes, so partial runs
         are resumable.
+
+        Args:
+            errors: Optional dict. Failed items are recorded as
+                ``errors[index] = {...}`` — see ``map`` for the shape.
         """
         if self.schema is None:
             raise ValueError(f"Task '{self.name}' has no schema defined.")
@@ -180,15 +233,34 @@ class Task:
                                 images_list=images_list,
                                 metadata_list=metadata_list,
                                 num_workers=num_workers, force=force,
-                                verbose=verbose, **kwargs),
+                                verbose=verbose, errors=errors,
+                                per_item_usage=per_item_usage, **kwargs),
         )
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
             images_list=None, metadata_list=None,
-            num_workers=4, force=False, verbose=False, **kwargs):
+            num_workers=4, force=False, verbose=False, errors=None,
+            per_item_usage=None, **kwargs):
         """Extract structured data from multiple inputs, with parallelism.
 
         Like imap but collects all results into a list in prompt order.
+
+        Args:
+            errors: Optional dict for per-item failure diagnostics. A None in
+                the returned list is positional and otherwise opaque; pass a
+                dict here and each failed index gets an entry with keys
+                ``index``, ``error``, ``exception``, ``attempts``,
+                ``metadata``, ``prompt_head``, ``raw`` (and ``duplicate_of``
+                when the item shared a de-duplicated call):
+
+                    errors = {}
+                    results = task.map(prompts, metadata_list=metas,
+                                       errors=errors)
+                    for i, e in errors.items():
+                        print(i, e['metadata'], e['error'])
+
+                Only failures are recorded, so ``errors`` stays empty on a
+                clean run and ``len(errors)`` is the failure count.
         """
         if self.schema is None:
             raise ValueError(f"Task '{self.name}' has no schema defined.")
@@ -199,17 +271,221 @@ class Task:
                                 images_list=images_list,
                                 metadata_list=metadata_list,
                                 num_workers=num_workers, force=force,
-                                verbose=verbose, **kwargs),
+                                verbose=verbose, errors=errors,
+                                per_item_usage=per_item_usage, **kwargs),
         )
+
+    # ------------------------------------------------------------------
+    # Instrument serialisation
+    #
+    # An annotation scheme that only one code path can administer is not
+    # frozen, only committed: cross-provider replication, a subagent second
+    # coder, or a human on paper all require the instrument as text. These
+    # methods delegate to llm._build_extract_prompt — the same function the
+    # API path calls — so the rendered instrument cannot drift from the
+    # administered one. Do not re-render the parts here.
+    # ------------------------------------------------------------------
+
+    ITEM_HEADER = "=== ITEM TO ANNOTATE ==="
+    ITEM_FOOTER = "=== END ITEM ==="
+    # The one-line contract reminder appended after the item block. A class
+    # constant, not a literal in render_instrument, because instrument_sha256
+    # covers it: the digest must hash the same string the renderer emits.
+    CONTRACT_REMINDER = "Respond with ONLY the JSON described above."
+
+    def _require_schema(self):
+        if self.schema is None:
+            raise ValueError(f"Task '{self.task_name}' has no schema defined.")
+
+    def instrument_text(self, system_prompt=None, examples=None):
+        """The instrument as one string, byte-identical to what the API sees.
+
+        Returns exactly the system prompt ``Task.run``/``Task.map`` send:
+        the task's system_prompt, the output contract, the JSON Schema of the
+        Pydantic model, and the few-shot examples as labelled
+        ``Example N input:`` / ``Example N output:`` pairs.
+
+        Byte-identity is the point — a second coder (another provider, a
+        subagent, a human) administered this string received the same
+        instrument as the API model, not a transcription of it.
+        """
+        self._require_schema()
+        full_system, _ = _build_extract_prompt(
+            "",
+            self.schema,
+            system_prompt=system_prompt or self.system_prompt,
+            examples=examples if examples is not None else self.examples,
+        )
+        return full_system
+
+    def instrument_sha256(self, system_prompt=None, examples=None):
+        """SHA-256 of everything a second coder reads except the item itself.
+
+        Covers ``instrument_text`` PLUS the item-block wrapper — the
+        delimiters and the contract reminder ``render_instrument`` appends.
+        An earlier digest covered the instrument alone, so the delimiters
+        and reminder could be edited without the digest moving: the string
+        handed to a second coder was not the string the digest described.
+
+        Record this to freeze the scheme: two runs claiming to administer
+        the same instrument should carry the same digest.
+
+        Two omissions are deliberate, and a methods note needs both stated:
+        the digest embeds the Pydantic-rendered JSON schema verbatim, so a
+        pydantic upgrade can change it with no change to the scheme
+        (conservative — a false alarm, never false reassurance); and it
+        covers no administration parameters — model, temperature,
+        max_tokens are the same digest. ``administration_record()`` carries
+        those alongside it.
+        """
+        wrapper = (f"{self.ITEM_HEADER}\n\n{self.ITEM_FOOTER}\n\n"
+                   f"{self.CONTRACT_REMINDER}")
+        text = self.instrument_text(system_prompt=system_prompt,
+                                    examples=examples) + "\n\n" + wrapper
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def administration_record(self, model=None):
+        """The reproducibility receipt for one administration of this task.
+
+        The instrument digest plus the parameters the digest deliberately
+        omits — what a methods note needs so "the same instrument" and "the
+        same administration" stay distinct claims. Pin the model explicitly
+        when the run overrides the task default.
+        """
+        import pydantic
+        return {
+            "task": self.task_name,
+            "schema": _schema_repr(self.schema),
+            "instrument_sha256": self.instrument_sha256(),
+            "model": model or getattr(self, "model", None) or DEFAULT_MODEL,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "retries": self.retries,
+            # The digest embeds model_json_schema() output, which can change
+            # across pydantic versions with no change to the scheme — this
+            # is the field that explains a digest mismatch between two runs
+            # of the same instrument.
+            "pydantic_version": pydantic.VERSION,
+        }
+
+    def render_instrument(self, item=None, system_prompt=None, examples=None,
+                          digest=False):
+        """Serialise the instrument (optionally with one item) to one string.
+
+        Suitable for pasting to another provider, handing to a subagent, or
+        printing for a human coder.
+
+        With no ``item`` the return value is exactly ``instrument_text()``.
+        With an ``item`` it appends the item between ``ITEM_HEADER`` /
+        ``ITEM_FOOTER`` delimiters plus a one-line contract reminder — the
+        API path sends the item as a separate user turn, so flattening a
+        conversation into one string needs a delimiter the turn boundary
+        provided for free.
+
+        Args:
+            item: The input text to annotate (a prompt string as ``run``
+                would take it). None renders the bare instrument.
+            system_prompt: Override the task's system_prompt.
+            examples: Override the task's few-shot examples.
+            digest: Append a provenance footer (task name, schema,
+                instrument sha256). Provenance metadata, not part of the
+                instrument — off by default so the default output stays
+                byte-exact.
+
+        Returns:
+            str: The self-contained instrument.
+        """
+        if item is not None:
+            for delim in (self.ITEM_HEADER, self.ITEM_FOOTER):
+                if delim in item:
+                    raise ValueError(
+                        f"item contains the delimiter {delim!r}: the "
+                        f"flattened form cannot represent it unambiguously "
+                        f"(a second coder would see two item boundaries). "
+                        f"Pre-process the item, or administer via the API "
+                        f"path, which sends the item as its own turn."
+                    )
+        parts = [self.instrument_text(system_prompt=system_prompt,
+                                      examples=examples)]
+        if item is not None:
+            parts.append(
+                f"{self.ITEM_HEADER}\n{item}\n{self.ITEM_FOOTER}\n\n"
+                f"{self.CONTRACT_REMINDER}"
+            )
+        if digest:
+            parts.append(
+                f"[instrument provenance — not part of the instrument]\n"
+                f"task: {self.task_name}\n"
+                f"schema: {_schema_repr(self.schema)}\n"
+                f"instrument_sha256: "
+                f"{self.instrument_sha256(system_prompt=system_prompt, examples=examples)}"
+            )
+        return "\n\n".join(parts)
+
+    def parse_and_validate(self, text, strict=False, diagnosis=None):
+        """Parse a hand-administered response into a validated schema object.
+
+        Applies the same pipeline the tool-call path gets for free: markdown
+        de-fencing, brace matching, json_repair fallback, the known
+        output-envelope unwraps, then Pydantic validation.
+
+        Args:
+            text: The raw response text from whatever administered the
+                instrument (another provider, a subagent, a typed-up human
+                annotation).
+            strict: Raise instead of returning None on failure. Use when you
+                want the reason; the default swallows it into a log warning.
+            diagnosis: Optional dict, populated on failure with 'error' and
+                'partial_field' — the same diagnosis the API path computes
+                (see _diagnose_partial_response). Pass it through to
+                ``retry_prompt``, or the hand path can only ever send the
+                generic reprompt: a coder that returned a bare list would be
+                told "that was not valid JSON" about JSON that parsed fine.
+
+        Returns:
+            A validated Pydantic instance (or list thereof), or None if the
+            text could not be parsed or did not validate.
+        """
+        self._require_schema()
+        parsed = None
+        try:
+            parsed = _parse_json_response(text)
+            return _validate_parsed(parsed, self.schema)
+        except Exception as e:
+            if diagnosis is not None:
+                diagnosis["error"] = f"{type(e).__name__}: {e}"
+                diagnosis["partial_field"] = _diagnose_partial_response(
+                    parsed, self.schema)
+            if strict:
+                raise
+            log.warning(
+                "%s.parse_and_validate failed (%s): %s",
+                self.task_name, e, (text or "")[:200],
+            )
+            return None
+
+    def retry_prompt(self, item, partial_field=None):
+        """The reprompt the API path uses after an invalid response.
+
+        Administering the instrument by hand otherwise loses the retry half
+        of the retry semantics. Send this in place of the item block's item
+        when ``parse_and_validate`` returns None, passing the
+        ``partial_field`` its ``diagnosis`` reported so the targeted branch
+        — "you returned only the value of the X field" — is reachable by
+        hand exactly as it is by API.
+        """
+        return _retry_prompt(item, partial_field)
 
     @property
     def results(self):
         """Iterate over cached (key_dict, parsed_result) pairs, latest per key.
 
         The stash is append-mode: a key rewritten (e.g. via force=True) keeps
-        its full history on disk, and bare items() yields every version.
-        Request latest-only so .df never double-counts rewritten keys; fall
-        back to last-wins dedup for stash engines without the kwarg.
+        every version on disk. Under hashstash 1.0 items() already collapses
+        to latest-per-key, but ask explicitly so .df cannot double-count
+        rewritten keys if that default changes back; fall back to last-wins
+        dedup for stash engines without the kwarg. Use `results_history` to
+        see the versions this discards.
 
         Yields:
             tuple: (key_dict, validated pydantic object or list thereof)
@@ -230,6 +506,46 @@ class Task:
                 yield key, result
             except Exception:
                 continue
+
+    @property
+    def results_history(self):
+        """Iterate (key_dict, [result, ...]) — every retained version per key.
+
+        Append-mode keeps each rewrite of a key rather than overwriting, so a
+        key re-run with force=True holds one entry per run, oldest first.
+        `results` and `df` show only the latest; this exposes the rest.
+
+        The use case is measuring a model's own variance: run the same items
+        N times with force=True, then read the versions back. Without force=
+        a repeat call is a cache hit, so identical output across two ordinary
+        runs demonstrates caching, not determinism — temperature=0 is not
+        evidence of a stable annotation until it has been forced.
+
+        Keys with only one version are included (as a 1-element list), so
+        `{k: v for k, v in task.results_history if len(v) > 1}` isolates the
+        items that were actually re-run.
+
+        Yields:
+            tuple: (key_dict, list of validated pydantic objects)
+        """
+        for key in self.stash.keys():
+            try:
+                raws = self.stash.get_all(key)
+            except (AttributeError, TypeError):
+                raws = [self.stash[key]]
+            if not isinstance(raws, list):
+                raws = [raws]
+            versions = []
+            for raw in raws:
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    versions.append(
+                        _validate_parsed(_parse_json_response(raw), self.schema))
+                except Exception:
+                    continue
+            if versions:
+                yield key, versions
 
     @property
     def df(self):
@@ -305,6 +621,35 @@ class SequentialTask(Task):
     # None preserves legacy keys, so existing caches — including in-flight
     # batch runs — stay valid.
     prompt_version = None
+
+    def _no_static_instrument(self):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} is a SequentialTask: each chunk's "
+            f"prompt is built from rolling state (format_context) plus the "
+            f"chunk's passages, and the model is called via generate(), not "
+            f"the extract path. There is no single static instrument to "
+            f"render — the inherited implementation would happily serialise "
+            f"(and hash, and hand to a second coder) a schema-and-contract "
+            f"string this task never sends."
+        )
+
+    # A SequentialTask with a schema attribute would otherwise inherit
+    # instrument methods that FABRICATE: verified against a schema-carrying
+    # subclass, instrument_text() returned the bare system prompt plus a
+    # full extract-path contract block that generate() never administers,
+    # and instrument_sha256() froze it. Refuse loudly instead.
+    def instrument_text(self, system_prompt=None, examples=None):
+        self._no_static_instrument()
+
+    def instrument_sha256(self, system_prompt=None, examples=None):
+        self._no_static_instrument()
+
+    def render_instrument(self, item=None, system_prompt=None, examples=None,
+                          digest=False):
+        self._no_static_instrument()
+
+    def administration_record(self, model=None):
+        self._no_static_instrument()
 
     def build_state(self):
         """Initialize the rolling state. Override in subclasses."""

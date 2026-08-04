@@ -147,6 +147,11 @@ class ContradictionResponseTask(Task):
     retries = 2
     temperature = 0.1
     max_tokens = 1024
+    # 'deepseek-chat' is a retired alias that now resolves server-side to
+    # deepseek-v4-flash, so that is what every run of this task has actually
+    # been served. Left as-is deliberately: `model` is part of the cache key,
+    # so re-pinning to 'deepseek/deepseek-v4-flash' would orphan existing
+    # annotations and force a paid re-run. Re-pin only alongside a re-run.
     model = "deepseek/deepseek-chat"
 
 

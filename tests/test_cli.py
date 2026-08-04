@@ -145,3 +145,194 @@ class TestOutput:
     def test_header_for(self):
         assert "x" in header_for({"_id": "x", "seq": 3})
         assert header_for({}) == "{}"
+
+
+class TestRenderShell:
+    """The render shell previously had no tests, through which an inverted
+    default (provenance footer ON) and an unreachable-task gap shipped."""
+
+    def _parse(self, argv):
+        return build_parser().parse_args(argv)
+
+    def test_default_output_is_byte_exact(self, capsys):
+        """`litmod render X` piped to a second coder must be the instrument,
+        byte for byte. The provenance footer used to default ON, so the
+        natural invocation shipped a non-byte-exact instrument to exactly
+        the audience byte-exactness was built for."""
+        from largeliterarymodels.cli.main import cmd_render
+        from largeliterarymodels.tasks import GenreTaskLite
+        args = self._parse(["render", "GenreTaskLite"])
+        assert cmd_render(args) == 0
+        out = capsys.readouterr().out
+        assert out.rstrip("\n") == GenreTaskLite().instrument_text()
+
+    def test_digest_is_opt_in(self, capsys):
+        from largeliterarymodels.cli.main import cmd_render
+        args = self._parse(["render", "GenreTaskLite", "--digest"])
+        cmd_render(args)
+        assert "instrument_sha256" in capsys.readouterr().out
+
+    def test_unregistered_task_falls_back_to_the_package(self, capsys):
+        """The CLI registry maps a curated dozen tasks; the reproducibility
+        guarantee is claimed for the whole package. ContradictionResponseTask
+        is real, importable, and was unreachable from the shell."""
+        from largeliterarymodels.cli.main import cmd_render
+        args = self._parse(["render", "ContradictionResponseTask",
+                            "--item", "x"])
+        assert cmd_render(args) == 0
+        assert "ITEM TO ANNOTATE" in capsys.readouterr().out
+
+    def test_unknown_task_still_errors(self):
+        from largeliterarymodels.cli.main import cmd_render
+        args = self._parse(["render", "NoSuchTask"])
+        with pytest.raises(SystemExit):
+            cmd_render(args)
+
+    def test_fixture_without_adapter_says_why(self):
+        from largeliterarymodels.cli.main import cmd_render
+        args = self._parse(["render", "ContradictionResponseTask",
+                            "--fixture"])
+        with pytest.raises(SystemExit, match="no registered adapter"):
+            cmd_render(args)
+
+
+class TestDoctorShell:
+    """cmd_doctor's logic is pure once _probe is stubbed; it stayed untested
+    while being the designated answer to the whole provider-drift class —
+    'I ran doctor and it passed' is only worth what these pin."""
+
+    def _args(self, **kw):
+        import argparse
+        defaults = dict(provider=None, cheap_only=False, include_local=False,
+                        timeout=5)
+        defaults.update(kw)
+        return argparse.Namespace(**defaults)
+
+    def _run(self, args, probe, keys):
+        import contextlib
+        import io
+        import largeliterarymodels.cli.doctor as D
+        out = io.StringIO()
+        with patch("largeliterarymodels.providers.check_api_keys",
+                   return_value=keys):
+            with patch.object(D, "_probe", side_effect=probe):
+                with contextlib.redirect_stdout(out):
+                    rc = D.cmd_doctor(args)
+        return rc, out.getvalue()
+
+    def test_unknown_provider_exits(self):
+        import largeliterarymodels.cli.doctor as D
+        with pytest.raises(SystemExit, match="unknown provider"):
+            D.cmd_doctor(self._args(provider="anthropic,nonsense"))
+
+    def test_nothing_probed_is_not_a_clean_bill(self):
+        """Every provider skipped for want of a key exits 1. A doctor that
+        exits 0 having probed nothing goes green forever in a CI whose key
+        env var was renamed."""
+        rc, out = self._run(self._args(), lambda m, t: ("PASS", "d", 0.1), {})
+        assert rc == 1
+        assert "probed NOTHING" in out
+
+    def test_failure_sets_the_exit_code(self):
+        rc, _ = self._run(self._args(provider="openai", cheap_only=True),
+                          lambda m, t: ("FAIL", "boom", 0.1),
+                          {"OPENAI_API_KEY": "x"})
+        assert rc == 1
+
+    def test_warn_is_surfaced_but_not_a_failure(self):
+        rc, out = self._run(self._args(provider="deepseek"),
+                            lambda m, t: ("WARN", "dropped params", 0.1),
+                            {"DEEPSEEK_API_KEY": "x"})
+        assert rc == 0
+        assert "WARNED:" in out
+
+    def test_summary_goes_to_stdout(self):
+        """`litmod doctor > report.txt` used to capture an empty file —
+        everything printed to stderr, including the verdict."""
+        rc, out = self._run(self._args(provider="openai", cheap_only=True),
+                            lambda m, t: ("PASS", "d", 0.1),
+                            {"OPENAI_API_KEY": "x"})
+        assert "passed 1" in out
+
+    def test_cheap_only_probes_one_tier(self):
+        probed = []
+
+        def probe(m, t):
+            probed.append(m)
+            return "PASS", "d", 0.1
+        self._run(self._args(provider="openai", cheap_only=True), probe,
+                  {"OPENAI_API_KEY": "x"})
+        assert probed == ["openai/gpt-5.4-nano"]
+
+    def test_default_tier_covers_the_packages_own_default(self):
+        """A retired per-provider default is exactly the drift doctor exists
+        to catch, and it was the one tier the matrix never probed."""
+        probed = []
+
+        def probe(m, t):
+            probed.append(m)
+            return "PASS", "d", 0.1
+        self._run(self._args(provider="openai"), probe,
+                  {"OPENAI_API_KEY": "x"})
+        assert "gpt-5.4-mini" in probed, probed
+
+    def test_matrix_models_all_route(self):
+        """A typo'd matrix id makes doctor FAIL for a reason that is not a
+        provider bug — the worst outcome for a tool whose job is telling
+        you the provider broke."""
+        from largeliterarymodels.cli.doctor import (PROVIDER_MATRIX,
+                                                    _default_model)
+        from largeliterarymodels.providers import route_provider
+        for name, spec in PROVIDER_MATRIX.items():
+            for tier in ("cheap", "frontier"):
+                if spec.get(tier):
+                    assert route_provider(spec[tier])
+            default = _default_model(spec.get("call"))
+            if default:
+                assert route_provider(default)
+
+
+class TestRegistryIntegrity:
+    def test_every_registered_task_imports(self):
+        """The analysis registry carried an entry pointing at an untracked
+        module: 397 tests passed over a registry broken for anyone who
+        checked the branch out. Three lines make that impossible to repeat."""
+        from largeliterarymodels.analysis.registry import TASK_REGISTRY
+        import importlib
+        for key, dotted in TASK_REGISTRY.items():
+            module_path, cls_name = dotted.split(":")
+            module = importlib.import_module(module_path)
+            assert getattr(module, cls_name, None) is not None, (key, dotted)
+
+
+class TestByteIdentityAcrossTheCatalog:
+    def test_every_extract_task_renders_what_it_administers(self):
+        """The byte-identity guarantee is claimed per-package, pinned on one
+        toy task. Run it across the whole registry: any task overriding run
+        or fabricating an instrument fails loudly here."""
+        from hashstash import HashStash
+        from tests.test_task_catalog import TASK_CLASSES
+        from largeliterarymodels.task import SequentialTask
+
+        checked = 0
+        for cls in TASK_CLASSES:
+            if cls.schema is None or issubclass(cls, SequentialTask):
+                continue
+            task = cls()
+            task._stash = HashStash(engine="memory").clear()
+            captured = {}
+
+            def grab(**kw):
+                captured["system_prompt"] = kw["system_prompt"]
+                raise RuntimeError("stop before any parsing")
+
+            with patch("largeliterarymodels.llm._call_provider",
+                       side_effect=grab):
+                try:
+                    task.run("probe item", model="claude-sonnet-4-6")
+                except Exception:
+                    pass
+            assert captured["system_prompt"] == task.instrument_text(), \
+                cls.__name__
+            checked += 1
+        assert checked >= 10, f"only {checked} tasks checked — registry moved?"

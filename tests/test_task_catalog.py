@@ -65,10 +65,18 @@ def test_examples_validate_against_schema(task_cls):
 
 def test_task_names_unique_or_deliberately_shared():
     """Duplicate task names share one stash dir; only the known deliberate
-    case (PassageContentTask V1/V2) is allowed."""
-    from collections import Counter
-    names = Counter(c.name for c in TASK_CLASSES)
-    dupes = {n: k for n, k in names.items() if k > 1}
+    case (PassageContentTask V1/V2) is allowed.
+
+    Dedupe by class IDENTITY, not by occurrence: a convenience alias
+    (JudgeTask = JudgeTaskA) registers the same class under two export
+    names, which is one stash dir and no hazard — counting it as a
+    collision reported an annotation-mixing risk that did not exist.
+    """
+    by_name = {}
+    for c in TASK_CLASSES:
+        by_name.setdefault(c.name, set()).add(c)
+    dupes = {n: [k.__name__ for k in ks]
+             for n, ks in by_name.items() if len(ks) > 1}
     assert set(dupes) <= {"classify_passage_content"}, (
         f"unexpected shared task names (shared stash dirs): {dupes}"
     )

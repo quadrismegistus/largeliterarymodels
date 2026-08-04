@@ -346,13 +346,19 @@ class Task:
                 raise ValueError(
                     "batch=True does not carry images (payload size); use "
                     "the concurrent path for image tasks.")
+            if verbose or num_workers != 4:
+                log.warning(
+                    "map(batch=True): verbose/num_workers have no meaning "
+                    "on the batch transport and are ignored.")
             results = llm.extract_batch(
                 prompts, self.schema,
                 system_prompt=system_prompt or self.system_prompt,
                 examples=examples if examples is not None else self.examples,
                 metadata_list=metadata_list, force=force,
-                retries=self.retries, errors=log_errors,
-                per_item_usage=pass_items, **kwargs,
+                # A caller's retries= override must not collide with the
+                # task default (it used to TypeError).
+                retries=kwargs.pop("retries", self.retries),
+                errors=log_errors, per_item_usage=pass_items, **kwargs,
             )
         else:
             results = llm.extract_map(

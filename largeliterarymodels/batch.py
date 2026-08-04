@@ -1,112 +1,194 @@
 """Batch transport: 50% pricing on Anthropic, OpenAI and Google.
 
-The endpoints were never the hard part. This module exists to reconcile
-batch submission with what llm already guarantees:
+The endpoints were never the hard part. This module reconciles batch
+submission with what llm already guarantees:
 
   * KEY IDENTITY — a batch-computed annotation writes to the stash under
-    exactly the key the streaming path would have used (transport is not
-    part of an administration's identity), so warm reads serve batch
-    results and a half-warm stash batches only its cold half.
-  * RECEIPTS — per-item usage lands in UsageTracker/per_item_usage with
-    every field the streaming path records (reasoning evidence,
-    response_model, dropped params), tagged "transport": "batch".
-  * MONEY-SAFETY — the ledger is written BEFORE submission, and a later
-    run whose items overlap an open batch RESUMES it. The one ambiguous
-    state (a ledger row that says "submitting" with no batch id — the
-    process died inside the submission call) stops loudly for the
-    operator: silently resubmitting a possibly-live batch is the
-    money-burning failure this design exists to prevent.
+    exactly the key the streaming path would have used, INCLUDING the
+    sync-fallback path (which re-runs items with the already-built
+    instrument via extract(prebuilt=True) rather than letting the
+    contract block double-wrap) and the probe (which carries the item's
+    metadata so its key matches).
+  * RECEIPTS — per-item usage with every field the streaming path
+    records, tagged by transport ("batch" / "sync-probe" /
+    "sync-fallback"); dropped params reach the machine-readable record
+    per item; UsageTracker splits token sums by transport so
+    costs.price_report can price a mixed run honestly.
+  * MONEY-SAFETY — resolution is PER ITEM: every item's custom_id is a
+    deterministic hash of its stash key, and the ledger maps custom_ids
+    to provider batch ids. A rerun over any overlapping set — subsets,
+    supersets, after partial progress, after the probe shifted the cold
+    set — finds its open items and RESUMES their batches. (The first
+    design fingerprinted the whole cold set, which shrinks as work
+    completes, so resume only worked when nothing had progressed —
+    found by adversarial review before any money was lost to it.)
+    The ledger is written before submission under a file lock; a row
+    that says "submitting" with no batch id stops the next run loudly.
 
-DeepSeek has no batch API (verified absent from their pricing page, not
-assumed) and local endpoints have nothing to discount — both raise.
-
-Effective discount is ~48-49%, not 50%: items whose batch result fails to
-parse fall back to the sync path at list price (~1-in-2,000 measured on
-list-typed schemas), and the one probe item runs sync by design.
+DeepSeek has no batch API (verified absent, not assumed); local
+endpoints have nothing to discount — both raise.
 """
 
+import fcntl
 import hashlib
 import json
+import logging
 import os
 import time
 
-import logging
-
 from . import providers as P
-from .llm import (STASH_PATH, UsageTracker, _build_extract_prompt,
-                  _make_key, _parse_json_response, _sampling_fingerprint,
-                  _schema_name, _stash_read, _legacy_key_kwargs,
-                  _validate_parsed)
+from .llm import (STASH_PATH, _Breaker, _build_extract_prompt, _make_key,
+                  _parse_json_response, _sampling_fingerprint, _schema_name,
+                  _stash_read, _legacy_key_kwargs, _validate_parsed)
 
 log = logging.getLogger(__name__)
 
 LEDGER_DIR = os.path.join(os.path.dirname(STASH_PATH), "batch_ledger")
 
-# Per-provider submission limits (requests per batch). Google's is
-# byte-bound (20 MB inline), approximated conservatively by count and
-# checked by size at build time.
-_CHUNK_LIMITS = {"anthropic": 100_000, "openai": 50_000, "google": 5_000}
+# Per-provider submission limits: requests AND payload bytes, with a
+# safety margin. Count limits alone were 5-60x too generous for real
+# instruments (a 25 KB instrument rides in EVERY request), which would
+# have failed loudly at submit — after the ledger row was written.
+_LIMITS = {
+    "anthropic": {"count": 100_000, "bytes": 180 * 1024 * 1024},
+    "openai": {"count": 50_000, "bytes": 140 * 1024 * 1024},
+    "google": {"count": 5_000, "bytes": 14 * 1024 * 1024},
+}
+
+# A 'submitting' row younger than this may belong to a LIVE process mid-
+# submission (the lock is not held across the network call); older, the
+# process is presumed dead and the state is genuinely ambiguous.
+_SUBMITTING_FRESH_SECONDS = 600
 
 
 class AmbiguousBatchState(RuntimeError):
-    """A ledger row says 'submitting' with no batch id.
+    """A ledger row says 'submitting' with no batch id, and it is old.
 
-    The process died inside the submission call: the provider may or may
-    not hold a live, billable batch. Nothing here can know, so nothing
-    here guesses — check the provider's console/API for a batch created
-    around the row's timestamp, then either mark the row closed (add a
-    line with status 'closed' and the same fingerprint) or attach the id
-    (status 'open', batch_id filled in) and rerun to resume it.
+    The submitting process died inside the submission call: the provider
+    may or may not hold a live, billable batch. Nothing here can know, so
+    nothing here guesses — check the provider's console/API for a batch
+    created around the row's timestamp, then append a resolution line to
+    the ledger: {"event": "resolved", "sub": "<sub id>", "batch_id":
+    "<id>"} if the batch exists (the next run resumes it), or
+    {"event": "abandoned", "sub": "<sub id>"} if it does not (the next
+    run resubmits). This error is raised regardless of force=True: force
+    is cache discipline, not permission to double-bill.
     """
 
 
+class BatchInProgress(RuntimeError):
+    """Another process appears to be submitting these items right now
+    (a 'submitting' row younger than 10 minutes). Wait for it to finish
+    — its batch will cover these items — or, if it is known dead,
+    resolve the row as described in AmbiguousBatchState."""
+
+
 def _custom_id(key):
-    """Deterministic per-item id: same key, same id, on every run —
-    which is what makes resubmission detectable at all."""
     canon = json.dumps(key, sort_keys=True, default=str)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:48]
 
 
-def _fingerprint(custom_ids):
-    return hashlib.sha256(
-        "".join(sorted(custom_ids)).encode("utf-8")).hexdigest()[:32]
-
-
 # ---------------------------------------------------------------------------
-# Ledger — append-only JSONL; the latest row per fingerprint is the state.
+# Ledger v2 — small append-only rows (NO key material), per-item
+# resolution, file-locked read-decide-append, torn-line tolerant. Key
+# material lives in one sidecar file per submission, written before the
+# submitting row references it.
 # ---------------------------------------------------------------------------
 
-def _ledger_path():
-    os.makedirs(LEDGER_DIR, exist_ok=True)
-    return os.path.join(LEDGER_DIR, "ledger.jsonl")
+class _Ledger:
+    def __init__(self, root=None):
+        self.root = root or LEDGER_DIR
+        os.makedirs(self.root, exist_ok=True)
+        self.path = os.path.join(self.root, "ledger.jsonl")
+        self._lock_path = os.path.join(self.root, ".lock")
 
+    def lock(self):
+        fh = open(self._lock_path, "a+")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        return fh
 
-def _ledger_append(row):
-    row = dict(row, ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
-    with open(_ledger_path(), "a") as f:
-        f.write(json.dumps(row, default=str) + "\n")
-    return row
+    @staticmethod
+    def unlock(fh):
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
 
+    def append(self, row):
+        row = dict(row, ts=time.time())
+        with open(self.path, "a") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+        return row
 
-def _ledger_state():
-    """fingerprint -> latest row."""
-    path = _ledger_path()
-    state = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            for line in f:
+    def rows(self):
+        if not os.path.exists(self.path):
+            return
+        with open(self.path) as f:
+            for n, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
-                row = json.loads(line)
-                state[row["fingerprint"]] = row
-    return state
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    # One torn line from a killed process must not block
+                    # collection of every live batch in the ledger.
+                    log.warning("ledger: skipping unparseable line %d of %s",
+                                n, self.path)
+
+    def cid_states(self):
+        """cid -> latest {'state', 'sub', 'batch_id', 'ts', 'provider'}.
+
+        Events: submitting -> open -> closed, plus operator resolutions
+        ('resolved' == open, 'abandoned' == cleared).
+        """
+        state = {}
+        subs = {}
+        for row in self.rows():
+            ev = row.get("event")
+            sub = row.get("sub")
+            if ev == "submitting":
+                subs[sub] = row
+                for cid in row.get("cids", ()):
+                    state[cid] = {"state": "submitting", "sub": sub,
+                                  "batch_id": None, "ts": row["ts"],
+                                  "provider": row.get("provider")}
+            elif ev in ("open", "resolved"):
+                base = subs.get(sub, row)
+                for cid in base.get("cids", row.get("cids", ())):
+                    state[cid] = {"state": "open", "sub": sub,
+                                  "batch_id": row.get("batch_id"),
+                                  "ts": row["ts"],
+                                  "provider": row.get("provider",
+                                                      base.get("provider"))}
+            elif ev == "closed":
+                for cid, s in list(state.items()):
+                    if s.get("batch_id") == row.get("batch_id") or \
+                            s.get("sub") == sub:
+                        state[cid] = dict(s, state="closed")
+            elif ev == "abandoned":
+                for cid, s in list(state.items()):
+                    if s.get("sub") == sub:
+                        state[cid] = dict(s, state="abandoned")
+        return state
+
+    # Sidecar: key material + submission order, one file per submission.
+    def write_sidecar(self, sub, payload):
+        with open(os.path.join(self.root, f"{sub}.keys.json"), "w") as f:
+            json.dump(payload, f, default=str)
+
+    def read_sidecar(self, sub):
+        with open(os.path.join(self.root, f"{sub}.keys.json")) as f:
+            return json.load(f)
+
+    def sidecar_for_batch(self, batch_id):
+        for row in self.rows():
+            if row.get("batch_id") == batch_id and row.get("event") in (
+                    "open", "resolved"):
+                return row.get("sub"), row
+        return None, None
 
 
 # ---------------------------------------------------------------------------
-# Provider adapters — the only code that touches a batch endpoint. Duck-
-# typed so tests substitute fakes; each returns plain dicts, never SDK
-# objects, so collect() has one shape to reason about.
+# Provider adapters — plain-dict results; SDK objects never escape.
 # ---------------------------------------------------------------------------
 
 class _AnthropicAdapter:
@@ -120,6 +202,9 @@ class _AnthropicAdapter:
             lambda: Anthropic(api_key=api_key) if timeout is None
             else Anthropic(api_key=api_key, timeout=timeout))
 
+    def request_bytes(self, req):
+        return len(json.dumps(req[1], default=str))
+
     def submit(self, requests):
         batch = self.client.messages.batches.create(requests=[
             {"custom_id": cid, "params": params} for cid, params in requests
@@ -130,8 +215,7 @@ class _AnthropicAdapter:
         return self.client.messages.batches.retrieve(
             batch_id).processing_status == "ended"
 
-    def results(self, batch_id):
-        """Yield (custom_id, ok, text, usage_dict, error_str)."""
+    def results(self, batch_id, order=None):
         for r in self.client.messages.batches.results(batch_id):
             kind = r.result.type
             if kind == "succeeded":
@@ -145,7 +229,8 @@ class _AnthropicAdapter:
                 except ValueError as e:
                     yield r.custom_id, False, None, u, str(e)
             else:
-                yield r.custom_id, False, None, None, kind
+                detail = str(getattr(r.result, "error", "") or "")[:200]
+                yield r.custom_id, False, None, None, f"{kind}: {detail}"
 
 
 class _OpenAIAdapter:
@@ -159,13 +244,23 @@ class _OpenAIAdapter:
             lambda: OpenAI(api_key=api_key) if timeout is None
             else OpenAI(api_key=api_key, timeout=timeout))
 
+    @staticmethod
+    def _line(cid, body):
+        return json.dumps({"custom_id": cid, "method": "POST",
+                           "url": "/v1/chat/completions", "body": body})
+
+    def request_bytes(self, req):
+        return len(self._line(*req)) + 1
+
     def submit(self, requests):
-        lines = "\n".join(
-            json.dumps({"custom_id": cid, "method": "POST",
-                        "url": "/v1/chat/completions", "body": body})
-            for cid, body in requests)
-        f = self.client.files.create(file=lines.encode("utf-8"),
-                                     purpose="batch")
+        import io
+        buf = io.BytesIO()
+        for cid, body in requests:
+            buf.write(self._line(cid, body).encode("utf-8"))
+            buf.write(b"\n")
+        buf.seek(0)
+        buf.name = "batch.jsonl"
+        f = self.client.files.create(file=buf, purpose="batch")
         batch = self.client.batches.create(
             input_file_id=f.id, endpoint="/v1/chat/completions",
             completion_window="24h")
@@ -185,7 +280,7 @@ class _OpenAIAdapter:
             if line.strip():
                 yield json.loads(line)
 
-    def results(self, batch_id):
+    def results(self, batch_id, order=None):
         batch = self.client.batches.retrieve(batch_id)
         for line in self._lines(getattr(batch, "output_file_id", None)):
             body = (line.get("response") or {}).get("body") or {}
@@ -213,20 +308,21 @@ class _GoogleAdapter:
             raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
         self.client = P._cached_client(("google", api_key, timeout),
                                        lambda: genai.Client(api_key=api_key))
-        self._model = None
+
+    def request_bytes(self, req):
+        r = req[1]
+        contents = r["contents"]
+        size = len(contents) if isinstance(contents, str) else 4096
+        sysi = getattr(r["config"], "system_instruction", None) or ""
+        return size + len(sysi) + 512
 
     def submit(self, requests):
-        """Google inline requests correlate by ORDER, not custom_id, so
-        the (cid, request) list order is the contract collect() relies on."""
-        self._order = [cid for cid, _ in requests]
-        self._model = requests[0][1]["model"] if requests else None
-        inline = []
-        for _, req in requests:
-            inline.append({"contents": req["contents"],
-                           "config": req["config"]})
+        model = requests[0][1]["model"]
+        inline = [{"contents": r["contents"], "config": r["config"]}
+                  for _, r in requests]
         job = self.client.batches.create(
-            model=self._model, src=inline,
-            config={"display_name": f"litmod-{_fingerprint(self._order)}"})
+            model=model, src=inline,
+            config={"display_name": f"litmod-{int(time.time())}"})
         return job.name
 
     def is_done(self, batch_id):
@@ -234,10 +330,19 @@ class _GoogleAdapter:
         return any(t in state for t in
                    ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"))
 
-    def results(self, batch_id):
+    def results(self, batch_id, order=None):
+        """Google inline responses correlate by SUBMISSION ORDER. The
+        order comes from the caller (persisted in the submission sidecar)
+        — never re-derived: sorted(cids) is submission order with
+        probability 1/n!, and a mis-zip writes every annotation under
+        another item's key, silently."""
+        if order is None:
+            raise RuntimeError(
+                "google batch results need the persisted submission order "
+                "— collect via a handle built from the ledger sidecar.")
         job = self.client.batches.get(name=batch_id)
         responses = getattr(job.dest, "inlined_responses", None) or []
-        for cid, item in zip(self._order, responses):
+        for cid, item in zip(order, responses):
             resp = getattr(item, "response", None)
             if resp is None:
                 err = str(getattr(item, "error", "no response"))[:300]
@@ -252,8 +357,6 @@ class _GoogleAdapter:
 
 
 def _usage_from_openai_dict(body):
-    """The OpenAI batch output is plain JSON, not SDK objects; map its
-    usage dict into the same normalised shape the sync path records."""
     u = body.get("usage") or {}
     details = u.get("completion_tokens_details") or {}
     reasoning = details.get("reasoning_tokens")
@@ -265,11 +368,12 @@ def _usage_from_openai_dict(body):
         cache_read_tokens=cached or 0,
         reasoning_tokens=reasoning or 0,
         reasoning_reported=reasoning is not None,
+        reasoning_observed=bool(reasoning),
         response_model=body.get("model"),
     )
 
 
-def _adapter_for(model, timeout=None):
+def _validate_batchable(model):
     m = model.lower()
     if P._routes_to_local(m):
         raise ValueError(
@@ -282,6 +386,11 @@ def _adapter_for(model, timeout=None):
             f"their pricing page). Run without batch=True; costs.price "
             f"already refuses to invent the discount."
         )
+
+
+def _adapter_for(model, timeout=None):
+    _validate_batchable(model)
+    m = model.lower()
     if P._routes_to_anthropic(m):
         return _AnthropicAdapter(timeout)
     if P._routes_to_google(m):
@@ -291,88 +400,132 @@ def _adapter_for(model, timeout=None):
 
 def _build_request(model, prompt, full_system, temperature, max_tokens,
                    thinking, cache_ttl):
-    """One batch request via the SAME builders the sync path calls."""
+    """(request, dropped) via the SAME builders the sync path calls."""
     m = model.lower()
     if P._routes_to_anthropic(m):
-        params, dropped = P.anthropic_request_params(
+        return P.anthropic_request_params(
             prompt, model=model, system_prompt=full_system,
             temperature=temperature, max_tokens=max_tokens,
             cache_ttl=cache_ttl, thinking=thinking)
-        return params, dropped
     if P._routes_to_google(m):
         gm, contents, config, _setting = P.google_request(
             prompt, model=model, system_prompt=full_system,
             temperature=temperature, max_tokens=max_tokens,
             thinking=thinking)
         return {"model": gm, "contents": contents, "config": config}, ()
-    body = P.openai_request_body(
+    return P.openai_request_body(
         "openai", model, P.openai_messages(prompt, full_system),
         temperature=temperature, max_tokens=max_tokens)
-    return body, ()
+
+
+def _record_item(per_item_usage, idx, usage, transport):
+    entry = per_item_usage.setdefault(idx, {
+        "index": idx, "calls": 0, "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+        "reasoning_tokens": 0, "response_model": None,
+    })
+    entry["calls"] += 1
+    entry["transport"] = transport
+    for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+              "cache_write_tokens", "reasoning_tokens"):
+        entry[k] += usage.get(k, 0)
+    if usage.get("response_model"):
+        entry["response_model"] = usage["response_model"]
 
 
 class BatchHandle:
-    """A submitted batch, reconstructable after process death.
+    """One submitted batch, reconstructable in any later process.
 
-    handle = extract_batch(..., wait=False)
-    ...process dies, new process...
-    handle = BatchHandle.from_ledger(batch_id_or_fingerprint)
-    results = handle.collect(llm, schema, ...)
+    Collect only after the batch is done: collect() refuses to run (and
+    refuses to close the ledger row) on an in-flight batch — closing a
+    live batch and resubmitting its items is a double bill. The usual
+    flow after a crash:
+
+        handle = BatchHandle.from_ledger(batch_id)   # or its sub id
+        handle.wait()
+        handle.collect(llm, schema)
+        # then rerun extract_batch warm to assemble the full result list
     """
 
-    def __init__(self, provider, model, batch_id, fingerprint, cid_to_key,
-                 cid_to_index, adapter=None):
+    def __init__(self, provider, model, batch_id, sub, cid_to_key,
+                 cid_to_index, order, dropped=(), adapter=None, ledger=None):
         self.provider = provider
         self.model = model
         self.batch_id = batch_id
-        self.fingerprint = fingerprint
-        self.cid_to_key = cid_to_key       # custom_id -> key dict
-        self.cid_to_index = cid_to_index   # custom_id -> original index
+        self.sub = sub
+        self.cid_to_key = cid_to_key
+        self.cid_to_index = cid_to_index
+        self.order = order
+        self.dropped = tuple(dropped or ())
         self._adapter = adapter
+        self._ledger = ledger or _Ledger()
 
     @classmethod
-    def from_ledger(cls, batch_id_or_fingerprint, timeout=None):
-        for fp, row in _ledger_state().items():
-            if batch_id_or_fingerprint in (fp, row.get("batch_id")):
-                if row["status"] == "submitting":
-                    raise AmbiguousBatchState(AmbiguousBatchState.__doc__)
-                return cls(
-                    row["provider"], row["model"], row["batch_id"], fp,
-                    {c: json.loads(k) for c, k in row["custom_ids"].items()},
-                    row.get("indices", {}),
-                )
-        raise ValueError(
-            f"no ledger row for {batch_id_or_fingerprint!r} in "
-            f"{_ledger_path()}")
+    def from_ledger(cls, batch_id_or_sub, timeout=None, ledger=None):
+        ledger = ledger or _Ledger()
+        target = None
+        for row in ledger.rows():
+            if batch_id_or_sub in (row.get("batch_id"), row.get("sub")):
+                target = row if target is None or row["ts"] >= target["ts"] \
+                    else target
+        if target is None:
+            raise ValueError(f"no ledger row for {batch_id_or_sub!r} in "
+                             f"{ledger.path}")
+        if target.get("event") == "closed":
+            raise ValueError(
+                f"batch {batch_id_or_sub!r} is already collected (ledger "
+                f"row closed) — its results are in the stash; a warm run "
+                f"serves them.")
+        if target.get("event") == "submitting":
+            raise AmbiguousBatchState(AmbiguousBatchState.__doc__)
+        sub = target["sub"]
+        side = ledger.read_sidecar(sub)
+        return cls(target.get("provider"), side["model"],
+                   target.get("batch_id"), sub,
+                   {c: json.loads(k) for c, k in side["keys"].items()},
+                   # JSON object keys are strings; indices must come back
+                   # as the ints they were.
+                   {c: int(i) for c, i in side.get("indices", {}).items()},
+                   side.get("order"), side.get("dropped", ()),
+                   ledger=ledger)
 
     def adapter(self, timeout=None):
         if self._adapter is None:
             self._adapter = _adapter_for(self.model, timeout)
-            if isinstance(self._adapter, _GoogleAdapter):
-                # Google correlates by order; restore it from the ledger.
-                self._adapter._order = sorted(self.cid_to_key)
         return self._adapter
+
+    def is_done(self):
+        return self.adapter().is_done(self.batch_id)
 
     def wait(self, poll_interval=60, timeout=None):
         start = time.time()
-        a = self.adapter()
-        while not a.is_done(self.batch_id):
+        while not self.is_done():
             if timeout and time.time() - start > timeout:
                 raise TimeoutError(
-                    f"batch {self.batch_id} not done after {timeout}s — it "
-                    f"is still running server-side; collect later with "
+                    f"batch {self.batch_id} not done after {timeout}s — "
+                    f"still running server-side; collect later with "
                     f"BatchHandle.from_ledger({self.batch_id!r})")
             time.sleep(poll_interval)
 
     def collect(self, llm, schema, retries=1, errors=None,
-                per_item_usage=None, **sync_kwargs):
-        """Write results to the stash under the ORIGINAL keys, feed the
-        receipts, and fall back to the sync path for failures."""
+                per_item_usage=None, fallback_cap=None, **sync_kwargs):
         a = self.adapter()
+        if not a.is_done(self.batch_id):
+            raise RuntimeError(
+                f"batch {self.batch_id} is still processing — collecting "
+                f"now would record every item as missing and close the "
+                f"ledger row on a LIVE batch, whose items a rerun would "
+                f"then resubmit and double-bill. wait() first.")
+        # A systematically failed batch must not convert into an
+        # unbounded full-price sync run: the breaker counts fallback
+        # outcomes, and a trip aborts collection with the row left open.
+        breaker = _Breaker(floor=(fallback_cap or 5))
         got = set()
         n_ok, n_fallback = 0, 0
         results = {}
-        for cid, ok, text, usage, err in a.results(self.batch_id):
+        first_error = None
+        for cid, ok, text, usage, err in a.results(self.batch_id,
+                                                   order=self.order):
             key = self.cid_to_key.get(cid)
             if key is None:
                 log.warning("batch %s: result for unknown custom_id %s",
@@ -388,52 +541,87 @@ class BatchHandle:
                     llm.stash[key] = text
                     parsed_ok = True
                     n_ok += 1
+                    breaker.record_success()
                 except Exception as e:  # noqa: BLE001 — falls back below
                     err = f"{type(e).__name__}: {e}"
             if usage is not None:
                 u = dict(usage, transport="batch")
+                if self.dropped:
+                    u["dropped_params"] = self.dropped
                 llm.usage.record(u)
                 if per_item_usage is not None and idx is not None:
-                    _record_item(per_item_usage, idx, u)
-            if not parsed_ok:
-                n_fallback += 1
-                log.warning("batch %s: item %s failed (%s) — falling back "
-                            "to the sync path at list price",
-                            self.batch_id, cid, (err or "?")[:200])
-                try:
-                    results[cid] = llm.extract(
-                        # The key was built from these exact fields, so the
-                        # sync fallback recomputes the identical key and
-                        # its retry machinery (partial-field reprompts
-                        # included) takes over.
-                        prompt=key["prompt"], schema=schema,
-                        system_prompt=key["system_prompt"],
-                        temperature=key["temperature"],
-                        max_tokens=key["max_tokens"],
-                        retries=retries, **sync_kwargs)
-                except Exception as e:  # noqa: BLE001
-                    results[cid] = None
-                    if errors is not None and idx is not None:
-                        errors[idx] = {
-                            "index": idx, "error": f"{type(e).__name__}: {e}",
-                            "exception": e, "attempts": 1 + retries,
-                            "transport": "batch+sync-fallback",
-                        }
+                    _record_item(per_item_usage, idx, u, "batch")
+            if parsed_ok:
+                continue
+            first_error = first_error or err
+            if breaker.record_failure(
+                    RuntimeError(str(err or "batch item failed")[:300])):
+                raise RuntimeError(
+                    f"batch {self.batch_id}: {breaker.tripped_reason} — "
+                    f"first error: {first_error!r}. This looks systematic; "
+                    f"a sync fallback would re-bill the whole batch at "
+                    f"list price, so collection stopped. The batch's "
+                    f"results remain on the provider and the ledger row "
+                    f"stays open: fix the cause, then collect again "
+                    f"(already-parsed items are in the stash).")
+            n_fallback += 1
+            log.warning("batch %s: item %s failed (%s) — sync fallback at "
+                        "list price", self.batch_id, cid,
+                        str(err or "?")[:200])
+            fb_usage = []
+
+            def fb_sink(u, _fb=fb_usage):
+                u = dict(u, transport="sync-fallback")
+                llm.usage.record(u)
+                _fb.append(u)
+            try:
+                results[cid] = llm.extract(
+                    prompt=key["prompt"], schema=schema,
+                    system_prompt=key["system_prompt"], prebuilt=True,
+                    temperature=key["temperature"],
+                    max_tokens=key["max_tokens"],
+                    metadata=key.get("metadata"),
+                    retries=retries, usage_sink=fb_sink, **sync_kwargs)
+                if per_item_usage is not None and idx is not None:
+                    for u in fb_usage:
+                        _record_item(per_item_usage, idx, u,
+                                     "sync-fallback")
+            except Exception as e:  # noqa: BLE001
+                results[cid] = None
+                if errors is not None and idx is not None:
+                    errors[idx] = {
+                        "index": idx, "error": f"{type(e).__name__}: {e}",
+                        "exception": e, "attempts": 1 + retries,
+                        "metadata": key.get("metadata"),
+                        "prompt_head": (key.get("prompt") or "")[:200],
+                        "raw": "",
+                        "transport": "batch+sync-fallback",
+                    }
         missing = set(self.cid_to_key) - got
+        if missing and not got:
+            raise RuntimeError(
+                f"batch {self.batch_id} returned NO results for its "
+                f"{len(missing)} items — it may have failed or expired "
+                f"wholesale. Not closing the ledger row; inspect the batch "
+                f"on the provider console before rerunning.")
         for cid in missing:
             idx = self.cid_to_index.get(cid)
             results[cid] = None
             if errors is not None and idx is not None:
+                key = self.cid_to_key.get(cid) or {}
                 errors[idx] = {
                     "index": idx,
                     "error": "batch returned no result for this item",
-                    "exception": None, "attempts": 0, "transport": "batch",
+                    "exception": None, "attempts": 0,
+                    "metadata": key.get("metadata"),
+                    "prompt_head": (key.get("prompt") or "")[:200],
+                    "raw": "", "transport": "batch",
                 }
-        _ledger_append({"status": "closed", "fingerprint": self.fingerprint,
-                        "provider": self.provider, "model": self.model,
-                        "batch_id": self.batch_id, "custom_ids": {},
-                        "n_ok": n_ok, "n_fallback": n_fallback,
-                        "n_missing": len(missing)})
+        self._ledger.append({"event": "closed", "sub": self.sub,
+                             "batch_id": self.batch_id,
+                             "provider": self.provider,
+                             "n_ok": n_ok, "n_fallback": n_fallback,
+                             "n_missing": len(missing)})
         if n_fallback or missing:
             log.warning(
                 "batch %s: %d ok, %d sync fallbacks (billed at list), %d "
@@ -443,43 +631,59 @@ class BatchHandle:
         return results
 
 
-def _record_item(per_item_usage, idx, usage):
-    entry = per_item_usage.setdefault(idx, {
-        "index": idx, "calls": 0, "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_write_tokens": 0,
-        "reasoning_tokens": 0, "response_model": None,
-    })
-    entry["calls"] += 1
-    entry["transport"] = "batch"
-    for k in ("input_tokens", "output_tokens", "cache_read_tokens",
-              "cache_write_tokens", "reasoning_tokens"):
-        entry[k] += usage.get(k, 0)
-    if usage.get("response_model"):
-        entry["response_model"] = usage["response_model"]
+class CompletedHandle(BatchHandle):
+    """Returned by extract_batch(wait=False) when nothing needed
+    submitting (fully warm, or the probe consumed the only cold item):
+    a handle-shaped object so the caller's contract holds, with nothing
+    to wait for and nothing to collect — the results are in the stash."""
+
+    def __init__(self):
+        super().__init__(None, None, None, None, {}, {}, None)
+
+    def is_done(self):
+        return True
+
+    def wait(self, poll_interval=60, timeout=None):
+        return None
+
+    def collect(self, llm, schema, **kwargs):
+        return {}
+
+
+_BATCH_REJECTED_KWARGS = ("fail_fast", "num_workers", "verbose", "cache_key",
+                          "images_list", "warm_cache")
 
 
 def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
                   temperature=None, max_tokens=None, metadata_list=None,
-                  force=False, retries=1, probe=True, wait=True,
+                  images=None, force=False, retries=1, probe=True, wait=True,
                   poll_interval=60, timeout=None, errors=None,
-                  per_item_usage=None, cache_ttl=None, **kwargs):
+                  per_item_usage=None, cache_ttl=None, ledger=None,
+                  **kwargs):
     """Batch-transport analogue of LLM.extract_map. Same keys, same
-    receipts, half the price on the items that succeed.
+    receipts, half the price on the items the batch serves.
 
-    probe=True runs the FIRST cold item through the sync path before
-    anything is submitted: it catches rejected parameters where the batch
-    has no repair loop (and warms the OpenAI param memo the request
-    builder consults), warms the prompt cache, and is fail_fast's only
-    meaningful moment — after submission the spend is committed.
-
-    wait=False returns a BatchHandle instead of results (single chunk
-    only); collect later, in this process or another.
+    See the module docstring for the guarantees. wait=False returns a
+    BatchHandle (always — a fully-warm input returns a CompletedHandle),
+    single chunk only.
     """
+    for k in _BATCH_REJECTED_KWARGS:
+        if k in kwargs:
+            raise TypeError(
+                f"extract_batch() does not take {k!r}: it has no meaning "
+                f"on the batch transport (see the concurrent path).")
+    if images:
+        raise ValueError("the batch path does not carry images (payload "
+                         "size); use the concurrent path for image tasks.")
     prompts = list(prompts)
     temperature = temperature if temperature is not None else llm.temperature
     max_tokens = max_tokens if max_tokens is not None else llm.max_tokens
     model = llm.model
-    _adapter_for(model)  # raises early for deepseek/local, before any work
+    _validate_batchable(model)  # deepseek/local refuse before any work,
+    adapter = None              # but the client (and its API-key demand)
+    ledger = ledger or _Ledger()  # is built only if something must submit
+    # — a fully-warm rerun must not require credentials the read needs
+    # nothing for.
 
     full_system, _ = _build_extract_prompt(
         "", schema, system_prompt=system_prompt, examples=examples)
@@ -488,10 +692,11 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
     legacy = _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp)
 
     if P._routes_to_anthropic(model.lower()) and cache_ttl is None \
-            and system_prompt:
-        # Anthropic's own guidance for batches: entries outlive the 5-minute
-        # TTL while the batch processes; 1h writes cost 2x once and read at
-        # 0.1x thousands of times.
+            and full_system:
+        # Gated on the BUILT instrument, not the raw system_prompt arg: a
+        # schema-only task has a cacheable instrument even when the caller
+        # passed no system_prompt, and a 5-minute TTL on a batch that
+        # outlives it by hours forfeits every read.
         cache_ttl = "1h"
 
     results = [None] * len(prompts)
@@ -521,100 +726,148 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
             dup_of.setdefault(seen[cid], []).append(i)
             continue
         seen[cid] = i
-        to_compute.append((i, cid, prompt, key))
+        to_compute.append((i, cid, prompt, key, metadata))
 
     if probe and to_compute:
-        i, cid, prompt, key = to_compute[0]
+        i, cid, prompt, key, metadata = to_compute[0]
         log.info("batch probe: 1 sync call before committing %d requests",
                  len(to_compute) - 1)
+
+        def probe_sink(u):
+            u = dict(u, transport="sync-probe")
+            llm.usage.record(u)
+            if per_item_usage is not None:
+                _record_item(per_item_usage, i, u, "sync-probe")
         results[i] = llm.extract(
             prompt=prompt, schema=schema, system_prompt=system_prompt,
             examples=examples, temperature=temperature,
             max_tokens=max_tokens, retries=retries, force=force,
-            cache_ttl=cache_ttl, **kwargs)
+            cache_ttl=cache_ttl, metadata=metadata, usage_sink=probe_sink,
+            **kwargs)
         to_compute = to_compute[1:]
 
-    if not to_compute:
-        _fan_out_duplicates(results, dup_of)
-        return results
-
-    chunk_limit = _CHUNK_LIMITS[
-        "anthropic" if P._routes_to_anthropic(model.lower())
-        else "google" if P._routes_to_google(model.lower()) else "openai"]
-    if not wait and len(to_compute) > chunk_limit:
-        raise ValueError(
-            f"{len(to_compute)} items exceed one {model} batch "
-            f"({chunk_limit}); wait=False supports a single chunk — "
-            f"split the input or use wait=True.")
-
-    state = _ledger_state()
-    all_handles = []
-    for start in range(0, len(to_compute), chunk_limit):
-        chunk = to_compute[start:start + chunk_limit]
-        cids = [c[1] for c in chunk]
-        fp = _fingerprint(cids)
-        row = state.get(fp)
-        if row and not force:
-            if row["status"] == "submitting":
-                raise AmbiguousBatchState(AmbiguousBatchState.__doc__)
-            if row["status"] == "open":
+    # Per-item ledger resolution: open items resume their batches;
+    # submitting items stop (fresh -> another process; stale ->
+    # ambiguous); everything else submits fresh.
+    states = ledger.cid_states()
+    resume_by_batch = {}
+    fresh = []
+    now = time.time()
+    for item in to_compute:
+        st = states.get(item[1])
+        if st and st["state"] == "submitting":
+            # Checked BEFORE force: force is cache discipline, not
+            # permission to double-bill through the one ambiguous state.
+            if now - st["ts"] < _SUBMITTING_FRESH_SECONDS:
+                raise BatchInProgress(BatchInProgress.__doc__)
+            raise AmbiguousBatchState(AmbiguousBatchState.__doc__)
+        if st is None or st["state"] in ("closed", "abandoned") or force:
+            if force and st and st["state"] == "open":
                 log.warning(
-                    "batch: resuming OPEN batch %s (%d items) from the "
-                    "ledger instead of resubmitting — the money was "
-                    "already committed", row["batch_id"], len(chunk))
-                all_handles.append(BatchHandle(
-                    row["provider"], model, row["batch_id"], fp,
-                    {c[1]: c[3] for c in chunk},
-                    {c[1]: c[0] for c in chunk}))
-                continue
-        requests = []
-        for i, cid, prompt, key in chunk:
-            req, _dropped = _build_request(model, prompt, full_system,
-                                           temperature, max_tokens,
-                                           kwargs.get("thinking", "auto"),
-                                           cache_ttl)
-            requests.append((cid, req))
-        adapter = _adapter_for(model, timeout)
-        _ledger_append({
-            "status": "submitting", "fingerprint": fp,
-            "provider": adapter.provider, "model": model, "batch_id": None,
-            "n": len(chunk),
-            "custom_ids": {c[1]: json.dumps(c[3], sort_keys=True,
-                                            default=str) for c in chunk},
-            "indices": {c[1]: c[0] for c in chunk},
-        })
-        batch_id = adapter.submit(requests)
-        _ledger_append({
-            "status": "open", "fingerprint": fp,
-            "provider": adapter.provider, "model": model,
-            "batch_id": batch_id, "n": len(chunk),
-            "custom_ids": {c[1]: json.dumps(c[3], sort_keys=True,
-                                            default=str) for c in chunk},
-            "indices": {c[1]: c[0] for c in chunk},
-        })
-        log.info("batch: submitted %d requests to %s as %s",
-                 len(chunk), adapter.provider, batch_id)
-        all_handles.append(BatchHandle(
-            adapter.provider, model, batch_id, fp,
-            {c[1]: c[3] for c in chunk}, {c[1]: c[0] for c in chunk},
-            adapter=adapter))
+                    "batch: force=True resubmits %s… already live in "
+                    "batch %s — that batch's spend is orphaned, "
+                    "deliberately", item[1][:12], st["batch_id"])
+            fresh.append(item)
+        elif st["state"] == "open":
+            resume_by_batch.setdefault(st["batch_id"], []).append(item)
+
+    handles = []
+    for batch_id, items in resume_by_batch.items():
+        log.warning("batch: %d items are live in open batch %s — resuming "
+                    "it instead of resubmitting", len(items), batch_id)
+        handle = BatchHandle.from_ledger(batch_id, ledger=ledger)
+        # The sidecar's indices are the ORIGINAL submission's positions;
+        # THIS run's items sit at different indices (subsets, reordered
+        # manifests). Remap by cid, or a 2-item rerun of a 3-item batch
+        # indexes off the end of its own results list.
+        handle.cid_to_index = {c[1]: c[0] for c in items}
+        handles.append(handle)
+
+    if fresh:
+        adapter = _adapter_for(model)
+        # Build all requests first (build-time side effects: dropped-param
+        # reporting, strict-mode, cache-floor warnings — before money).
+        built = []
+        dropped_all = ()
+        for i, cid, prompt, key, metadata in fresh:
+            req, dropped = _build_request(model, prompt, full_system,
+                                          temperature, max_tokens,
+                                          kwargs.get("thinking", "auto"),
+                                          cache_ttl)
+            dropped_all = dropped or dropped_all
+            built.append((i, cid, prompt, key, req))
+        # Chunk by count AND bytes.
+        limits = _LIMITS[adapter.provider]
+        chunks = []
+        cur, cur_bytes = [], 0
+        for item in built:
+            b = adapter.request_bytes((item[1], item[4]))
+            if cur and (len(cur) >= limits["count"]
+                        or cur_bytes + b > limits["bytes"]):
+                chunks.append(cur)
+                cur, cur_bytes = [], 0
+            cur.append(item)
+            cur_bytes += b
+        if cur:
+            chunks.append(cur)
+        if not wait and (len(chunks) > 1 or handles):
+            raise ValueError(
+                f"wait=False supports a single new chunk and no resumed "
+                f"batches ({len(chunks)} chunks, {len(handles)} resumes "
+                f"here) — split the input or use wait=True.")
+
+        for chunk in chunks:
+            sub = f"sub-{int(time.time() * 1e6)}-{os.getpid()}"
+            cids = [c[1] for c in chunk]
+            ledger.write_sidecar(sub, {
+                "model": model,
+                "keys": {c[1]: json.dumps(c[3], sort_keys=True,
+                                          default=str) for c in chunk},
+                "indices": {c[1]: c[0] for c in chunk},
+                "order": cids,
+                "dropped": list(dropped_all),
+            })
+            # Read-decide-append under the lock: two processes over the
+            # same items must not both submit.
+            fh = ledger.lock()
+            try:
+                latest = ledger.cid_states()
+                clash = [
+                    c for c in cids
+                    if latest.get(c, {}).get("state") == "submitting"
+                    or (latest.get(c, {}).get("state") == "open"
+                        and not force)
+                ]
+                if clash:
+                    raise BatchInProgress(BatchInProgress.__doc__)
+                ledger.append({"event": "submitting", "sub": sub,
+                               "provider": adapter.provider, "model": model,
+                               "cids": cids, "pid": os.getpid()})
+            finally:
+                _Ledger.unlock(fh)
+            batch_id = adapter.submit([(c[1], c[4]) for c in chunk])
+            ledger.append({"event": "open", "sub": sub,
+                           "provider": adapter.provider,
+                           "batch_id": batch_id, "cids": cids})
+            log.info("batch: submitted %d requests to %s as %s",
+                     len(chunk), adapter.provider, batch_id)
+            handles.append(BatchHandle(
+                adapter.provider, model, batch_id, sub,
+                {c[1]: c[3] for c in chunk}, {c[1]: c[0] for c in chunk},
+                cids, dropped=dropped_all, adapter=adapter, ledger=ledger))
 
     if not wait:
-        return all_handles[0]
+        return handles[0] if handles else CompletedHandle()
 
-    for handle in all_handles:
+    for handle in handles:
         handle.wait(poll_interval=poll_interval, timeout=timeout)
         by_cid = handle.collect(llm, schema, retries=retries, errors=errors,
-                                per_item_usage=per_item_usage, **kwargs)
+                                per_item_usage=per_item_usage)
         for cid, value in by_cid.items():
             idx = handle.cid_to_index.get(cid)
             if idx is not None:
-                results[idx] = value
-    _fan_out_duplicates(results, dup_of)
-    return results
-
-
-def _fan_out_duplicates(results, dup_of):
+                results[int(idx)] = value
     for i, twins in dup_of.items():
         for j in twins:
             results[j] = results[i]
+    return results

@@ -1536,22 +1536,34 @@ class TestRequestBuilders:
                              "max_completion_tokens"})
         monkeypatch.setattr(P, "_NO_TEMPERATURE", set())
         msgs = P.openai_messages("hi", "sys")
-        body = P.openai_request_body("openai", "openai/gpt-5.4-mini", msgs,
-                                     temperature=0.0, max_tokens=64)
+        body, dropped = P.openai_request_body("openai", "openai/gpt-5.4-mini",
+                                              msgs, temperature=0.0,
+                                              max_tokens=64)
         assert body["max_completion_tokens"] == 64
         assert "max_tokens" not in body
         assert body["temperature"] == 0.0
         assert body["model"] == "gpt-5.4-mini"
         assert body["messages"][0] == {"role": "system", "content": "sys"}
+        assert dropped == ()
 
-    def test_openai_body_respects_no_temperature_memo(self, monkeypatch):
+    def test_openai_body_reports_the_temperature_drop(self, monkeypatch):
+        """The sync path re-reports the known rejection on EVERY call; the
+        batch builder must not reintroduce the silent drop 50,000 requests
+        at a time."""
         import largeliterarymodels.providers as P
         monkeypatch.setattr(P, "_TOKEN_PARAM", {})
         monkeypatch.setattr(P, "_NO_TEMPERATURE", {("openai", "m")})
-        body = P.openai_request_body("openai", "m",
-                                     P.openai_messages("hi"),
-                                     temperature=0.0)
+        monkeypatch.setattr(P, "_WARNED_NO_TEMPERATURE", set())
+        monkeypatch.delenv("LITMOD_STRICT_PARAMS", raising=False)
+        body, dropped = P.openai_request_body("openai", "m",
+                                              P.openai_messages("hi"),
+                                              temperature=0.0)
         assert "temperature" not in body
+        assert dropped == ("temperature",)
+        monkeypatch.setenv("LITMOD_STRICT_PARAMS", "1")
+        with pytest.raises(P.DroppedParameterError):
+            P.openai_request_body("openai", "m", P.openai_messages("hi"),
+                                  temperature=0.0)
 
     def test_google_request_carries_the_thinking_setting(self, monkeypatch):
         import largeliterarymodels.providers as P

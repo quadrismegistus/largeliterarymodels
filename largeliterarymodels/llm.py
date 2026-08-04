@@ -107,6 +107,8 @@ class UsageTracker:
         # mid-batch, a retry landing on a different snapshot), and a scalar
         # would report whichever came first and read as uniformity.
         self.response_models = {}
+        # transport -> token sums (see record); "sync" when untagged.
+        self.by_transport = {}
         # param name -> number of calls it was dropped from. A parameter that
         # looks applied and is not can falsify a methods claim silently, so the
         # run keeps a checkable record of the omission rather than only a log
@@ -125,6 +127,19 @@ class UsageTracker:
                 self.reasoning_reported_calls += 1
             if usage.get("reasoning_observed") or usage.get("reasoning_tokens"):
                 self.reasoning_observed_calls += 1
+            # Per-transport token split. A mixed batch run (batch items at
+            # 50%, probe + fallbacks at list) cannot be priced from summed
+            # totals — price_report(batch=True) was discounting the
+            # list-billed tokens too, a systematic under-estimate.
+            transport = usage.get("transport", "sync")
+            by_t = self.by_transport.setdefault(transport, {
+                "calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            })
+            by_t["calls"] += 1
+            for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+                      "cache_write_tokens"):
+                by_t[k] += usage.get(k, 0)
             served = usage.get("response_model")
             if served:
                 self.response_models[served] = \
@@ -162,6 +177,8 @@ class UsageTracker:
                 "reasoning_reported_calls": self.reasoning_reported_calls,
                 "reasoning_observed_calls": self.reasoning_observed_calls,
                 "response_models": dict(self.response_models),
+                "by_transport": {t: dict(v)
+                                 for t, v in self.by_transport.items()},
                 "dropped_params": dict(self.dropped_params),
             }
 
@@ -920,7 +937,8 @@ class LLM:
 
     def extract(self, prompt, schema, system_prompt=None, examples=None,
                 temperature=None, max_tokens=None, images=None, metadata=None,
-                force=False, retries=1, cache_key=None, **kwargs):
+                force=False, retries=1, cache_key=None, prebuilt=False,
+                **kwargs):
         """Extract structured data from text using a Pydantic schema.
 
         Args:
@@ -947,9 +965,18 @@ class LLM:
         temperature = temperature if temperature is not None else self.temperature
         max_tokens = max_tokens if max_tokens is not None else self.max_tokens
 
-        full_system, user_prompt = _build_extract_prompt(
-            prompt, schema, system_prompt=system_prompt, examples=examples,
-        )
+        if prebuilt:
+            # The caller holds an ALREADY-BUILT (instrument, user prompt)
+            # pair — the batch fallback path re-running an item whose key
+            # stores the full instrument as its system_prompt. Rebuilding
+            # would append a second contract block: the item would be
+            # administered under a different instrument than its batchmates
+            # and stashed under an unreachable key, re-billed forever.
+            full_system, user_prompt = system_prompt, prompt
+        else:
+            full_system, user_prompt = _build_extract_prompt(
+                prompt, schema, system_prompt=system_prompt, examples=examples,
+            )
         s_name = _schema_name(schema)
         eff_temp, thinking_fp = _sampling_fingerprint(
             self.model, temperature, kwargs)

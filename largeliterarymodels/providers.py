@@ -212,16 +212,28 @@ def openai_request_body(provider, model, messages, temperature=0.7,
     why the batch path probes one item sync first: a cold memo builds
     max_tokens for a gpt-5 model and 50,000 requests fail at once where
     the sync loop would have healed the first 400.
+
+    Returns (body, dropped): when the memo says the model rejects
+    `temperature`, the omission is REPORTED (and raises under
+    LITMOD_STRICT_PARAMS) exactly as the sync path reports it on every
+    call — the batch builder must not reintroduce, 50,000 requests at a
+    time, the silent drop that machinery exists to forbid.
     """
     memo = (provider, _strip_prefix(model))
+    send_temperature = memo not in _NO_TEMPERATURE
+    dropped = ()
+    if not send_temperature and temperature is not None:
+        _report_dropped_param(provider, _strip_prefix(model), "temperature",
+                              temperature, _WARNED_NO_TEMPERATURE)
+        dropped = ("temperature",)
     body = _openai_attempt_kwargs(
         _TOKEN_PARAM.get(memo, "max_tokens"),
-        memo not in _NO_TEMPERATURE,
+        send_temperature,
         temperature, max_tokens, extra,
     )
     body["model"] = _strip_prefix(model)
     body["messages"] = messages
-    return body
+    return body, dropped
 
 
 def _chat_completion(client, provider, model, messages, temperature, max_tokens,
@@ -242,6 +254,11 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
         the machine-readable record — a post-hoc audit that only logs leaves
         the usage record asserting the opposite of what the warning says.
     """
+    # Idempotent strip: every current caller strips first, but the memo
+    # keys MUST agree with openai_request_body's (which strips), or a
+    # future unstripped caller silently gives the two sides different
+    # memos — found latent by review, hardened here.
+    model = _strip_prefix(model)
     memo = (provider, model)
     param = _TOKEN_PARAM.get(memo, "max_tokens")
     send_temperature = memo not in _NO_TEMPERATURE

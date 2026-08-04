@@ -355,14 +355,44 @@ def price_report(model, report, batch=False, on=None):
     share, dropped params, and served models ride along as warnings, so
     the dollar figure arrives next to the receipts that qualify it.
     """
-    est = price(
-        model,
-        fresh=report.get("input_tokens", 0),
-        cached=report.get("cache_read_tokens", 0),
-        output=report.get("output_tokens", 0),
-        cache_write_5m=report.get("cache_write_tokens", 0),
-        batch=batch, on=on,
-    )
+    by_transport = report.get("by_transport") or {}
+    batch_part = by_transport.get("batch")
+    if batch and batch_part and len(by_transport) > 1:
+        # A mixed run: batch items at 50%, probe + fallbacks at list.
+        # Discounting the summed totals under-estimates systematically —
+        # price each transport at its own rate and add.
+        est = price(model, fresh=batch_part.get("input_tokens", 0),
+                    cached=batch_part.get("cache_read_tokens", 0),
+                    output=batch_part.get("output_tokens", 0),
+                    cache_write_5m=batch_part.get("cache_write_tokens", 0),
+                    batch=True, on=on)
+        sync_usd = 0.0
+        for t, part in by_transport.items():
+            if t == "batch":
+                continue
+            sync_est = price(model, fresh=part.get("input_tokens", 0),
+                             cached=part.get("cache_read_tokens", 0),
+                             output=part.get("output_tokens", 0),
+                             cache_write_5m=part.get("cache_write_tokens", 0),
+                             batch=False, on=on)
+            sync_usd += sync_est["usd"]
+        est["lines"]["sync_transports_at_list"] = round(sync_usd, 6)
+        est["usd"] = round(est["usd"] + sync_usd, 4)
+        est["usd_list"] = round(est["usd_list"] + sync_usd, 4)
+        est["warnings"].append(
+            f"mixed-transport run: {sum(p['calls'] for t, p in by_transport.items() if t != 'batch')} "
+            f"of {report.get('calls', 0)} calls (probe/fallbacks) billed at "
+            f"list — priced at their own rate, ${sync_usd:.4f}."
+        )
+    else:
+        est = price(
+            model,
+            fresh=report.get("input_tokens", 0),
+            cached=report.get("cache_read_tokens", 0),
+            output=report.get("output_tokens", 0),
+            cache_write_5m=report.get("cache_write_tokens", 0),
+            batch=batch, on=on,
+        )
     reasoning = report.get("reasoning_tokens", 0)
     if reasoning:
         share = reasoning / max(1, report.get("output_tokens", 1))

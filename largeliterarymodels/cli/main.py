@@ -3,6 +3,8 @@
 Subcommands:
     litmod ls
     litmod show     <TaskName>
+    litmod doctor   [--provider anthropic,openai,...] [--cheap-only]
+    litmod render   <TaskName> [--item TEXT | --item-file F | --fixture]
     litmod smoke    <TaskName> --model M[,M2,...]
     litmod run      <TaskName> --input CSV --model M [--output CSV]
     litmod annotate <TaskName> [--annotator name] [--port N]
@@ -54,6 +56,68 @@ def cmd_show(args) -> int:
         preview = {k: (v if k != 'text' else f"<{len(v)} chars>")
                    for k, v in r.items()}
         print(f"  {preview}")
+    return 0
+
+
+def _cmd_doctor(args) -> int:
+    # Imported lazily: pulls in provider SDKs, which `litmod ls` shouldn't pay for.
+    from .doctor import cmd_doctor
+    return cmd_doctor(args)
+
+
+def cmd_render(args) -> int:
+    """Print the task's instrument as one self-contained string.
+
+    For administering the identical scheme outside the API path: another
+    provider, a subagent, or a human coder on paper. The DEFAULT output is
+    byte-identical to the API system prompt — an earlier version defaulted
+    the provenance footer ON, so the natural invocation shipped a
+    non-byte-exact instrument to exactly the audience byte-exactness was
+    built for.
+    """
+    try:
+        task_cls, adapter = resolve(args.task)
+    except SystemExit:
+        # The CLI registry maps a curated dozen tasks to adapters, which is
+        # narrower than the task package itself — and the tasks most in need
+        # of rendering are often the newest, unregistered ones. Fall back to
+        # the package: the instrument needs no adapter, only --fixture does.
+        import largeliterarymodels.tasks as tasks_pkg
+        from largeliterarymodels.task import Task
+        task_cls = getattr(tasks_pkg, args.task, None)
+        if not (isinstance(task_cls, type) and issubclass(task_cls, Task)):
+            raise
+        adapter = None
+
+    task = task_cls()
+
+    item = None
+    if args.item:
+        item = args.item
+    elif args.item_file:
+        with open(args.item_file) as f:
+            item = f.read()
+    elif args.fixture:
+        if adapter is None:
+            raise SystemExit(
+                f"{args.task} has no registered adapter, so --fixture has "
+                f"nothing to draw from; pass --item or --item-file."
+            )
+        try:
+            records = adapter.fixtures()
+        except (SystemExit, Exception) as e:  # noqa: BLE001
+            raise SystemExit(f"could not load fixtures: {e}")
+        if not records:
+            raise SystemExit("adapter returned no fixtures")
+        item, _meta = adapter.build_prompt(records[0])
+
+    text = task.render_instrument(item=item, digest=args.digest)
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(text + "\n")
+        print(f"wrote {len(text)} chars to {args.output}", file=sys.stderr)
+    else:
+        print(text)
     return 0
 
 
@@ -334,6 +398,37 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser('show', help='show task schema + fixtures')
     sp.add_argument('task')
     sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser(
+        'doctor',
+        help='probe each provider on a cheap and a current frontier model')
+    sp.add_argument('--provider', default=None,
+                    help='comma-separated subset (anthropic,openai,google,'
+                         'deepseek,local)')
+    sp.add_argument('--cheap-only', action='store_true',
+                    help='skip the frontier-tier probes')
+    sp.add_argument('--include-local', action='store_true',
+                    help='also probe the local endpoint (must be running)')
+    sp.add_argument('--timeout', type=float, default=120.0)
+    sp.set_defaults(func=_cmd_doctor)
+
+    sp = sub.add_parser(
+        'render',
+        help='print the task instrument as one self-contained string')
+    sp.add_argument('task')
+    sp.add_argument('--item', default=None,
+                    help='item text to append as the item to annotate')
+    sp.add_argument('--item-file', default=None,
+                    help='read the item to annotate from this file')
+    sp.add_argument('--fixture', action='store_true',
+                    help="use the adapter's first fixture as the item")
+    sp.add_argument('--digest', action='store_true',
+                    help='append the provenance footer (instrument sha256). '
+                         'Off by default: the default output is byte-'
+                         'identical to the API system prompt, so it can be '
+                         'piped to a second coder as-is')
+    sp.add_argument('--output', '-o', default=None, help='write to file')
+    sp.set_defaults(func=cmd_render)
 
     sp = sub.add_parser('smoke', help='run task on fixtures')
     sp.add_argument('task')

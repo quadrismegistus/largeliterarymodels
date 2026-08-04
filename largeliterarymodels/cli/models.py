@@ -24,15 +24,28 @@ MODEL_TAGS: dict[str, str] = {
     # three tags behave the same — pin a dated ID explicitly if you need
     # byte-exact reproducibility)
     'sonnet':        'claude-sonnet-4-6',
+    'sonnet-5':      'claude-sonnet-5',
     'opus':          'claude-opus-4-7',
     'haiku':         'claude-haiku-4-5',
+
+    # OpenAI (gpt-5 tier; these need max_completion_tokens, which
+    # providers._chat_completion negotiates from the API's own error)
+    'gpt5':          'openai/gpt-5.4',
+    'gpt5-mini':     'openai/gpt-5.4-mini',
+    'gpt5-nano':     'openai/gpt-5.4-nano',
 
     # Google Gemini
     'gemini-flash':  'gemini-2.5-flash',
     'gemini-pro':    'gemini-2.5-pro',
 
     # DeepSeek (hosted API; requires DEEPSEEK_API_KEY)
-    'deepseek-chat': 'deepseek/deepseek-chat',
+    'deepseek-pro':   'deepseek/deepseek-v4-pro',
+    'deepseek-flash': 'deepseek/deepseek-v4-flash',
+    # Retired name, still served as a server-side alias for v4-flash. Left
+    # pointing at the alias on purpose: re-pointing it would silently change
+    # the model string in existing cache keys and force a re-run. Prefer the
+    # explicit tags above; call_deepseek warns once when the alias is used.
+    'deepseek-chat':  'deepseek/deepseek-chat',
 }
 
 

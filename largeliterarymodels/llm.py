@@ -1336,12 +1336,19 @@ class LLM:
         elif isinstance(fail_fast, dict):
             breaker = _Breaker(**fail_fast)
         elif isinstance(fail_fast, int):
-            # An int is a loosening/tightening of WHEN aborting is allowed,
-            # so it must gate both conditions: floor alone would let the
-            # 20%-rate condition fire at 30 outcomes and silently override a
-            # caller's fail_fast=50.
-            breaker = _Breaker(floor=fail_fast,
-                               min_outcomes=max(30, fail_fast))
+            if fail_fast == 0:
+                # 0 reads as "off" under the falsy convention (False and
+                # None both disable); as a floor it would mean abort on the
+                # FIRST failed item — near-tightest, from the spelling of
+                # loosest. Honour the convention.
+                breaker = _Breaker(enabled=False)
+            else:
+                # An int is a loosening/tightening of WHEN aborting is
+                # allowed, so it must gate both conditions: floor alone
+                # would let the 20%-rate condition fire at 30 outcomes and
+                # silently override a caller's fail_fast=50.
+                breaker = _Breaker(floor=fail_fast,
+                                   min_outcomes=max(30, fail_fast))
         else:
             raise TypeError(
                 f"fail_fast={fail_fast!r}: pass a dict of _Breaker settings, "
@@ -1502,25 +1509,35 @@ class LLM:
         # not readable until its write lands, so without this the first
         # num_workers calls each pay the ~1.25x write premium on the shared
         # system block rather than one write plus cheap reads.
-        if (warm_cache and num_workers > 1 and len(to_compute) > num_workers
-                and len(full_system) > 2000):
-            first, to_compute = to_compute[0], to_compute[1:]
-            i, result = _do_one(first)
-            yield from _fan_out(i, result)
-            if breaker.tripped:
-                raise BatchAborted(breaker.error(self.model), errors=errors)
-
-        executor = ThreadPoolExecutor(max_workers=num_workers)
         try:
-            futures = {executor.submit(_do_one, item): item for item in to_compute}
-            for future in tqdm(as_completed(futures), total=len(to_compute),
-                               desc=f"Extracting {s_name} ({self.model})"):
-                i, result = future.result()
+            if (warm_cache and num_workers > 1
+                    and len(to_compute) > num_workers
+                    and len(full_system) > 2000):
+                first, to_compute = to_compute[0], to_compute[1:]
+                i, result = _do_one(first)
                 yield from _fan_out(i, result)
                 if breaker.tripped:
-                    raise BatchAborted(breaker.error(self.model), errors=errors)
+                    raise BatchAborted(breaker.error(self.model),
+                                       errors=errors)
+
+            executor = ThreadPoolExecutor(max_workers=num_workers)
+            try:
+                futures = {executor.submit(_do_one, item): item
+                           for item in to_compute}
+                for future in tqdm(as_completed(futures),
+                                   total=len(to_compute),
+                                   desc=f"Extracting {s_name} ({self.model})"):
+                    i, result = future.result()
+                    yield from _fan_out(i, result)
+                    if breaker.tripped:
+                        raise BatchAborted(breaker.error(self.model),
+                                           errors=errors)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # The summary covers the warm-cache pre-flight too: an abort
+            # raised there previously skipped this block entirely, losing
+            # the batch receipt for exactly the runs that need it most.
             if total >= 10:
                 # THIS batch's numbers, not the Task-lifetime aggregate.
                 log.info("extract_imap %s", batch_usage.summary_line())

@@ -335,8 +335,11 @@ def _report_dropped_param(provider, model, param, value, warned,
             message + " Raised because LITMOD_STRICT_PARAMS is set; pass a "
             f"model that accepts `{param}`, or stop setting it."
         )
-    if model not in warned:
-        warned.add(model)
+    # Keyed by (model, param): keyed on model alone, whichever parameter was
+    # reported first permanently suppressed the warning for every other —
+    # on claude-cli the temperature warning silenced the max_tokens one.
+    if (model, param) not in warned:
+        warned.add((model, param))
         log.warning("%s", message)
 
 
@@ -725,17 +728,19 @@ _THINKING_CANNOT_DISABLE = ("fable", "mythos")
 _WARNED_THINKING = set()
 
 
-def thinking_default(model):
+def thinking_default(model, _warn=True):
     """The `thinking` value to send when a caller expresses no preference.
 
     Returns {"type": "disabled"} for models that would otherwise think, None
     to omit the parameter (older families, where omitting already means off).
+    _warn=False suppresses the cannot-disable cost warning — cache-key
+    fingerprinting calls this for items that may never reach the API.
     """
     m = model.lower()
     if not any(_family_match(m, tag) for tag in _THINKING_ON_BY_DEFAULT):
         return None
     if any(_family_match(m, tag) for tag in _THINKING_CANNOT_DISABLE):
-        if model not in _WARNED_THINKING:
+        if _warn and model not in _WARNED_THINKING:
             _WARNED_THINKING.add(model)
             log.warning(
                 "anthropic: %r has thinking permanently on (an explicit "
@@ -803,6 +808,37 @@ def deepseek_thinking_default(model):
     and let the response-side audit catch a model that ignores it.
     """
     return dict(_THINKING_DISABLED_OPENAI)
+
+
+def _normalize_thinking_anthropic(thinking):
+    """Canonicalise a caller's thinking argument for the Anthropic API.
+
+    The cross-provider "off" spellings must mean off here too — an earlier
+    version forwarded thinking=False verbatim onto the wire (a 400) while
+    the same spelling disabled thinking on DeepSeek and Google. "enabled"
+    without a budget raises rather than inventing one: Anthropic's enable
+    requires budget_tokens, and a silently chosen default budget would be a
+    sampling-policy decision smuggled in as a spelling convenience.
+    """
+    if thinking is None:
+        return None
+    if thinking is False or (isinstance(thinking, str)
+                             and thinking.lower() == "disabled"):
+        return {"type": "disabled"}
+    if thinking is True or (isinstance(thinking, str)
+                            and thinking.lower() == "enabled"):
+        raise ValueError(
+            "anthropic thinking must be an explicit dict with budget_tokens "
+            "(e.g. {'type': 'enabled', 'budget_tokens': 4096}) — there is no "
+            "defensible default budget to invent."
+        )
+    if isinstance(thinking, dict) and "type" in thinking:
+        return dict(thinking)
+    raise ValueError(
+        f"thinking={thinking!r} is not a recognised value for an Anthropic "
+        f"model. Use 'auto', None, False/'disabled', or a dict with a "
+        f"'type' key."
+    )
 
 
 def _normalize_thinking(thinking):
@@ -906,19 +942,20 @@ _GOOGLE_THINKING_CANNOT_DISABLE = ("gemini-2.5-pro", "gemini-3.1-pro")
 _WARNED_GOOGLE_THINKING = set()
 
 
-def google_thinking_budget(model, thinking="auto"):
+def google_thinking_budget(model, thinking="auto", _warn=True):
     """The thinking_budget to send for a Gemini call, or None to send nothing.
 
     "auto" resolves to 0 (thinking off) except on families that reject a
     zero budget, where nothing is sent and a once-per-model warning states
     the cost — the Fable arrangement. Callers may pass an int budget, the
     cross-provider dict/bool spellings, or None to take the API default.
+    _warn=False suppresses the cost warning for key-fingerprinting calls.
     """
     if thinking == "auto":
         m = _strip_prefix(model).lower()
         if any(_family_match(m, tag)
                for tag in _GOOGLE_THINKING_CANNOT_DISABLE):
-            if model not in _WARNED_GOOGLE_THINKING:
+            if _warn and model not in _WARNED_GOOGLE_THINKING:
                 _WARNED_GOOGLE_THINKING.add(model)
                 log.warning(
                     "google: %r only works in thinking mode (a zero "
@@ -961,20 +998,27 @@ def thinking_fingerprint(model, thinking="auto"):
     """
     m = model.lower()
     if _routes_to_google(m):
-        budget = google_thinking_budget(model, thinking)
+        budget = google_thinking_budget(model, thinking, _warn=False)
         if budget is None:
             return None
         return "disabled" if budget == 0 else f"budget:{budget}"
     resolved = None
     if _routes_to_anthropic(m):
-        resolved = thinking_default(model) if thinking == "auto" else thinking
+        resolved = (thinking_default(model, _warn=False) if thinking == "auto"
+                    else _normalize_thinking_anthropic(thinking))
     elif _routes_to_deepseek(m):
         resolved = (deepseek_thinking_default(model) if thinking == "auto"
                     else _normalize_thinking(thinking))
     if resolved is None:
         return None
     if isinstance(resolved, dict):
-        return resolved.get("type", str(sorted(resolved.items())))
+        kind = resolved.get("type", str(sorted(resolved.items())))
+        # budget_tokens is part of the output's identity: a 1,024-token and
+        # a 64,000-token deliberation are different administrations, and
+        # collapsing them to "enabled" served one as a cache hit for the
+        # other with nothing recording the mismatch.
+        budget = resolved.get("budget_tokens")
+        return f"{kind}:budget:{budget}" if budget is not None else kind
     return str(resolved)
 
 
@@ -1116,7 +1160,8 @@ def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
         }]
         _warn_if_below_cache_floor(model, system_prompt)
 
-    thinking_param = thinking_default(model) if thinking == "auto" else thinking
+    thinking_param = (thinking_default(model) if thinking == "auto"
+                      else _normalize_thinking_anthropic(thinking))
     if thinking_param is not None:
         api_kwargs["thinking"] = thinking_param
 

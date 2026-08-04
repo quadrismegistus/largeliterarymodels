@@ -1307,3 +1307,77 @@ class TestGoogleThinkingDefault:
         monkeypatch.setattr(P, "_LOGGED_RESOLUTIONS", set())
         P.call_google("hi", model="gemini-2.5-flash")
         assert seen["config"].thinking_config.thinking_budget == 0
+
+
+class TestClosingReviewFixes:
+    """Defects found by the closing (post-fix-campaign) review."""
+
+    def test_anthropic_thinking_budget_is_part_of_the_key(self):
+        """{'type': 'enabled', 'budget_tokens': 1024} and 64000 are
+        different administrations; collapsing both to 'enabled' served the
+        low-budget output as a cache hit for the high-budget rerun."""
+        from largeliterarymodels.providers import thinking_fingerprint
+        low = thinking_fingerprint("claude-sonnet-5",
+                                   {"type": "enabled", "budget_tokens": 1024})
+        high = thinking_fingerprint("claude-sonnet-5",
+                                    {"type": "enabled", "budget_tokens": 64000})
+        assert low != high
+        assert thinking_fingerprint("claude-sonnet-5") == "disabled"
+
+    def test_anthropic_normalizes_cross_provider_off_spellings(self, monkeypatch):
+        """thinking=False means off on DeepSeek and Google; on Anthropic it
+        used to go on the wire verbatim (a 400) with the fingerprint
+        recording the string 'False'."""
+        import largeliterarymodels.providers as P
+        seen = []
+        usage = type("U", (), {"input_tokens": 1, "output_tokens": 1,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0})()
+        text = type("B", (), {"type": "text", "text": "{}"})()
+        resp = type("R", (), {"model": "m", "content": [text],
+                              "usage": usage, "stop_reason": "end_turn"})()
+        create = staticmethod(lambda **kw: (seen.append(kw), resp)[1])
+        client = type("C", (), {"messages": type("M", (), {"create": create})()})()
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+        monkeypatch.setattr(P, "_cached_client", lambda key, factory: client)
+        monkeypatch.setattr(P, "_LOGGED_RESOLUTIONS", set())
+        P.call_anthropic("hi", model="claude-sonnet-5", temperature=None,
+                         thinking=False)
+        assert seen[0]["thinking"] == {"type": "disabled"}
+        assert P.thinking_fingerprint("claude-sonnet-5", False) == "disabled"
+
+    def test_anthropic_enabled_without_budget_raises(self):
+        """No defensible default budget to invent — raise, loudly."""
+        from largeliterarymodels.providers import _normalize_thinking_anthropic
+        with pytest.raises(ValueError, match="budget_tokens"):
+            _normalize_thinking_anthropic("enabled")
+        with pytest.raises(ValueError, match="budget_tokens"):
+            _normalize_thinking_anthropic(True)
+
+    def test_dropped_param_warnings_keyed_by_param(self, monkeypatch, caplog):
+        """On claude-cli the temperature warning used to permanently
+        suppress the max_tokens warning — the dedup set keyed on model
+        alone, and whichever param reported first claimed the slot."""
+        import largeliterarymodels.providers as P
+        monkeypatch.delenv("LITMOD_STRICT_PARAMS", raising=False)
+        warned = set()
+        with caplog.at_level("WARNING"):
+            P._report_dropped_param("claude-cli", "m", "temperature", 0.0,
+                                    warned)
+            P._report_dropped_param("claude-cli", "m", "max_tokens", 4096,
+                                    warned)
+        assert "`temperature`" in caplog.text
+        assert "`max_tokens`" in caplog.text
+
+    def test_fingerprinting_does_not_fire_cost_warnings(self, monkeypatch,
+                                                        caplog):
+        """Key computation may run for fully-cached items that never reach
+        the API; a cost warning there charges the user for spend that is
+        not happening."""
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(P, "_WARNED_THINKING", set())
+        monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
+        with caplog.at_level("WARNING"):
+            P.thinking_fingerprint("claude-fable-5")
+            P.thinking_fingerprint("gemini-2.5-pro")
+        assert caplog.text == ""

@@ -1363,3 +1363,41 @@ class TestLegacyKeyReads:
                                      None) is None
         assert effective_temperature("deepseek/deepseek-v4-pro", 0.7,
                                      "auto") == 0.7
+
+
+class TestClosingReviewFixesLLM:
+    def _task(self, name, system_prompt="Assess.", retries=0):
+        class T(Task):
+            schema = Sentiment
+        T.name = name
+        T.system_prompt = system_prompt
+        T.retries = retries
+        task = T()
+        task._stash = HashStash(engine="memory").clear()
+        return task
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_fail_fast_zero_means_off(self, mock_call):
+        """0 is the falsy spelling of 'off' (False and None both disable);
+        as a floor it meant abort on the first failed item."""
+        mock_call.side_effect = ValueError("boom")
+        task = self._task("ff_zero")
+        results = task.map([f"i{n}" for n in range(6)], num_workers=1,
+                           fail_fast=0)
+        assert results == [None] * 6
+        assert mock_call.call_count == 6
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_warm_path_abort_still_logs_the_batch_summary(self, mock_call,
+                                                          caplog):
+        """An abort raised in the warm-cache pre-flight used to skip the
+        finally that logs the batch receipt — lost for exactly the runs
+        that need it most."""
+        import logging
+        mock_call.side_effect = ValueError("boom")
+        task = self._task("warm_abort_summary", system_prompt="z" * 3000)
+        with caplog.at_level(logging.INFO, logger="largeliterarymodels.llm"):
+            with pytest.raises(RuntimeError):
+                task.map([f"i{n}" for n in range(12)], num_workers=4,
+                         fail_fast=1)
+        assert "extract_imap usage:" in caplog.text

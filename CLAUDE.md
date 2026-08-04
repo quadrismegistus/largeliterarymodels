@@ -97,7 +97,7 @@ constants and a live API. Three landed at once in 2026-07:
 |---|---|---|
 | deepseek | `deepseek-chat` silently served the cheap tier — annotations published off it | legacy aliases warn once naming what they resolve to |
 | openai | `max_tokens` 400s across the whole gpt-5 tier | `_chat_completion` reads the replacement param out of the error and memoizes it |
-| anthropic | `content[0].text` raises on any thinking model (Sonnet 5, Opus 5, Fable 5) | `_first_text` walks for the first text block |
+| anthropic | `content[0].text` raises on any thinking model (Sonnet 5, Opus 5, Fable 5) | `_response_text` concatenates every text block (interleaved thinking splits the answer across several) |
 | deepseek | v4 reasons by default on *both* tiers; thinking mode accepts `temperature` and ignores it silently, so runs read as temperature-pinned when they were not | `call_deepseek` sends `extra_body={"thinking": {"type": "disabled"}}` by default (for **every** deepseek id — deciding from the name is this same bug class), records the drop in `dropped_params` when thinking is on, and a response-side audit catches a disable that didn't take |
 
 A useful generalisation from the fourth: our source comment had asserted that

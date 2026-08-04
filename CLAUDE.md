@@ -162,19 +162,32 @@ Measured 2026-07-30, `claude-sonnet-5`, PassageFormTask instrument (6,863 tokens
   doctor's first WARN sweep, 2026-08-04: 363 thought tokens against 14
   answer tokens on the two-field probe) and its `thoughts_token_count` is
   *not* included in `candidates_token_count` — usage sums them so
-  output_tokens means billed-output everywhere. `google_thinking_budget`
-  now sends `thinking_budget=0` by default; measured on the same probe,
-  flash drops from 377 billed output tokens to 14. gemini-2.5-pro and
-  gemini-3.1-pro "only work in thinking mode" (probed: budget 0 is a 400),
-  so they get the Fable arrangement — nothing sent, warned once, doctor
-  WARNs — and a future model joining that family fails loudly with a
-  pointer to `_GOOGLE_THINKING_CANNOT_DISABLE` rather than being healed
-  into a thinking-on call whose output would land under a thinking-off
-  cache key. Old flash extract keys orphan (thinking-on output);
-  pro/3.1-pro keys are byte-stable (behaviour unchanged). OpenAI's gpt-5.4
-  tier is reasoning-capable but measured ZERO reasoning tokens on all
-  three doctor probes — nothing to cut, so nothing was changed on no
-  evidence.
+  output_tokens means billed-output everywhere. `google_thinking_setting`
+  now sends the off-equivalent by default — and **the two Gemini
+  generations take DIFFERENT parameters**: 2.5 wants `thinking_budget=0`;
+  3.x wants `thinking_level` ("minimal"/"low"/"medium"/"high"), where the
+  budget survives only as a deprecated back-compat field whose ZERO is a
+  generic 400 (probed live on 3.6-flash — the error prose drifted too, so
+  the loud-failure wrap matches on what WE sent, not on Google's message).
+  Per Google's docs 3.x cannot fully disable thinking; "minimal" is the
+  documented off-equivalent, measured at zero reported thoughts where the
+  API default thought 370. Also measured: `thinking_budget` is a TARGET,
+  not a cap — budget 128 produced 190 thought tokens on a real
+  instrument. Field cost of the gap this closes: a 14,520-call
+  gemini-3.6-flash run billed ~966 output tokens/call (~96% thoughts,
+  £147); the same call now runs at ~15. gemini-2.5-pro and gemini-3.1-pro
+  cannot express "off" at all (3.1-pro rejects even level "minimal"; its
+  floor is "low", ~4x cheaper than its "high" default, available as an
+  explicit opt-in) — they keep the Fable arrangement: nothing sent,
+  warned once, doctor WARNs, keys byte-stable. 3.x default keys say
+  `level:minimal`, never "disabled" — no key claims an off state the
+  model cannot deliver. OpenAI's gpt-5.4 tier is reasoning-capable but
+  measured ZERO reasoning tokens on all three doctor probes — nothing to
+  cut, so nothing was changed on no evidence. Gemini's implicit prompt
+  caching has a silent floor of its own (4,096 tokens on 3.x): a
+  3,906-token instrument ran 14,520 times at full input price ~130
+  tokens under it, so `cache_warning` now covers Gemini's zero-reads
+  shape alongside Anthropic's.
 - **The cache key carries the thinking state and the *effective*
   temperature.** Thinking-on and thinking-off output must never share a key
   (a non-forced rerun would hand back one as the other, silently), and a key

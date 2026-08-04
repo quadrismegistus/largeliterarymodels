@@ -1225,44 +1225,91 @@ class TestDroppedHintDedupe:
 class TestGoogleThinkingDefault:
     """Gemini reasons by default (measured: 363 thought tokens on a
     two-field probe) and thoughts bill as output. Off by default where the
-    API permits; families that 400 on a zero budget get the Fable
-    arrangement — nothing sent, warned once — because healing the rejection
-    into a thinking-on call would store its output under a thinking-off
+    API permits — and the two generations take DIFFERENT parameters
+    (probed live: budget-0 on 3.6-flash is a generic INVALID_ARGUMENT;
+    3.x wants thinking_level, whose "minimal" measured zero thoughts where
+    the default thought 370). Cannot-disable families get the Fable
+    arrangement — nothing sent, warned once — because healing a rejection
+    into a thinking-on call would store its output under an off-claiming
     cache key."""
 
-    def test_flash_gets_budget_zero(self):
-        from largeliterarymodels.providers import google_thinking_budget
-        assert google_thinking_budget("gemini-2.5-flash") == 0
+    def test_flash_25_gets_budget_zero(self):
+        from largeliterarymodels.providers import google_thinking_setting
+        assert google_thinking_setting("gemini-2.5-flash") == \
+            ("thinking_budget", 0)
+
+    def test_flash_3x_gets_level_minimal(self):
+        """The £147 finding: gemini-3.6-flash thought on every one of
+        14,520 calls because nothing was sent. Its off-equivalent is
+        thinking_level='minimal', not budget-0 (a 400)."""
+        from largeliterarymodels.providers import google_thinking_setting
+        assert google_thinking_setting("gemini-3.6-flash") == \
+            ("thinking_level", "minimal")
+        assert google_thinking_setting("gemini-3.5-flash-lite") == \
+            ("thinking_level", "minimal")
+
+    def test_gemini_30_is_not_gemini_3x(self):
+        from largeliterarymodels.providers import _is_gemini_3x
+        assert _is_gemini_3x("gemini-3.6-flash")
+        assert not _is_gemini_3x("gemini-30-flash")
+        assert not _is_gemini_3x("gemini-2.5-flash")
 
     def test_cannot_disable_families_send_nothing_and_warn(self, monkeypatch,
                                                            caplog):
         import largeliterarymodels.providers as P
         monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
         with caplog.at_level("WARNING"):
-            assert P.google_thinking_budget("gemini-2.5-pro") is None
-            assert P.google_thinking_budget("gemini-3.1-pro-preview") is None
-        assert "only works in thinking mode" in caplog.text
+            assert P.google_thinking_setting("gemini-2.5-pro") is None
+            assert P.google_thinking_setting("gemini-3.1-pro-preview") is None
+        assert "cannot express 'off'" in caplog.text
 
-    def test_cross_provider_spellings_map(self):
-        from largeliterarymodels.providers import google_thinking_budget
-        assert google_thinking_budget("gemini-2.5-flash", None) is None
-        assert google_thinking_budget("gemini-2.5-flash", False) == 0
-        assert google_thinking_budget("gemini-2.5-flash",
-                                      {"type": "disabled"}) == 0
-        assert google_thinking_budget("gemini-2.5-flash", 128) == 128
+    def test_cross_provider_spellings_map_per_generation(self):
+        from largeliterarymodels.providers import google_thinking_setting
+        # 2.5: budget vocabulary.
+        assert google_thinking_setting("gemini-2.5-flash", None) is None
+        assert google_thinking_setting("gemini-2.5-flash", False) == \
+            ("thinking_budget", 0)
+        assert google_thinking_setting("gemini-2.5-flash",
+                                       {"type": "disabled"}) == \
+            ("thinking_budget", 0)
+        assert google_thinking_setting("gemini-2.5-flash", 128) == \
+            ("thinking_budget", 128)
+        # 3.x: level vocabulary; the off spellings map to minimal.
+        assert google_thinking_setting("gemini-3.6-flash", False) == \
+            ("thinking_level", "minimal")
+        assert google_thinking_setting("gemini-3.6-flash", "low") == \
+            ("thinking_level", "low")
+        assert google_thinking_setting("gemini-3.6-flash", None) is None
         with pytest.raises(ValueError):
-            google_thinking_budget("gemini-2.5-flash", object())
+            google_thinking_setting("gemini-2.5-flash", object())
 
-    def test_fingerprint_splits_flash_keys_but_not_pro(self):
+    def test_wrong_generation_vocabulary_raises(self):
+        """A deprecated budget on 3.x has documented 'unexpected
+        performance'; a silently-degraded parameter is worse than an
+        error. Levels on 2.5 do not exist at all."""
+        from largeliterarymodels.providers import google_thinking_setting
+        with pytest.raises(ValueError, match="thinking_level"):
+            google_thinking_setting("gemini-3.6-flash", 128)
+        with pytest.raises(ValueError, match="thinking_budget"):
+            google_thinking_setting("gemini-2.5-flash", "minimal")
+
+    def test_fingerprint_vocabulary(self):
         """Old flash entries are thinking-on output — they must orphan.
         Pro's behaviour is unchanged (thinking then, thinking now), so its
-        keys must stay byte-stable."""
+        keys must stay byte-stable. 3.x keys say level:minimal, never
+        'disabled' — there is no off state for a key to claim."""
         from largeliterarymodels.providers import thinking_fingerprint
         assert thinking_fingerprint("gemini-2.5-flash") == "disabled"
         assert thinking_fingerprint("gemini-2.5-pro") is None
         assert thinking_fingerprint("gemini-2.5-flash", 128) == "budget:128"
+        assert thinking_fingerprint("gemini-3.6-flash") == "level:minimal"
+        assert thinking_fingerprint("gemini-3.6-flash", "low") == "level:low"
+        assert thinking_fingerprint("gemini-3.1-pro-preview") is None
 
-    def test_rejected_budget_is_loud_not_healed(self, monkeypatch):
+    def test_rejected_setting_is_loud_not_healed(self, monkeypatch):
+        """Matched on what WE sent, not Google's error prose — the prose
+        drifted between generations (2.5-pro names thinking mode;
+        3.6-flash says only 'invalid argument')."""
         import largeliterarymodels.providers as P
         monkeypatch.setenv("GEMINI_API_KEY", "test")
         monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
@@ -1271,14 +1318,45 @@ class TestGoogleThinkingDefault:
             @staticmethod
             def generate_content(**kw):
                 raise Exception(
-                    "400 INVALID_ARGUMENT. Budget 0 is invalid. This model "
-                    "only works in thinking mode.")
+                    "400 INVALID_ARGUMENT. Request contains an invalid "
+                    "argument.")
 
         client = type("C", (), {"models": _Models()})
         monkeypatch.setattr(P, "_cached_client", lambda key, factory: client)
         with pytest.raises(RuntimeError,
                            match="_GOOGLE_THINKING_CANNOT_DISABLE"):
             P.call_google("hi", model="gemini-9.9-hypothetical")
+
+    def test_level_minimal_reaches_the_config(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        seen = {}
+
+        class _Meta:
+            prompt_token_count = 10
+            candidates_token_count = 5
+            cached_content_token_count = 0
+            thoughts_token_count = None
+
+        class _Resp:
+            model_version = "gemini-3.6-flash"
+            usage_metadata = _Meta()
+            text = "{}"
+
+        class _Models:
+            @staticmethod
+            def generate_content(**kw):
+                seen.update(kw)
+                return _Resp()
+
+        client = type("C", (), {"models": _Models()})
+        monkeypatch.setattr(P, "_cached_client", lambda key, factory: client)
+        monkeypatch.setattr(P, "_LOGGED_RESOLUTIONS", set())
+        P.call_google("hi", model="gemini-3.6-flash")
+        # The SDK coerces the string to its ThinkingLevel enum.
+        level = seen["config"].thinking_config.thinking_level
+        assert "MINIMAL" in str(level).upper()
+        assert seen["config"].thinking_config.thinking_budget is None
 
     def test_budget_zero_reaches_the_config(self, monkeypatch):
         import largeliterarymodels.providers as P
@@ -1381,3 +1459,35 @@ class TestClosingReviewFixes:
             P.thinking_fingerprint("claude-fable-5")
             P.thinking_fingerprint("gemini-2.5-pro")
         assert caplog.text == ""
+
+
+class TestGeminiCacheFloorSurfaced:
+    """A 3,906-token instrument on gemini-3.6-flash ran 14,520 times at
+    full input price — ~130 tokens under the 4,096 implicit-caching floor,
+    visible only on the invoice. The zero-reads warning now covers Gemini,
+    so this shape surfaces in the first batch summary instead of a week
+    later."""
+
+    def test_gemini_floor_known(self):
+        from largeliterarymodels.providers import cache_minimum_tokens
+        assert cache_minimum_tokens("gemini-3.6-flash") == 4096
+        assert cache_minimum_tokens("gemini-3.1-pro-preview") == 4096
+        assert cache_minimum_tokens("gemini-2.5-flash") is None, \
+            "2.5 floors are unmeasured — None, not a guess"
+
+    def test_zero_reads_warns_on_gemini(self):
+        from largeliterarymodels.llm import UsageTracker
+        u = UsageTracker()
+        for _ in range(5):
+            u.record({"input_tokens": 3965, "output_tokens": 20,
+                      "cache_read_tokens": 0})
+        w = u.cache_warning("gemini-3.6-flash")
+        assert w is not None and "4,096" in w
+
+    def test_healthy_gemini_reads_stay_silent(self):
+        from largeliterarymodels.llm import UsageTracker
+        u = UsageTracker()
+        for _ in range(5):
+            u.record({"input_tokens": 200, "output_tokens": 20,
+                      "cache_read_tokens": 4200})
+        assert u.cache_warning("gemini-3.6-flash") is None

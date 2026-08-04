@@ -241,8 +241,18 @@ class UsageTracker:
             earlier version returned None here because "some cache activity"
             looked healthy — the exact diagnosis its own message text
             offered was the one it could never reach.
+
+        Covers Anthropic AND Gemini: Gemini's implicit caching has its own
+        silent floor, and the miss it hides is the same shape — a
+        3,906-token instrument ran 14,520 times at full input price, ~130
+        tokens under the 4,096 minimum, visible only on the invoice.
+        Gemini reports cache reads only (no write counter), so the
+        writes-only branch never fires there; zero reads is the signal.
         """
-        if self.calls < 3 or "claude" not in model.lower():
+        m = model.lower()
+        anthropic_like = "claude" in m
+        google_like = "gemini" in m or m.startswith("google/")
+        if self.calls < 3 or not (anthropic_like or google_like):
             return None
         if self.cache_read_tokens:
             return None

@@ -500,6 +500,14 @@ _CACHE_MIN_DEFAULT_FAMILIES = ("sonnet-5", "sonnet-4-6", "sonnet-4-5",
                                "opus-4-8", "opus-4-1")
 _CACHE_MIN_DEFAULT = 1024
 
+# Gemini implicit-caching minimums. 3.x measured in the field: a
+# 3,906-token prefix never cached across 14,520 calls (~$76 of full-price
+# input); 4,096 is the documented minimum it sat just under. 2.5-era
+# floors are unmeasured here — None, not a guess.
+_GOOGLE_CACHE_MIN_TOKENS = (
+    ("gemini-3", 4096),
+)
+
 
 # Densest chars/token seen on real instrument text. Used only to bound an
 # estimate from above, never to produce one.
@@ -528,6 +536,16 @@ def cache_minimum_tokens(model):
     matches a future 'opus-50'.
     """
     m = model.lower()
+    if _routes_to_google(m):
+        # Gemini implicit caching has its own floor, and a miss is silent
+        # in exactly the Anthropic way: a 3,906-token instrument on
+        # gemini-3.6-flash ran 14,520 times at full input price, ~130
+        # tokens under the 4,096 minimum, and nothing said so until the
+        # invoice did (reported by the malign-logits seat, 2026-08-04).
+        for tag, minimum in _GOOGLE_CACHE_MIN_TOKENS:
+            if _family_match(m, tag):
+                return minimum
+        return None
     if "claude" not in m and not m.startswith("anthropic/"):
         return None
     matches = [(tag, minimum) for tag, minimum in _CACHE_MIN_TOKENS
@@ -942,15 +960,44 @@ _GOOGLE_THINKING_CANNOT_DISABLE = ("gemini-2.5-pro", "gemini-3.1-pro")
 _WARNED_GOOGLE_THINKING = set()
 
 
-def google_thinking_budget(model, thinking="auto", _warn=True):
-    """The thinking_budget to send for a Gemini call, or None to send nothing.
+_GOOGLE_THINKING_LEVELS = ("minimal", "low", "medium", "high")
 
-    "auto" resolves to 0 (thinking off) except on families that reject a
-    zero budget, where nothing is sent and a once-per-model warning states
-    the cost — the Fable arrangement. Callers may pass an int budget, the
-    cross-provider dict/bool spellings, or None to take the API default.
+
+def _is_gemini_3x(model):
+    """Gemini 3.x uses thinking_level; thinking_budget is deprecated there
+    and a zero budget is a 400. Version-boundary matched: 'gemini-3' must
+    not claim a future 'gemini-30'."""
+    return _family_match(_strip_prefix(model).lower(), "gemini-3")
+
+
+def google_thinking_setting(model, thinking="auto", _warn=True):
+    """The ThinkingConfig field to send for a Gemini call, or None.
+
+    Returns ("thinking_budget", int) for the 2.5 generation,
+    ("thinking_level", str) for 3.x, or None to send nothing. The two
+    generations take DIFFERENT parameters — probed live 2026-08-04:
+    thinking_budget=0 on gemini-3.6-flash is a generic INVALID_ARGUMENT
+    (budget survives only as a deprecated nonzero back-compat field), and
+    per Google's docs 3.x cannot fully disable thinking; thinking_level
+    "minimal" is the documented off-equivalent ("matches the 'no thinking'
+    setting for most queries"), measured at zero reported thoughts on our
+    probes where the API default thought 370 tokens. When thoughts do
+    occur under minimal — documented as possible on complex items — the
+    usage receipts (reasoning_tokens, the no_reasoning_observed gate)
+    carry it; that is a documented behaviour, not a broken disable, so it
+    is not warned about the way an ignored budget-0 is.
+
+    "auto": 2.5 -> budget 0; 3.x -> level "minimal"; cannot-disable
+    families -> nothing sent plus a once-per-model cost warning (the Fable
+    arrangement). Explicit spellings: a level string on 3.x; an int budget
+    on 2.5 (rejected on 3.x — deprecated there, and a silently-degraded
+    parameter is worse than an error); the cross-provider off spellings
+    (False/'disabled'/{"type": "disabled"}) map to the generation's
+    off-equivalent; True/'enabled'/None take the API default.
     _warn=False suppresses the cost warning for key-fingerprinting calls.
     """
+    is_3x = _is_gemini_3x(model)
+    off = ("thinking_level", "minimal") if is_3x else ("thinking_budget", 0)
     if thinking == "auto":
         m = _strip_prefix(model).lower()
         if any(_family_match(m, tag)
@@ -958,28 +1005,43 @@ def google_thinking_budget(model, thinking="auto", _warn=True):
             if _warn and model not in _WARNED_GOOGLE_THINKING:
                 _WARNED_GOOGLE_THINKING.add(model)
                 log.warning(
-                    "google: %r only works in thinking mode (a zero "
-                    "thinking_budget is a 400), so extraction calls bill "
-                    "thoughts as output — measured ~400 thought tokens per "
-                    "two-field probe. Use gemini-2.5-flash if that matters.",
+                    "google: %r only works in thinking mode (its minimum "
+                    "thinking level/budget cannot express 'off'), so "
+                    "extraction calls bill thoughts as output — measured "
+                    "~400 thought tokens per two-field probe. Use "
+                    "gemini-2.5-flash or a 3.x flash tier if that matters.",
                     model,
                 )
             return None
-        return 0
+        return off
     if thinking is None:
         return None
     if isinstance(thinking, bool):
-        return None if thinking else 0
+        return None if thinking else off
     if isinstance(thinking, int):
-        return thinking
+        if is_3x:
+            raise ValueError(
+                f"thinking={thinking!r}: Gemini 3.x takes thinking_level "
+                f"('minimal'/'low'/'medium'/'high'), not a token budget — "
+                f"the budget survives only as a deprecated field with "
+                f"documented 'unexpected performance'. Pass a level."
+            )
+        return ("thinking_budget", thinking)
+    if isinstance(thinking, str) and thinking.lower() in _GOOGLE_THINKING_LEVELS:
+        if not is_3x:
+            raise ValueError(
+                f"thinking={thinking!r}: the Gemini 2.5 generation takes an "
+                f"int thinking_budget, not a level string."
+            )
+        return ("thinking_level", thinking.lower())
     if isinstance(thinking, str) and thinking.lower() in ("disabled", "enabled"):
-        return 0 if thinking.lower() == "disabled" else None
+        return off if thinking.lower() == "disabled" else None
     if isinstance(thinking, dict) and "type" in thinking:
-        return 0 if thinking.get("type") == "disabled" else None
+        return off if thinking.get("type") == "disabled" else None
     raise ValueError(
         f"thinking={thinking!r} is not a recognised value for a Gemini "
-        f"model. Use 'auto', None, an int thinking_budget, True/False, "
-        f"'enabled'/'disabled', or a dict with a 'type' key."
+        f"model. Use 'auto', None, True/False, 'enabled'/'disabled', a "
+        f"level string (3.x), or an int thinking_budget (2.5)."
     )
 
 
@@ -998,10 +1060,15 @@ def thinking_fingerprint(model, thinking="auto"):
     """
     m = model.lower()
     if _routes_to_google(m):
-        budget = google_thinking_budget(model, thinking, _warn=False)
-        if budget is None:
+        setting = google_thinking_setting(model, thinking, _warn=False)
+        if setting is None:
             return None
-        return "disabled" if budget == 0 else f"budget:{budget}"
+        param, value = setting
+        if param == "thinking_budget":
+            return "disabled" if value == 0 else f"budget:{value}"
+        # thinking_level: never "disabled" — 3.x has no off state to claim,
+        # and a key must not assert one the model cannot deliver.
+        return f"level:{value}"
     resolved = None
     if _routes_to_anthropic(m):
         resolved = (thinking_default(model, _warn=False) if thinking == "auto"
@@ -1461,9 +1528,10 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
     )
     if system_prompt:
         config.system_instruction = system_prompt
-    budget = google_thinking_budget(model, thinking)
-    if budget is not None:
-        config.thinking_config = types.ThinkingConfig(thinking_budget=budget)
+    setting = google_thinking_setting(model, thinking)
+    if setting is not None:
+        param, value = setting
+        config.thinking_config = types.ThinkingConfig(**{param: value})
 
     # Build contents
     if images:
@@ -1483,21 +1551,31 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
             config=config,
         )
     except Exception as e:
-        if budget == 0 and "only works in thinking mode" in str(e):
-            # Deliberately loud, not healed: retrying without the budget
-            # would run thinking-on and store the output under a
-            # thinking-off cache key — a silently wrong provenance record,
-            # which is worse than this error.
+        if setting is not None and "INVALID_ARGUMENT" in str(e):
+            # Matched on what WE sent, not on Google's error prose — the
+            # prose already drifted once between generations (2.5-pro says
+            # "only works in thinking mode"; 3.6-flash says only "invalid
+            # argument"). Deliberately loud, not healed: retrying without
+            # the setting would run thinking-on and store the output under
+            # a thinking-off/minimal cache key — a silently wrong
+            # provenance record, which is worse than this error.
             raise RuntimeError(
-                f"google: {model!r} rejects thinking_budget=0 — it belongs "
-                f"in providers._GOOGLE_THINKING_CANNOT_DISABLE (thinking "
-                f"then stays on, warned once, and billed as output). "
-                f"Original error: {e}"
+                f"google: {model!r} rejected {setting[0]}={setting[1]!r}. "
+                f"If this model cannot express 'off', it belongs in "
+                f"providers._GOOGLE_THINKING_CANNOT_DISABLE (thinking then "
+                f"stays on, warned once, billed as output); if it is a new "
+                f"generation, its parameter vocabulary may have changed — "
+                f"probe it before adding constants. Original error: {e}"
             ) from e
         raise
     _log_resolved_model("google", model,
                         getattr(response, "model_version", None))
-    if budget == 0:
+    if setting == ("thinking_budget", 0):
+        # Budget-0 accepted-and-ignored is a broken disable and warns.
+        # thinking_level="minimal" is NOT audited here: the docs say the
+        # model "may reason very minimally for complex tasks" under it, so
+        # thoughts there are documented behaviour — the usage receipts and
+        # the no_reasoning_observed gate carry them per run.
         m = getattr(response, "usage_metadata", None)
         thoughts = getattr(m, "thoughts_token_count", None) if m else None
         if thoughts and model not in _WARNED_THINKING_NOT_DISABLED:

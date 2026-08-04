@@ -1,0 +1,454 @@
+{
+  "_what": "Multi-provider LLM token pricing. Supersedes largeliterarymodels/data/anthropic_pricing.json, which is Anthropic-only and was last updated 2026-04-27 (it tops out at claude-sonnet-4-6 and cannot price claude-sonnet-5, any OpenAI model, or any DeepSeek model).",
+  "unit": "USD per 1,000,000 tokens",
+  "fetched": "2026-08-04",
+  "sources": {
+    "anthropic": "https://platform.claude.com/docs/en/docs/about-claude/pricing",
+    "openai": "https://developers.openai.com/api/docs/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  "fields": {
+    "input": "fresh (uncached) input tokens",
+    "cached": "cache read / cache hit. null means the model has NO cache tier and cached tokens bill at the full `input` rate.",
+    "cache_write_5m": "prompt cache write, 5-minute TTL (Anthropic; OpenAI gpt-5.6-* only). null = not offered or not separately billed.",
+    "cache_write_1h": "prompt cache write, 1-hour TTL. Anthropic only.",
+    "output": "output tokens. For REASONING models this includes reasoning tokens, which are invisible in the response but billed.",
+    "reasoning": "true if the model emits billed reasoning tokens \u2014 output-token estimates from a non-reasoning workload are FLOORS for these.",
+    "batch_discount": "fraction off input and output for asynchronous batch APIs. Anthropic and OpenAI both offer 0.5."
+  },
+  "caveats": {
+    "anthropic_tokenizer": "Claude 4.7 and later (and Mythos Preview) use a newer tokenizer producing ~30% MORE tokens for the same text. Claude Sonnet 4.6 and earlier use the previous one. Token counts measured on one family do not transfer across that boundary without adjustment.",
+    "sonnet_5_introductory": "Claude Sonnet 5 is priced at $2/$10 through 2026-08-31, then $3/$15. Both rows are present; `claude-sonnet-5` aliases the introductory row while it is in force.",
+    "openai_long_context": "gpt-5.5, gpt-5.4 and the -pro variants show <272K-context pricing here; longer contexts may be priced differently.",
+    "counterfactual_use": "Pricing a workload measured on model A against model B is a COUNTERFACTUAL, not a quote: output volume and tokenization both differ. Price a swap from a small pilot on the target model.",
+    "deepseek_peak_pricing": "DeepSeek has ANNOUNCED but not implemented peak/off-peak pricing: during peak hours (09:00-12:00 and 14:00-18:00 Beijing, UTC+8) prices will be 2x. No effective date. Registration P's deepseek arm ran 14:00-15:00 UTC = 22:00-23:00 Beijing, i.e. off-peak, so the $0.81 is a regular-rate figure and would be $1.63 under the announced peak policy.",
+    "openai_other_tiers": "The OpenAI page also carries Flex and Fast-mode tables besides Standard and Batch. Only Standard rates are recorded here; a Flex run would price differently."
+  },
+  "anthropic": {
+    "claude-fable-5": {
+      "input": 10.0,
+      "cached": 1.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "output": 50.0,
+      "reasoning": false
+    },
+    "claude-mythos-5": {
+      "input": 10.0,
+      "cached": 1.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "output": 50.0,
+      "reasoning": false
+    },
+    "claude-opus-5": {
+      "input": 5.0,
+      "cached": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "reasoning": false
+    },
+    "claude-opus-4-8": {
+      "input": 5.0,
+      "cached": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "reasoning": false
+    },
+    "claude-opus-4-7": {
+      "input": 5.0,
+      "cached": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "reasoning": false
+    },
+    "claude-opus-4-6": {
+      "input": 5.0,
+      "cached": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "reasoning": false
+    },
+    "claude-opus-4-5": {
+      "input": 5.0,
+      "cached": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "reasoning": false
+    },
+    "claude-opus-4-1": {
+      "input": 15.0,
+      "cached": 1.5,
+      "cache_write_5m": 18.75,
+      "cache_write_1h": 30.0,
+      "output": 75.0,
+      "reasoning": false,
+      "status": "deprecated"
+    },
+    "claude-opus-4": {
+      "input": 15.0,
+      "cached": 1.5,
+      "cache_write_5m": 18.75,
+      "cache_write_1h": 30.0,
+      "output": 75.0,
+      "reasoning": false,
+      "status": "retired except Google Cloud"
+    },
+    "claude-sonnet-5": {
+      "input": 2.0,
+      "cached": 0.2,
+      "cache_write_5m": 2.5,
+      "cache_write_1h": 4.0,
+      "output": 10.0,
+      "reasoning": false,
+      "note": "introductory, through 2026-08-31"
+    },
+    "claude-sonnet-5-post-2026-09-01": {
+      "input": 3.0,
+      "cached": 0.3,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "output": 15.0,
+      "reasoning": false
+    },
+    "claude-sonnet-4-6": {
+      "input": 3.0,
+      "cached": 0.3,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "output": 15.0,
+      "reasoning": false
+    },
+    "claude-sonnet-4-5": {
+      "input": 3.0,
+      "cached": 0.3,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "output": 15.0,
+      "reasoning": false
+    },
+    "claude-sonnet-4": {
+      "input": 3.0,
+      "cached": 0.3,
+      "cache_write_5m": 3.75,
+      "cache_write_1h": 6.0,
+      "output": 15.0,
+      "reasoning": false,
+      "status": "retired except Bedrock/GCP"
+    },
+    "claude-haiku-4-5": {
+      "input": 1.0,
+      "cached": 0.1,
+      "cache_write_5m": 1.25,
+      "cache_write_1h": 2.0,
+      "output": 5.0,
+      "reasoning": false
+    },
+    "claude-haiku-3-5": {
+      "input": 0.8,
+      "cached": 0.08,
+      "cache_write_5m": 1.0,
+      "cache_write_1h": 1.6,
+      "output": 4.0,
+      "reasoning": false,
+      "status": "retired except Bedrock/GCP"
+    }
+  },
+  "openai": {
+    "gpt-5.6-sol": {
+      "input": 5.0,
+      "cached": 0.5,
+      "cache_write_5m": 6.25,
+      "output": 30.0,
+      "reasoning": false
+    },
+    "gpt-5.6-terra": {
+      "input": 2.0,
+      "cached": 0.2,
+      "cache_write_5m": 2.5,
+      "output": 12.0,
+      "reasoning": false
+    },
+    "gpt-5.6-luna": {
+      "input": 0.2,
+      "cached": 0.02,
+      "cache_write_5m": 0.25,
+      "output": 1.2,
+      "reasoning": false
+    },
+    "gpt-5.5": {
+      "input": 5.0,
+      "cached": 0.5,
+      "output": 30.0,
+      "reasoning": false
+    },
+    "gpt-5.5-pro": {
+      "input": 30.0,
+      "cached": null,
+      "output": 180.0,
+      "reasoning": true
+    },
+    "gpt-5.5-cyber": {
+      "input": 12.5,
+      "cached": 1.25,
+      "output": 75.0,
+      "reasoning": false
+    },
+    "gpt-5.4": {
+      "input": 2.5,
+      "cached": 0.25,
+      "output": 15.0,
+      "reasoning": false
+    },
+    "gpt-5.4-mini": {
+      "input": 0.75,
+      "cached": 0.075,
+      "output": 4.5,
+      "reasoning": false
+    },
+    "gpt-5.4-nano": {
+      "input": 0.2,
+      "cached": 0.02,
+      "output": 1.25,
+      "reasoning": false
+    },
+    "gpt-5.4-pro": {
+      "input": 30.0,
+      "cached": null,
+      "output": 180.0,
+      "reasoning": true
+    },
+    "gpt-5.3-chat-latest": {
+      "input": 1.75,
+      "cached": 0.175,
+      "output": 14.0,
+      "reasoning": false
+    },
+    "gpt-5.3-codex": {
+      "input": 1.75,
+      "cached": 0.175,
+      "output": 14.0,
+      "reasoning": false
+    },
+    "gpt-5.2": {
+      "input": 1.75,
+      "cached": 0.175,
+      "output": 14.0,
+      "reasoning": false
+    },
+    "gpt-5.2-chat-latest": {
+      "input": 1.75,
+      "cached": 0.175,
+      "output": 14.0,
+      "reasoning": false
+    },
+    "gpt-5.2-pro": {
+      "input": 21.0,
+      "cached": null,
+      "output": 168.0,
+      "reasoning": true
+    },
+    "gpt-5.1": {
+      "input": 1.25,
+      "cached": 0.125,
+      "output": 10.0,
+      "reasoning": false
+    },
+    "gpt-5": {
+      "input": 1.25,
+      "cached": 0.125,
+      "output": 10.0,
+      "reasoning": false
+    },
+    "gpt-5-mini": {
+      "input": 0.25,
+      "cached": 0.025,
+      "output": 2.0,
+      "reasoning": false
+    },
+    "gpt-5-nano": {
+      "input": 0.05,
+      "cached": 0.005,
+      "output": 0.4,
+      "reasoning": false
+    },
+    "gpt-5-pro": {
+      "input": 15.0,
+      "cached": null,
+      "output": 120.0,
+      "reasoning": true
+    },
+    "gpt-5-search-api": {
+      "input": 1.25,
+      "cached": 0.125,
+      "output": 10.0,
+      "reasoning": false
+    },
+    "chat-latest": {
+      "input": 5.0,
+      "cached": 0.5,
+      "output": 30.0,
+      "reasoning": false
+    },
+    "o1": {
+      "input": 15.0,
+      "cached": 7.5,
+      "output": 60.0,
+      "reasoning": true
+    },
+    "o1-pro": {
+      "input": 150.0,
+      "cached": null,
+      "output": 600.0,
+      "reasoning": true
+    },
+    "o3": {
+      "input": 2.0,
+      "cached": 0.5,
+      "output": 8.0,
+      "reasoning": true
+    },
+    "o3-pro": {
+      "input": 20.0,
+      "cached": null,
+      "output": 80.0,
+      "reasoning": true
+    },
+    "o3-mini": {
+      "input": 1.1,
+      "cached": 0.55,
+      "output": 4.4,
+      "reasoning": true
+    },
+    "o4-mini": {
+      "input": 1.1,
+      "cached": 0.275,
+      "output": 4.4,
+      "reasoning": true
+    },
+    "gpt-4.1": {
+      "input": 2.0,
+      "cached": 0.5,
+      "output": 8.0,
+      "reasoning": false
+    },
+    "gpt-4.1-mini": {
+      "input": 0.4,
+      "cached": 0.1,
+      "output": 1.6,
+      "reasoning": false
+    },
+    "gpt-4.1-nano": {
+      "input": 0.1,
+      "cached": 0.025,
+      "output": 0.4,
+      "reasoning": false
+    },
+    "gpt-4o": {
+      "input": 2.5,
+      "cached": 1.25,
+      "output": 10.0,
+      "reasoning": false
+    },
+    "gpt-4o-2024-05-13": {
+      "input": 5.0,
+      "cached": null,
+      "output": 15.0,
+      "reasoning": false
+    },
+    "gpt-4o-mini": {
+      "input": 0.15,
+      "cached": 0.075,
+      "output": 0.6,
+      "reasoning": false
+    },
+    "gpt-4-turbo-2024-04-09": {
+      "input": 10.0,
+      "cached": null,
+      "output": 30.0,
+      "reasoning": false
+    },
+    "gpt-4-0613": {
+      "input": 30.0,
+      "cached": null,
+      "output": 60.0,
+      "reasoning": false
+    },
+    "gpt-3.5-turbo": {
+      "input": 0.5,
+      "cached": null,
+      "output": 1.5,
+      "reasoning": false
+    },
+    "gpt-3.5-turbo-0125": {
+      "input": 0.5,
+      "cached": null,
+      "output": 1.5,
+      "reasoning": false
+    },
+    "gpt-3.5-turbo-1106": {
+      "input": 1.0,
+      "cached": null,
+      "output": 2.0,
+      "reasoning": false
+    },
+    "gpt-3.5-turbo-instruct": {
+      "input": 1.5,
+      "cached": null,
+      "output": 2.0,
+      "reasoning": false
+    },
+    "davinci-002": {
+      "input": 2.0,
+      "cached": null,
+      "output": 2.0,
+      "reasoning": false
+    },
+    "babbage-002": {
+      "input": 0.4,
+      "cached": null,
+      "output": 0.4,
+      "reasoning": false
+    }
+  },
+  "deepseek": {
+    "deepseek-v4-pro": {
+      "input": 0.435,
+      "cached": 0.003625,
+      "output": 0.87,
+      "reasoning": false
+    },
+    "deepseek-v4-flash": {
+      "input": 0.14,
+      "cached": 0.0028,
+      "output": 0.28,
+      "reasoning": false
+    }
+  },
+  "aliases": {
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-5",
+    "haiku": "claude-haiku-4-5",
+    "anthropic/claude-sonnet-5": "claude-sonnet-5",
+    "anthropic/claude-haiku-4-5": "claude-haiku-4-5",
+    "openai/gpt-4o-mini": "gpt-4o-mini",
+    "openai/gpt-5.4-mini": "gpt-5.4-mini",
+    "deepseek/deepseek-v4-pro": "deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash": "deepseek-v4-flash",
+    "gpt-4o-mini-2024-07-18": "gpt-4o-mini"
+  },
+  "batch_discount": {
+    "anthropic": 0.5,
+    "openai": 0.5,
+    "deepseek": null,
+    "_verified": "2026-08-04, from each provider's own pricing page",
+    "_anthropic": "Stated in prose AND given its own table: 'a 50% discount on both input and output tokens'.",
+    "_openai": "NOT stated in prose. A separate Batch table exists per model category and is 50% of Standard throughout; the discount is evident only by comparing the two tables.",
+    "_deepseek": "NO Batch API. Confirmed absent from the pricing page rather than assumed."
+  }
+}

@@ -1597,5 +1597,13 @@ class LLM:
             raise
         return results
 
+    def extract_batch(self, prompts, schema, **kwargs):
+        """Batch-transport extract_map: 50% pricing on providers with a
+        batch API, same stash keys, same receipts. See
+        largeliterarymodels.batch.extract_batch for the contract (ledger
+        semantics, probe-first, wait=False handles)."""
+        from .batch import extract_batch
+        return extract_batch(self, prompts, schema, **kwargs)
+
     def __repr__(self):
         return f"LLM(model={self.model!r})"

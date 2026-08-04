@@ -14,6 +14,11 @@ Main API:
     write_consensus(consensus_wide, task_name, task_version,
                     ensemble_name='ensemble-maj', ...) → n_rows_inserted
 
+Rank agreement (for ranking tasks, NOT the categorical functions above):
+    kendall_w(rankings, pool=None) → dict (W, n_items, coverage, p, notes)
+    pairwise_rank_correlation(rankings, method='spearman') → DataFrame
+    rank_agreement_summary(per_item, pools=None) → DataFrame (item × W)
+
 Field-type handling for majority:
     bool      → majority True/False; ties → reference
     Literal   → mode; ties → reference
@@ -553,3 +558,433 @@ def write_consensus(
                       'run_id', 'annotated_at', 'meta'],
     )
     return len(rows)
+
+
+# ── Rank agreement ─────────────────────────────────────────────────────────
+#
+# The functions above are categorical: they ask whether two coders produced
+# the same value. Applied to a ranking that question is the wrong one, and
+# quietly so — it scores rank 1 against rank 2 as exactly the same
+# disagreement as rank 1 against rank 13, discarding the ordering that is the
+# whole content of the instrument. A ranking task whose coders visibly agree
+# can score mediocre on a categorical statistic, which inverts the conclusion
+# rather than merely blurring it. The failure mode is not a function that
+# errors; it is an existing function that returns a plausible number for a
+# question you did not ask.
+#
+# For m coders ranking n items the statistic is Kendall's W (coefficient of
+# concordance), with pairwise Spearman/Kendall for coder-to-coder detail.
+
+
+def _as_tie_groups(entry, coder=None) -> list[list]:
+    """Normalise one coder's ranking into ordered tie-groups, best first.
+
+    Accepts either:
+        ["kill", ["cry", "scream"], "run"]   ordered; a nested sequence is a tie
+        {"kill": 1, "cry": 2, "scream": 2}   explicit ranks; equal rank = tie
+
+    Every malformed input below used to produce a number rather than an error,
+    which is the failure mode this module exists to avoid:
+
+    - a bare string ranks its own characters;
+    - a duplicated item overwrites its own midrank, so S is computed against a
+      rank vector that does not sum to n(n+1)/2 and W can exceed 1;
+    - a NaN rank compares false against everything including itself, so the
+      tie-group it lands in — and hence the whole ranking — depends on dict
+      insertion order;
+    - a non-numeric rank raises `could not convert string to float` with no
+      indication of which coder sent it.
+
+    `coder` is only used to name the offender in the error message.
+    """
+    who = f'coder {coder!r}: ' if coder is not None else ''
+
+    if isinstance(entry, (str, bytes)):
+        raise ValueError(
+            f'{who}ranking is a bare string {entry!r}; iterating it would rank '
+            f'its individual characters. Pass a sequence of items.'
+        )
+
+    if isinstance(entry, dict):
+        by_rank: dict[float, list] = {}
+        for item, rank in entry.items():
+            if rank is None:
+                raise ValueError(
+                    f'{who}item {item!r} has rank None. A missing rank must be '
+                    f'omitted from the ranking, not recorded as None — the '
+                    f'intersection is what handles partial coverage.'
+                )
+            try:
+                value = float(rank)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f'{who}item {item!r} has non-numeric rank {rank!r}'
+                ) from exc
+            if value != value:  # NaN
+                raise ValueError(
+                    f'{who}item {item!r} has rank NaN. NaN compares false '
+                    f'against every rank including itself, so the tie-group it '
+                    f'joins would depend on dict insertion order. Omit the '
+                    f'item instead.'
+                )
+            by_rank.setdefault(value, []).append(item)
+        groups = [sorted(by_rank[r], key=str) for r in sorted(by_rank)]
+    else:
+        groups = []
+        for element in entry:
+            if isinstance(element, (list, tuple, set, frozenset)):
+                groups.append(sorted(element, key=str))
+            else:
+                groups.append([element])
+
+    seen: set = set()
+    for group in groups:
+        for item in group:
+            if item in seen:
+                raise ValueError(
+                    f'{who}item {item!r} appears more than once in the ranking. '
+                    f'A repeated item overwrites its own midrank and can push W '
+                    f'above 1; rank each item exactly once.'
+                )
+            seen.add(item)
+    return groups
+
+
+def _midranks(groups: list[list]) -> dict:
+    """Assign midranks over ordered tie-groups: [a, [b, c], d] → 1, 2.5, 2.5, 4."""
+    ranks, position = {}, 1
+    for group in groups:
+        mid = position + (len(group) - 1) / 2
+        for item in group:
+            ranks[item] = mid
+        position += len(group)
+    return ranks
+
+
+def _restrict_and_rerank(groups: list[list], keep: set) -> tuple[dict, list[list]]:
+    """Re-rank a coder over a subset of items.
+
+    Ranks must be recomputed after intersecting, not filtered: a coder whose
+    2nd and 5th choices survive is expressing ranks 1 and 2 over the surviving
+    set, not 2 and 5. Filtering without re-ranking silently inflates S.
+    """
+    restricted = [[i for i in g if i in keep] for g in groups]
+    restricted = [g for g in restricted if g]
+    return _midranks(restricted), restricted
+
+
+def _validate_pool(pool, n_distinct: int) -> int:
+    """Check a declared candidate-pool size against what the coders did.
+
+    An unvalidated pool is worse than no pool: `coverage` is the one number
+    that stops a W over 4 items being quoted as a W over 15, and a pool smaller
+    than the item set silently returns a coverage above 1 rather than failing.
+    """
+    try:
+        as_int = int(pool)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'pool must be a positive integer, got {pool!r}') from exc
+    if as_int != pool or as_int <= 0:
+        raise ValueError(f'pool must be a positive integer, got {pool!r}')
+    if as_int < n_distinct:
+        raise ValueError(
+            f'pool={as_int} is smaller than the {n_distinct} distinct items the '
+            f'coders ranked, which would report coverage above 1'
+        )
+    return as_int
+
+
+def kendall_w(
+    rankings: dict,
+    pool: Optional[int] = None,
+    min_items: int = 4,
+) -> dict:
+    """Kendall's W (coefficient of concordance) across coders' rankings.
+
+    Ties are expected and corrected for. Coders may rank overlapping but
+    non-identical subsets (items a coder judged unrankable simply do not
+    appear); W is computed on the intersection, and `n_items` reports how many
+    items that actually was. Read it — a coder who ranked 4 of a 15-word pool
+    collapses the intersection to 4, and a W over 4 items is not comparable to
+    a W over 15 no matter how high it is.
+
+    `mean_spearman` is the mean of the pairwise Spearman correlations computed
+    over the GLOBAL intersection — the same item set W itself uses. It is not
+    derived from the textbook identity W = (1 + (m-1)r̄)/m, which holds only
+    when every coder has the same tie structure and is silently wrong
+    otherwise. Note that `pairwise_rank_correlation` uses PER-PAIR
+    intersections instead, so its mean coefficient will differ from
+    `mean_spearman` whenever coverage differs between coders; neither is wrong,
+    they are answering questions about different item sets.
+
+    Args:
+        rankings: {coder: ranking}, each ranking in either form accepted by
+            _as_tie_groups.
+        pool: Optional size of the candidate pool the coders drew from. Must be
+            a positive integer no smaller than the number of distinct items the
+            coders actually ranked, else ValueError — a pool below that yields
+            coverage > 1, which is not a coverage. When omitted, `coverage`
+            falls back to intersection / union of all coders' items, so the
+            restriction is always reported rather than opt-in.
+        min_items: Refuse to return a W below this many items (default 4).
+            Returns w=None with a note rather than a number that invites
+            quotation.
+
+    Returns:
+        dict with keys: w, n_items, n_coders, coders, items, coverage,
+        dropped_per_coder, ties_present, chi2, df, p_value, p_approximate,
+        mean_spearman, notes, note. `w` is None whenever it could not be
+        computed, and `notes` always says why. `notes` is the list; `note` is
+        those notes joined with '; ', or None when there are none — several
+        conditions can hold at once, so a single-slot note loses whichever one
+        was written first.
+    """
+    coders = sorted(rankings)
+    m = len(coders)
+    grouped = {c: _as_tie_groups(rankings[c], coder=c) for c in coders}
+    sets = {c: set(i for g in grouped[c] for i in g) for c in coders}
+
+    union: set = set().union(*sets.values()) if sets else set()
+    common = set.intersection(*(sets[c] for c in coders)) if coders else set()
+    n = len(common)
+
+    if pool is not None:
+        pool = _validate_pool(pool, len(union))
+
+    notes: list[str] = []
+    out = {
+        'w': None, 'n_items': n, 'n_coders': m, 'coders': tuple(coders),
+        'items': tuple(sorted(common, key=str)),
+        'coverage': (n / pool) if pool is not None
+                    else (n / len(union) if union else None),
+        # Distinct items, not tokens: a coder who repeated an item has not
+        # thereby dropped one.
+        'dropped_per_coder': {c: len(sets[c]) - n for c in coders},
+        'ties_present': False,
+        'chi2': None, 'df': None, 'p_value': None, 'p_approximate': None,
+        'mean_spearman': None, 'notes': notes, 'note': None,
+    }
+
+    def finish():
+        out['notes'] = list(notes)
+        out['note'] = '; '.join(notes) if notes else None
+        return out
+
+    if m < 2:
+        notes.append('W needs at least 2 coders')
+        return finish()
+    if n < 2:
+        notes.append(f'only {n} item(s) common to all {m} coders')
+        return finish()
+    if n < min_items:
+        notes.append(
+            f'{n} common items is below min_items={min_items}; W over so few '
+            f'items is unstable and not comparable to W over a full pool'
+        )
+        return finish()
+
+    rank_maps, tie_correction = {}, 0.0
+    flat_coders = []
+    for c in coders:
+        ranks, restricted = _restrict_and_rerank(grouped[c], common)
+        rank_maps[c] = ranks
+        # Tie correction must come off the RESTRICTED groups: a tie the
+        # intersection has broken is no longer a tie in the ranking being
+        # scored, and correcting for it shrinks the denominator, inflating W
+        # above 1 in the limit.
+        for group in restricted:
+            t = len(group)
+            if t > 1:
+                out['ties_present'] = True
+                tie_correction += t ** 3 - t
+        if len(set(ranks.values())) < 2:
+            flat_coders.append(c)
+
+    if flat_coders:
+        notes.append(
+            'zero-variance coder(s) ' + ', '.join(repr(c) for c in flat_coders)
+            + ' tied every common item; they carry no ordering information but '
+              'still count toward m, dragging W toward its no-information value'
+        )
+
+    items = out['items']
+    rank_sums = [sum(rank_maps[c][i] for c in coders) for i in items]
+    mean_rank_sum = m * (n + 1) / 2
+    S = sum((r - mean_rank_sum) ** 2 for r in rank_sums)
+
+    denominator = m ** 2 * (n ** 3 - n) - m * tie_correction
+    if denominator <= 0:
+        notes.append('no rank variation to measure (every item tied)')
+        return finish()
+
+    w = 12 * S / denominator
+    out['w'] = w
+
+    from scipy import stats
+
+    # Mean pairwise Spearman, computed rather than inferred. The identity
+    # W = (1 + (m-1)r̄)/m assumes an identical tie structure across coders and
+    # is off by ~0.05 on realistic tied data; it also reports 0.0 for a pair
+    # whose correlation is undefined, which is a claim of independence rather
+    # than of ignorance.
+    coefficients, undefined = [], []
+    for i, a in enumerate(coders):
+        for b in coders[i + 1:]:
+            xa = [rank_maps[a][it] for it in items]
+            xb = [rank_maps[b][it] for it in items]
+            if len(set(xa)) < 2 or len(set(xb)) < 2:
+                undefined.append(f'{a}~{b}')
+                continue
+            coefficients.append(float(stats.spearmanr(xa, xb).statistic))
+    out['mean_spearman'] = (
+        sum(coefficients) / len(coefficients) if coefficients else None
+    )
+    if undefined:
+        notes.append(
+            'mean_spearman excludes ' + str(len(undefined))
+            + ' undefined pair(s) (' + ', '.join(undefined)
+            + ') where one coder had no rank variation'
+        )
+
+    chi2 = m * (n - 1) * w
+    out['chi2'] = chi2
+    out['df'] = n - 1
+    out['p_value'] = float(stats.chi2.sf(chi2, n - 1))
+    # The chi-square approximation is poor for short rankings, and — separately
+    # — for two coders at any n, where m(n-1)W is not close to chi-square
+    # because W is just a rescaled Spearman. Say so rather than let a p-value
+    # be quoted at face value.
+    out['p_approximate'] = bool(n <= 7 or m == 2)
+    if n <= 7:
+        notes.append(
+            f'p from the chi-square approximation, unreliable at n={n} '
+            f'(adequate above ~7 items)'
+        )
+    if m == 2:
+        notes.append(
+            'with 2 coders W is a rescaled Spearman correlation and the '
+            'chi-square approximation on m(n-1)W is poor at any n; use the '
+            'Spearman p-value from pairwise_rank_correlation instead'
+        )
+    return finish()
+
+
+def pairwise_rank_correlation(
+    rankings: dict,
+    method: str = 'spearman',
+    min_items: int = 3,
+) -> pd.DataFrame:
+    """All-pairs rank correlation between coders. Rows = coder pairs.
+
+    Each pair uses its OWN intersection rather than the global one, so a single
+    low-coverage coder does not shrink every other pair's n. This is the
+    opposite convention from `kendall_w`, which is necessarily global: when
+    coverage differs between coders the mean of this table's `coefficient`
+    column will NOT equal `kendall_w(...)['mean_spearman']`, because the two
+    are computed over different item sets. Compare them only when every coder
+    ranked the same items.
+
+    Kendall uses tau-b, which is tie-corrected; Spearman is computed on
+    midranks.
+
+    Args:
+        rankings: {coder: ranking}, in either form accepted by _as_tie_groups.
+        method: 'spearman' or 'kendall'.
+        min_items: pairs sharing fewer items than this get coefficient=NaN and
+            computable=False (default 3). Note that a coefficient at n=3 is
+            barely one: untied Spearman over 3 items can only take the values
+            1, 0.5, -0.5 and -1, so its p-value cannot go below 1/6 ≈ 0.167 and
+            reporting significance there is meaningless. Raise min_items if the
+            table is going to be read as evidence.
+
+    Returns:
+        DataFrame with columns: coder_a, coder_b, n, computable, coefficient,
+        p_value. `computable` is False for pairs below min_items and for pairs
+        where one coder tied everything (an undefined correlation) — filter on
+        it explicitly rather than relying on pandas' .mean() to skip the NaNs,
+        which hides how many pairs the mean rests on.
+    """
+    if method not in ('spearman', 'kendall'):
+        raise ValueError("method must be 'spearman' or 'kendall'")
+    from scipy import stats
+
+    coders = sorted(rankings)
+    grouped = {c: _as_tie_groups(rankings[c], coder=c) for c in coders}
+    sets = {c: set(i for g in grouped[c] for i in g) for c in coders}
+
+    rows = []
+    for i, a in enumerate(coders):
+        for b in coders[i + 1:]:
+            common = sets[a] & sets[b]
+            row = {'coder_a': a, 'coder_b': b, 'n': len(common),
+                   'computable': False,
+                   'coefficient': float('nan'), 'p_value': float('nan')}
+            if len(common) >= min_items:
+                ra, _ = _restrict_and_rerank(grouped[a], common)
+                rb, _ = _restrict_and_rerank(grouped[b], common)
+                items = sorted(common, key=str)
+                xa = [ra[i2] for i2 in items]
+                xb = [rb[i2] for i2 in items]
+                if len(set(xa)) >= 2 and len(set(xb)) >= 2:
+                    if method == 'spearman':
+                        res = stats.spearmanr(xa, xb)
+                    else:
+                        res = stats.kendalltau(xa, xb, variant='b')
+                    row['computable'] = True
+                    row['coefficient'] = float(res.statistic)
+                    row['p_value'] = float(res.pvalue)
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=['coder_a', 'coder_b', 'n', 'computable',
+                     'coefficient', 'p_value'])
+    return pd.DataFrame(rows)
+
+
+#: Columns of rank_agreement_summary(), including when it is empty.
+SUMMARY_COLUMNS = ('w', 'n_items', 'n_coders', 'coverage',
+                   'ties_present', 'p_value', 'note')
+
+
+def rank_agreement_summary(
+    per_item: dict,
+    pools: Optional[dict] = None,
+    min_items: int = 4,
+) -> pd.DataFrame:
+    """Kendall's W per item across a corpus of ranking tasks.
+
+    Args:
+        per_item: {item_id: {coder: ranking}}.
+        pools: Optional {item_id: pool_size} for per-item coverage.
+        min_items: Passed to kendall_w.
+
+    Returns:
+        DataFrame indexed by item_id with the columns named in
+        SUMMARY_COLUMNS: w, n_items, n_coders, coverage, ties_present, p_value
+        and note. Items whose W could not be computed keep their row with w=NaN
+        and the reason in `note`, rather than being dropped — a silently
+        shorter table is how a coverage problem becomes invisible. An empty
+        `per_item` returns an empty frame with those columns, not an error:
+        callers concatenate these, and a zero-row corpus is a legitimate state.
+    """
+    rows = []
+    for item_id, rankings in per_item.items():
+        pool = pools.get(item_id) if pools else None
+        r = kendall_w(rankings, pool=pool, min_items=min_items)
+        rows.append({
+            'item_id': item_id,
+            'w': r['w'] if r['w'] is not None else float('nan'),
+            'n_items': r['n_items'],
+            'n_coders': r['n_coders'],
+            'coverage': r['coverage'] if r['coverage'] is not None else float('nan'),
+            'ties_present': r['ties_present'],
+            'p_value': r['p_value'] if r['p_value'] is not None else float('nan'),
+            'note': r['note'] or '',
+        })
+    if not rows:
+        return pd.DataFrame(
+            columns=list(SUMMARY_COLUMNS),
+            index=pd.Index([], name='item_id'),
+        )
+    return pd.DataFrame(rows).set_index('item_id')

@@ -336,3 +336,36 @@ class TestByteIdentityAcrossTheCatalog:
                 cls.__name__
             checked += 1
         assert checked >= 10, f"only {checked} tasks checked — registry moved?"
+
+
+class TestPriceShell:
+    def _run(self, argv, capsys):
+        from largeliterarymodels.cli.main import build_parser
+        args = build_parser().parse_args(argv)
+        rc = args.func(args)
+        return rc, capsys.readouterr().out
+
+    def test_one_model_prints_the_invoice_anchor(self, capsys):
+        rc, out = self._run(["price", "--fresh", "517547", "--cached",
+                             "18389760", "--output", "657056",
+                             "--model", "gpt-4o-mini"], capsys)
+        assert rc == 0 and "$1.8511" in out
+        assert "prices fetched" in out
+
+    def test_table_mode_ranks_and_flags_floors(self, capsys):
+        rc, out = self._run(["price", "--fresh", "1000000",
+                             "--output", "100000"], capsys)
+        assert rc == 0
+        assert "*floor" in out
+        assert "gemini-3.6-flash" in out and "deepseek-v4-pro" in out
+
+    def test_prefix_gate_reaches_the_shell(self, capsys):
+        rc, out = self._run(["price", "--cached", "10000000",
+                             "--prefix-tokens", "3000",
+                             "--model", "claude-haiku-4-5"], capsys)
+        assert "BELOW" in out and "4,096" in out
+
+    def test_batch_notes_deepseeks_absence(self, capsys):
+        rc, out = self._run(["price", "--fresh", "1000000", "--batch"],
+                            capsys)
+        assert "deepseek does not" in out

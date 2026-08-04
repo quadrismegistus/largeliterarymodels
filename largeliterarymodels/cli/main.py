@@ -121,6 +121,51 @@ def cmd_render(args) -> int:
     return 0
 
 
+def cmd_price(args) -> int:
+    """Price a measured workload: one model, or the whole table ranked.
+
+    Prospective estimates are cache-aware when --prefix-tokens is given —
+    below the model's known cache floor the discount is refused rather
+    than promised. Every line prints the table's fetch date: a pricing
+    table is a constants file, and constants rot.
+    """
+    from largeliterarymodels import costs
+
+    kw = dict(fresh=args.fresh, cached=args.cached, output=args.output,
+              cache_write_5m=args.cache_write, batch=args.batch,
+              on=args.on, times=args.times)
+
+    if args.model:
+        est = costs.price(args.model, prefix_tokens=args.prefix_tokens, **kw)
+        print(f"{est['provider']}/{est['model']}"
+              f"{'  [batch]' if args.batch else ''}: ${est['usd']:.4f}"
+              f"   (prices fetched {est['pricing_date']})")
+        for k, v in est["lines"].items():
+            print(f"    {k:<16} ${v:.4f}")
+        for w in est["warnings"]:
+            print(f"    ! {w}")
+        return 0
+
+    rows = costs.compare(providers=[args.provider] if args.provider else None,
+                         **kw)
+    print(f"workload: {args.fresh:,} fresh + {args.cached:,} cached input, "
+          f"{args.output:,} output"
+          + (f", x{args.times}" if args.times > 1 else "")
+          + f"   (prices fetched {costs.pricing_date()})")
+    if args.batch:
+        print("BATCH pricing where the provider offers it "
+              "(deepseek does not).")
+    print(f"\n  {'provider':<10} {'model':<32} {'COST':>10}")
+    print("  " + "-" * 56)
+    for est in rows:
+        floor = any("FLOOR" in w for w in est["warnings"])
+        print(f"  {est['provider']:<10} {est['model']:<32} "
+              f"{est['usd']:>10.2f}{' *floor' if floor else ''}")
+    print("\n  *floor: the model cannot stop reasoning; a non-reasoning "
+          "workload priced against it is a floor, not an estimate.")
+    return 0
+
+
 def _run_model(task, prompts, metas, model_id, num_workers):
     """Run one model over all prompts, return list[Result|None]."""
     if num_workers <= 1 or len(prompts) == 1:
@@ -429,6 +474,33 @@ def build_parser() -> argparse.ArgumentParser:
                          'piped to a second coder as-is')
     sp.add_argument('--output', '-o', default=None, help='write to file')
     sp.set_defaults(func=cmd_render)
+
+    sp = sub.add_parser(
+        'price',
+        help='price a measured workload against one model or the table')
+    sp.add_argument('--fresh', type=int, default=0,
+                    help='uncached input tokens')
+    sp.add_argument('--cached', type=int, default=0,
+                    help='cache-read input tokens')
+    sp.add_argument('--output', type=int, default=0, help='output tokens')
+    sp.add_argument('--cache-write', type=int, default=0,
+                    help='cache-write tokens (5m TTL)')
+    sp.add_argument('--prefix-tokens', type=int, default=None,
+                    help='cacheable-prefix size; enables the cache-floor '
+                         'check on prospective estimates')
+    sp.add_argument('--model', default=None,
+                    help='price one model (tag, alias, or full id) instead '
+                         'of ranking the table')
+    sp.add_argument('--provider',
+                    choices=('anthropic', 'openai', 'deepseek', 'google'))
+    sp.add_argument('--batch', action='store_true',
+                    help='apply batch discounts where the provider has one')
+    sp.add_argument('--times', type=int, default=1,
+                    help='multiply the workload (e.g. 3 coder arms)')
+    sp.add_argument('--on', default=None,
+                    help='pricing date YYYY-MM-DD (dated rows, e.g. '
+                         'sonnet-5 introductory pricing)')
+    sp.set_defaults(func=cmd_price)
 
     sp = sub.add_parser('smoke', help='run task on fixtures')
     sp.add_argument('task')

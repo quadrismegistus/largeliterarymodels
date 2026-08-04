@@ -16,7 +16,10 @@ def available_models(verbose=False):
     if "GEMINI_API_KEY" in keys:
         models.extend(["gemini-2.5-flash", "gemini-2.5-pro"])
     if "DEEPSEEK_API_KEY" in keys:
-        models.extend(["deepseek/deepseek-chat"])
+        # The API lists only these two; 'deepseek-chat'/'deepseek-reasoner'
+        # are retired aliases that silently resolve to flash, so don't
+        # advertise them. See providers._DEEPSEEK_LEGACY_ALIASES.
+        models.extend(["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"])
     return models
 
 

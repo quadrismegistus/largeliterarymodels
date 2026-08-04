@@ -265,6 +265,48 @@ Measured 2026-07-30, `claude-sonnet-5`, PassageFormTask instrument (6,863 tokens
   (retries accumulate). Output tokens per item are a free difficulty signal —
   no need to re-tokenise the text.
 
+## Costing
+
+`costs.py` prices workloads against the packaged multi-provider table
+(`largeliterarymodels/model_pricing.json` — Anthropic/OpenAI/DeepSeek/Google,
+fetched with source URLs; every estimate prints the fetch date, because a
+pricing table is a constants file and constants rot). Validated against a
+real invoice: predicted $1.8511, billed $1.86 — pinned as a test.
+
+```python
+from largeliterarymodels import costs
+results = task.map(prompts)
+costs.print_report(task.model, task.usage.report())   # this run, priced
+costs.price("gemini-3.6-flash", fresh=74e6, output=14e6)  # counterfactual
+```
+
+`litmod price --fresh N --cached N --output N [--model M | --provider P]
+[--batch] [--prefix-tokens N] [--on DATE]` does it from the shell.
+
+What the numbers know that a naive rate-card lookup does not:
+- **`cached: null` means NO cache tier** — those tokens bill at full input
+  rate, the largest driver on high-cache workloads.
+- **Prospective estimates are cache-floor-aware**: pass `prefix_tokens` (the
+  old `estimate()` API passes it automatically) and a prefix below the
+  model's floor re-bills at full rate with the padding economics stated,
+  instead of promising a discount the provider silently declines. Floors
+  come from `providers.cache_minimum_tokens` — one source, not two.
+- **Reasoning floors follow measured behaviour**, not the vendor's product
+  tier: fable is `reasoning: false` as a product and unavoidable-thinking
+  as a fact; the FLOOR warning follows the fact.
+- **Dated rows**: sonnet-5's introductory pricing ends 2026-08-31 (a 44%
+  jump); `on=` selects the row and estimates within 30 days of a boundary
+  warn.
+- **Batch discounts are per-provider facts**: anthropic/openai/google 0.5,
+  deepseek has NO batch API — requesting batch there prices at list, loudly.
+
+The stash stores only response text, so token counts die with the process —
+a past run cannot be priced from the stash. `Task(usage_log=True)` appends
+one JSONL record per batch (batch totals + per-item rows incl.
+`response_model`) to `data/usage_logs/<task>.jsonl`;
+`costs.price_report(rec["model"], rec["batch"])` prices it later. Additive:
+no stash value or key is touched.
+
 ## Provider routing
 
 `providers.py:route_provider()` dispatches on model string prefix:

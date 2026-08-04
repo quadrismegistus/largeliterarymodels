@@ -931,7 +931,12 @@ def effective_temperature(model, temperature, thinking="auto"):
         return None
     if _routes_to_anthropic(m) and not _supports_temperature(model):
         return None
-    if _routes_to_deepseek(m) and thinking_fingerprint(model, thinking) == "enabled":
+    if _routes_to_deepseek(m) and thinking_fingerprint(model, thinking) != "disabled":
+        # Anything short of an explicit disable leaves DeepSeek thinking —
+        # including thinking=None (send nothing, take the default, which
+        # reasons) — and thinking mode ignores temperature. `!= "disabled"`,
+        # not `== "enabled"`: the None case is the one a key would otherwise
+        # record a temperature for.
         return None
     return temperature
 

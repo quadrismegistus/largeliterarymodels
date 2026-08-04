@@ -482,6 +482,64 @@ def _sampling_fingerprint(model, temperature, kwargs):
             thinking_fingerprint(model, thinking))
 
 
+_WARNED_LEGACY_READS = set()
+
+
+def _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp):
+    """The old-schema key fields to ALSO try on a read miss, or None.
+
+    The provenance key schema (effective temperature, thinking state) orphans
+    two kinds of pre-schema entries, and only one deserves it:
+
+      * entries whose producing call BEHAVED differently — DeepSeek and
+        sonnet-5/opus-5 extract output from when thinking ran by default.
+        Serving those under a thinking-off key is the poisoning the schema
+        exists to prevent. No fallback, on purpose.
+      * entries whose key merely CARRIED an inert field — a temperature the
+        model rejected (opus-4-7/4-8, fable, claude-cli) or ignored. The
+        annotation is byte-for-byte what an identical call would produce
+        today; orphaning it re-bills real annotation stock for nothing, and
+        on the disabled claude-cli path converts a cached read into a hard
+        RuntimeError.
+
+    The predicate separating them is exact: this call sends a thinking
+    parameter iff thinking_fp is not None, and old code never sent one — so
+    when thinking_fp is None the old call and this call hit the same API
+    default and behaved identically, and the only key difference is the
+    recorded-but-inert temperature. This is deliberately NOT a user flag:
+    key identity must not depend on ambient configuration, and a flag's
+    state is recorded nowhere — the fallback is applied exactly where it is
+    provably safe and nowhere else.
+    """
+    if thinking_fp is not None or eff_temp == temperature:
+        return None
+    return {"temperature": temperature}
+
+
+def _stash_read(stash, key, legacy_key, model):
+    """(hit, value) for `key`, falling back to a safe legacy-schema key.
+
+    A legacy hit is copied forward under the new key, so the migration is
+    one read per item and the legacy schema ages out of the hot path.
+    """
+    if key in stash:
+        return True, stash[key]
+    if legacy_key is not None and legacy_key in stash:
+        value = stash[legacy_key]
+        stash[key] = value
+        if model not in _WARNED_LEGACY_READS:
+            _WARNED_LEGACY_READS.add(model)
+            log.info(
+                "%s: served from a pre-provenance-schema cache key (the old "
+                "key recorded a temperature the model never applied; the "
+                "annotation itself is identical) and copied forward under "
+                "the new key. This is once-per-item; no action needed.",
+                model,
+            )
+        return True, value
+    return False, None
+
+
 def _custom_key(cache_key, model, schema_name=None):
     """A caller-supplied stash key, completed with the coder's identity.
 
@@ -816,15 +874,27 @@ class LLM:
         )
         eff_temp, thinking_fp = _sampling_fingerprint(
             self.model, temperature, kwargs)
+        legacy_key = None
         if cache_key is not None:
+            # No legacy fallback for custom keys: a bare pre-schema custom
+            # key could hold ANY model's annotation — that ambiguity is the
+            # defect, not an inert field.
             key = _custom_key(cache_key, self.model)
         else:
             key = _make_key(prompt, self.model, system_prompt, eff_temp,
                             max_tokens, images=images, metadata=metadata,
                             thinking=thinking_fp)
+            legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
+                                        thinking_fp)
+            if legacy is not None:
+                legacy_key = _make_key(prompt, self.model, system_prompt,
+                                       legacy["temperature"], max_tokens,
+                                       images=images, metadata=metadata)
 
-        if not force and key in self.stash:
-            return self.stash[key]
+        if not force:
+            hit, value = _stash_read(self.stash, key, legacy_key, self.model)
+            if hit:
+                return value
 
         result = _call_provider(
             prompt=prompt,
@@ -873,15 +943,25 @@ class LLM:
         s_name = _schema_name(schema)
         eff_temp, thinking_fp = _sampling_fingerprint(
             self.model, temperature, kwargs)
+        legacy_key = None
         if cache_key is not None:
             key = _custom_key(cache_key, self.model, schema_name=s_name)
         else:
             key = _make_key(user_prompt, self.model, full_system, eff_temp,
                             max_tokens, schema_name=s_name, images=images,
                             metadata=metadata, thinking=thinking_fp)
+            legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
+                                        thinking_fp)
+            if legacy is not None:
+                legacy_key = _make_key(user_prompt, self.model, full_system,
+                                       legacy["temperature"], max_tokens,
+                                       schema_name=s_name, images=images,
+                                       metadata=metadata)
 
-        if not force and key in self.stash:
-            cached = self.stash[key]
+        hit, cached = (False, None)
+        if not force:
+            hit, cached = _stash_read(self.stash, key, legacy_key, self.model)
+        if hit:
             if isinstance(cached, str):
                 try:
                     return _validate_parsed(_parse_json_response(cached), schema)
@@ -993,14 +1073,23 @@ class LLM:
 
         eff_temp, thinking_fp = _sampling_fingerprint(
             self.model, temperature, kwargs)
+        legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
+                                    thinking_fp)
         for i, prompt in enumerate(prompts):
             images = images_list[i] if images_list else None
             metadata = metadata_list[i] if metadata_list else None
             key = _make_key(prompt, self.model, system_prompt, eff_temp,
                             max_tokens, images=images, metadata=metadata,
                             thinking=thinking_fp)
-            if not force and key in self.stash:
-                results[i] = self.stash[key]
+            legacy_key = None if legacy is None else _make_key(
+                prompt, self.model, system_prompt, legacy["temperature"],
+                max_tokens, images=images, metadata=metadata)
+            hit, value = (False, None)
+            if not force:
+                hit, value = _stash_read(self.stash, key, legacy_key,
+                                         self.model)
+            if hit:
+                results[i] = value
             else:
                 to_compute.append((i, prompt, key, images))
 
@@ -1168,14 +1257,23 @@ class LLM:
 
         eff_temp, thinking_fp = _sampling_fingerprint(
             self.model, temperature, kwargs)
+        legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
+                                    thinking_fp)
         for i, prompt in enumerate(prompts):
             images = images_list[i] if images_list else None
             metadata = metadata_list[i] if metadata_list else None
             key = _make_key(prompt, self.model, full_system, eff_temp,
                             max_tokens, schema_name=s_name, images=images,
                             metadata=metadata, thinking=thinking_fp)
-            if not force and key in self.stash:
-                cached = self.stash[key]
+            legacy_key = None if legacy is None else _make_key(
+                prompt, self.model, full_system, legacy["temperature"],
+                max_tokens, schema_name=s_name, images=images,
+                metadata=metadata)
+            hit, cached = (False, None)
+            if not force:
+                hit, cached = _stash_read(self.stash, key, legacy_key,
+                                          self.model)
+            if hit:
                 if isinstance(cached, str):
                     try:
                         result = _validate_parsed(_parse_json_response(cached), schema)

@@ -172,12 +172,23 @@ Measured 2026-07-30, `claude-sonnet-5`, PassageFormTask instrument (6,863 tokens
   asserting `temperature: 0.0` on a model that rejected it plants a false
   methods claim in the durable artifact. Keys record `thinking` only when a
   thinking parameter is actually sent, and temperature as None where it is
-  known-rejected (Sonnet 5/Opus 5/Fable) or known-ignored (DeepSeek thinking
-  mode) — so pre-thinking-era caches stay byte-stable and reachable, while
-  sonnet-5/opus-5/deepseek extract caches from before this change are
-  deliberately orphaned: their provenance was compromised anyway. Custom
-  `cache_key=` dicts gain `model`/`schema` via setdefault (keys that already
-  carry `model`, like SequentialTask's chunk keys, are untouched).
+  known-rejected (Sonnet 5/Opus 5/Fable, Opus 4.7/4.8, claude-cli) or
+  known-ignored (DeepSeek in anything but explicit disabled). Pre-schema
+  entries split two ways, and only one stays orphaned:
+  **behaviour-differed** entries (sonnet-5/opus-5/deepseek extract, produced
+  with thinking on and uncontrolled sampling) are deliberately unreachable —
+  serving them under a thinking-off key is the poisoning the schema
+  prevents; **inert-field** entries (Opus 4.7/4.8, Fable, claude-cli — the
+  old key recorded a temperature that never applied, so the annotation is
+  byte-identical to a fresh call's) are served by a read-only legacy
+  fallback and copied forward under the new key. The predicate is exact:
+  a legacy read is offered iff this call sends no thinking parameter,
+  which is what old code always did. Deliberately NOT a flag — key
+  identity must not depend on ambient configuration that nothing records.
+  Custom `cache_key=` dicts gain `model`/`schema` via setdefault (keys that
+  already carry `model`, like SequentialTask's chunk keys, are untouched;
+  bare custom keys get no legacy fallback — a pre-schema custom key could
+  hold any model's annotation, and that ambiguity is the defect).
 - **The prompt cache is real and measurable, not assumed.** An 8-item batch at
   `num_workers=3` recorded one 6,863-token write and 48,041 tokens of reads —
   87% hit rate. Read it via `task.usage.summary_line()` / `.report()`.

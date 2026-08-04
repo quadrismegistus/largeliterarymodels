@@ -1244,3 +1244,122 @@ class TestSequentialTaskRefusesToFabricate:
             q.render_instrument(item="x")
         with pytest.raises(NotImplementedError):
             q.administration_record()
+
+
+class TestLegacyKeyReads:
+    """The provenance key schema must orphan ONLY the entries whose
+    producing call behaved differently (thinking-on DeepSeek/sonnet-5).
+    Entries whose old key merely carried an inert temperature — a value the
+    model rejected or the transport dropped — are byte-identical to what an
+    identical call produces today, and orphaning them re-bills real
+    annotation stock (and turns claude-cli cached reads into RuntimeErrors,
+    on the one task whose model string was kept precisely to preserve its
+    cache). This is deliberately not a user flag: key identity must not
+    depend on ambient configuration nothing records."""
+
+    def _seed_legacy(self, stash, model, temperature=0.0):
+        from largeliterarymodels.llm import (_build_extract_prompt, _make_key,
+                                             _schema_name)
+        from tests.test_regressions import Out
+        full_system, user_prompt = _build_extract_prompt("p", Out)
+        old_key = _make_key(user_prompt, model, full_system, temperature,
+                            4096, schema_name=_schema_name(Out))
+        stash[old_key] = '{"x": 42}'
+        return old_key
+
+    def _llm(self, model):
+        from largeliterarymodels.llm import LLM
+        from tests.test_regressions import FakeStash
+        return LLM(model, stash=FakeStash())
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_fable_reads_its_pre_schema_cache(self, mock_call):
+        """Fable's thinking was on then and is on now (cannot disable) —
+        the old entry is what an identical call produces today."""
+        from tests.test_regressions import Out
+        llm = self._llm("claude-fable-5")
+        self._seed_legacy(llm.stash, "claude-fable-5")
+        result = llm.extract("p", Out, retries=0, temperature=0.0)
+        assert result.x == 42
+        assert mock_call.call_count == 0, "must not re-bill the annotation"
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_opus_4_7_reads_its_pre_schema_cache(self, mock_call):
+        from tests.test_regressions import Out
+        llm = self._llm("claude-opus-4-7")
+        self._seed_legacy(llm.stash, "claude-opus-4-7")
+        assert llm.extract("p", Out, retries=0, temperature=0.0).x == 42
+        assert mock_call.call_count == 0
+
+    def test_claude_cli_cached_reads_do_not_touch_the_disabled_provider(
+            self, monkeypatch):
+        """A cache miss on claude-cli raises through the disabled provider;
+        the legacy read must satisfy it before routing happens at all."""
+        from tests.test_regressions import Out
+        monkeypatch.delenv("LITMOD_ALLOW_CLAUDE_CLI", raising=False)
+        llm = self._llm("claude-cli/sonnet")
+        self._seed_legacy(llm.stash, "claude-cli/sonnet")
+        assert llm.extract("p", Out, retries=0, temperature=0.0).x == 42
+
+    @patch("largeliterarymodels.llm._call_provider", return_value='{"x": 1}')
+    def test_sonnet_5_thinking_on_entries_stay_orphaned(self, mock_call):
+        """The old sonnet-5 entry is thinking-on output with uncontrolled
+        sampling; the thinking-off call must NOT be served it."""
+        from tests.test_regressions import Out
+        llm = self._llm("claude-sonnet-5")
+        self._seed_legacy(llm.stash, "claude-sonnet-5")
+        assert llm.extract("p", Out, retries=0, temperature=0.0).x == 1
+        assert mock_call.call_count == 1, "the orphan must not be served"
+
+    @patch("largeliterarymodels.llm._call_provider", return_value='{"x": 1}')
+    def test_deepseek_thinking_on_entries_stay_orphaned(self, mock_call):
+        from tests.test_regressions import Out
+        llm = self._llm("deepseek/deepseek-v4-pro")
+        self._seed_legacy(llm.stash, "deepseek/deepseek-v4-pro",
+                          temperature=0.7)
+        assert llm.extract("p", Out, retries=0, temperature=0.7).x == 1
+        assert mock_call.call_count == 1
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_legacy_hit_is_copied_forward(self, mock_call):
+        """One legacy read per item: the second read must hit the NEW key."""
+        from tests.test_regressions import Out
+        llm = self._llm("claude-fable-5")
+        old_key = self._seed_legacy(llm.stash, "claude-fable-5")
+        llm.extract("p", Out, retries=0, temperature=0.0)
+        del llm.stash[llm.stash._k(old_key)]
+        assert llm.extract("p", Out, retries=0, temperature=0.0).x == 42
+        assert mock_call.call_count == 0
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_batch_path_reads_legacy_too(self, mock_call):
+        from tests.test_regressions import Out
+        llm = self._llm("claude-opus-4-8")
+        self._seed_legacy(llm.stash, "claude-opus-4-8")
+        results = dict(llm.extract_imap(["p"], Out, retries=0,
+                                        temperature=0.0))
+        assert results[0].x == 42
+        assert mock_call.call_count == 0
+
+    @patch("largeliterarymodels.llm._call_provider", return_value='{"x": 1}')
+    def test_custom_cache_keys_get_no_fallback(self, mock_call):
+        """A bare pre-schema custom key could hold ANY model's annotation —
+        that ambiguity is the defect, not an inert field."""
+        from tests.test_regressions import Out, FakeStash
+        from largeliterarymodels.llm import LLM
+        stash = FakeStash()
+        stash[{"id": "item1"}] = '{"x": 42}'
+        llm = LLM("claude-fable-5", stash=stash)
+        assert llm.extract("p", Out, retries=0,
+                           cache_key={"id": "item1"}).x == 1
+        assert mock_call.call_count == 1
+
+    def test_deepseek_thinking_none_key_records_no_temperature(self):
+        """thinking=None on DeepSeek means take the default, which reasons
+        and ignores temperature — the key must not assert one. The
+        anything-but-disabled condition, not enabled-only."""
+        from largeliterarymodels.providers import effective_temperature
+        assert effective_temperature("deepseek/deepseek-v4-pro", 0.7,
+                                     None) is None
+        assert effective_temperature("deepseek/deepseek-v4-pro", 0.7,
+                                     "auto") == 0.7

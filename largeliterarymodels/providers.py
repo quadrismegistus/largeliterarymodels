@@ -168,6 +168,62 @@ def _api_kwargs(kwargs):
     return {k: v for k, v in kwargs.items() if k not in _NON_API_KWARGS}
 
 
+def openai_messages(prompt, system_prompt=None, images=None):
+    """The messages list exactly as the OpenAI-compatible sync paths build it.
+
+    Shared by call_openai, call_deepseek (text-only) and call_local, and by
+    the batch path — one constructor, so the transports cannot drift.
+    """
+    if images:
+        content = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            b64 = base64.b64encode(data).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+    return messages
+
+
+def _openai_attempt_kwargs(param, send_temperature, temperature, max_tokens,
+                           extra):
+    """One attempt's request kwargs — the single constructor _chat_completion
+    builds every attempt from and openai_request_body wraps for batch."""
+    kwargs = dict(extra)
+    kwargs[param] = max_tokens
+    if send_temperature and temperature is not None:
+        kwargs["temperature"] = temperature
+    return kwargs
+
+
+def openai_request_body(provider, model, messages, temperature=0.7,
+                        max_tokens=4096, **extra):
+    """A complete chat-completions body for one BATCH request line.
+
+    Consults the same repair memos the sync path learns from — which is
+    why the batch path probes one item sync first: a cold memo builds
+    max_tokens for a gpt-5 model and 50,000 requests fail at once where
+    the sync loop would have healed the first 400.
+    """
+    memo = (provider, _strip_prefix(model))
+    body = _openai_attempt_kwargs(
+        _TOKEN_PARAM.get(memo, "max_tokens"),
+        memo not in _NO_TEMPERATURE,
+        temperature, max_tokens, extra,
+    )
+    body["model"] = _strip_prefix(model)
+    body["messages"] = messages
+    return body
+
+
 def _chat_completion(client, provider, model, messages, temperature, max_tokens,
                      usage_sink=None, dropped_hint=(), usage_filter=None,
                      **extra):
@@ -205,10 +261,8 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
     tried = {param}
     last_exc = None
     for _ in range(3):
-        kwargs = dict(extra)
-        kwargs[param] = max_tokens
-        if send_temperature and temperature is not None:
-            kwargs["temperature"] = temperature
+        kwargs = _openai_attempt_kwargs(param, send_temperature, temperature,
+                                        max_tokens, extra)
         try:
             response = client.chat.completions.create(
                 model=model, messages=messages, **kwargs,
@@ -1152,34 +1206,24 @@ def _response_text(content, model, stop_reason=None):
     )
 
 
-def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
-                   temperature=0.7, max_tokens=4096, images=None,
-                   timeout=None, cache_ttl=None, usage_sink=None,
-                   thinking="auto", **kwargs):
-    """Call Anthropic's Claude API directly.
+def anthropic_request_params(prompt, model="claude-sonnet-4-6",
+                             system_prompt=None, temperature=0.7,
+                             max_tokens=4096, images=None, cache_ttl=None,
+                             thinking="auto"):
+    """(api_kwargs, dropped_params) — the EXACT request the sync path sends.
 
-    Args:
-        thinking: "auto" (default) disables extended thinking on families
-            where it would otherwise run — see thinking_default. Pass None to
-            send nothing and take the API default, or an explicit dict such as
-            {"type": "adaptive"} to request it.
-        cache_ttl: Prompt-cache lifetime for the system block: None for the
-            5-minute default, or "1h". Caveat measured in the field: when a
-            5-minute entry for the same prefix is already warm, a "1h" request
-            reads it rather than establishing a 1-hour entry — so switching
-            TTL mid-batch does not extend the existing entry. The 1-hour write
-            also costs 2x base input vs 1.25x for 5 minutes, so it only pays
-            back across three or more reads.
-        usage_sink: Optional callable receiving a normalised usage dict.
+    One constructor for both transports: the sync path calls this and then
+    client.messages.create(**api_kwargs); the batch path calls this per
+    item and submits {"custom_id": ..., "params": api_kwargs}. Two request
+    builders is how sync and batch drift apart — the recurring bug class,
+    in a shape a unit test cannot catch.
+
+    Side-effects are deliberate and belong at BUILD time on both paths:
+    _report_dropped_param fires (and raises under LITMOD_STRICT_PARAMS)
+    when the family rejects temperature — constructing 10,000 batch
+    requests with a pin that will not apply should fail before money
+    moves, not after — and the cache-floor warning fires once per model.
     """
-    from anthropic import Anthropic
-
-    api_key = _get_key("ANTHROPIC_API_KEY")
-    client = _cached_client(
-        ("anthropic", api_key, timeout),
-        lambda: Anthropic(api_key=api_key) if timeout is None
-        else Anthropic(api_key=api_key, timeout=timeout),
-    )
     model = _strip_prefix(model)
 
     # Build content blocks
@@ -1231,6 +1275,44 @@ def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
                       else _normalize_thinking_anthropic(thinking))
     if thinking_param is not None:
         api_kwargs["thinking"] = thinking_param
+    return api_kwargs, tuple(dropped)
+
+
+def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
+                   temperature=0.7, max_tokens=4096, images=None,
+                   timeout=None, cache_ttl=None, usage_sink=None,
+                   thinking="auto", **kwargs):
+    """Call Anthropic's Claude API directly.
+
+    Args:
+        thinking: "auto" (default) disables extended thinking on families
+            where it would otherwise run — see thinking_default. Pass None to
+            send nothing and take the API default, or an explicit dict such as
+            {"type": "adaptive"} to request it.
+        cache_ttl: Prompt-cache lifetime for the system block: None for the
+            5-minute default, or "1h". Caveat measured in the field: when a
+            5-minute entry for the same prefix is already warm, a "1h" request
+            reads it rather than establishing a 1-hour entry — so switching
+            TTL mid-batch does not extend the existing entry. The 1-hour write
+            also costs 2x base input vs 1.25x for 5 minutes, so it only pays
+            back across three or more reads.
+        usage_sink: Optional callable receiving a normalised usage dict.
+    """
+    from anthropic import Anthropic
+
+    api_key = _get_key("ANTHROPIC_API_KEY")
+    client = _cached_client(
+        ("anthropic", api_key, timeout),
+        lambda: Anthropic(api_key=api_key) if timeout is None
+        else Anthropic(api_key=api_key, timeout=timeout),
+    )
+    api_kwargs, dropped = anthropic_request_params(
+        prompt, model=model, system_prompt=system_prompt,
+        temperature=temperature, max_tokens=max_tokens, images=images,
+        cache_ttl=cache_ttl, thinking=thinking,
+    )
+    model = api_kwargs["model"]
+    dropped = list(dropped)
 
     response = client.messages.create(**api_kwargs)
     # Rolling aliases (claude-sonnet-4-6) resolve to dated snapshots; log which.
@@ -1357,25 +1439,7 @@ def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
         else OpenAI(api_key=api_key, timeout=timeout),
     )
     model = _strip_prefix(model)
-
-    # Build content
-    if images:
-        content = []
-        for img in images:
-            data, mime = _load_image_bytes(img)
-            b64 = base64.b64encode(data).decode("utf-8")
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            })
-        content.append({"type": "text", "text": prompt})
-    else:
-        content = prompt
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": content})
+    messages = openai_messages(prompt, system_prompt, images)
 
     response = _chat_completion(
         client, "openai", model, messages, temperature, max_tokens,
@@ -1433,10 +1497,7 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
         )
         _WARNED_DEEPSEEK_ALIASES.add(model)
 
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
+    messages = openai_messages(prompt, system_prompt)
 
     body = dict(extra_body or {})
     thinking_param = (deepseek_thinking_default(model) if thinking == "auto"
@@ -1489,6 +1550,41 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
     return response.choices[0].message.content
 
 
+def google_request(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
+                   temperature=0.7, max_tokens=4096, thinking="auto",
+                   images=None):
+    """(model, contents, GenerateContentConfig, thinking_setting) — the
+    EXACT request the sync path sends, shared with the batch path so the
+    two transports cannot drift. The thinking_setting rides along because
+    the caller's post-response audit (budget-0 accepted-and-ignored) and
+    the loud-rejection wrap both key off what was actually sent.
+    """
+    from google.genai import types
+
+    model = _strip_prefix(model)
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        max_output_tokens=max_tokens,
+    )
+    if system_prompt:
+        config.system_instruction = system_prompt
+    setting = google_thinking_setting(model, thinking)
+    if setting is not None:
+        param, value = setting
+        config.thinking_config = types.ThinkingConfig(**{param: value})
+
+    if images:
+        parts = []
+        for img in images:
+            data, mime = _load_image_bytes(img)
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+        parts.append(types.Part.from_text(text=prompt))
+        contents = parts
+    else:
+        contents = prompt
+    return model, contents, config, setting
+
+
 def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None,
                 timeout=None, usage_sink=None, thinking="auto", **kwargs):
@@ -1520,29 +1616,11 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
         )
 
     client = _cached_client(("google", api_key, timeout), _make_google_client)
-    model = _strip_prefix(model)
-
-    config = types.GenerateContentConfig(
-        temperature=temperature,
-        max_output_tokens=max_tokens,
+    model, contents, config, setting = google_request(
+        prompt, model=model, system_prompt=system_prompt,
+        temperature=temperature, max_tokens=max_tokens, thinking=thinking,
+        images=images,
     )
-    if system_prompt:
-        config.system_instruction = system_prompt
-    setting = google_thinking_setting(model, thinking)
-    if setting is not None:
-        param, value = setting
-        config.thinking_config = types.ThinkingConfig(**{param: value})
-
-    # Build contents
-    if images:
-        parts = []
-        for img in images:
-            data, mime = _load_image_bytes(img)
-            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
-        parts.append(types.Part.from_text(text=prompt))
-        contents = parts
-    else:
-        contents = prompt
 
     try:
         response = client.models.generate_content(
@@ -1681,24 +1759,7 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
         else OpenAI(api_key="local", base_url=base_url, timeout=timeout),
     )
     model = _strip_prefix(model)
-
-    if images:
-        content = []
-        for img in images:
-            data, mime = _load_image_bytes(img)
-            b64 = base64.b64encode(data).decode("utf-8")
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            })
-        content.append({"type": "text", "text": prompt})
-    else:
-        content = prompt
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": content})
+    messages = openai_messages(prompt, system_prompt, images)
 
     # Disable thinking mode for qwen3.5+ which defaults to reasoning — otherwise
     # max_tokens gets burned in `reasoning_content` leaving empty `content`. The

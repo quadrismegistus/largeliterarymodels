@@ -1491,3 +1491,79 @@ class TestGeminiCacheFloorSurfaced:
             u.record({"input_tokens": 200, "output_tokens": 20,
                       "cache_read_tokens": 4200})
         assert u.cache_warning("gemini-3.6-flash") is None
+
+
+class TestRequestBuilders:
+    """One constructor per provider, shared by the sync and batch
+    transports — two builders is how they drift, in a shape a unit test
+    of either alone cannot catch. The sync wiring tests already pin that
+    call_* sends exactly what these return; these pin the builder
+    surfaces the batch path consumes."""
+
+    def test_anthropic_params_are_batch_ready(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(P, "_WARNED_NO_TEMPERATURE", set())
+        monkeypatch.delenv("LITMOD_STRICT_PARAMS", raising=False)
+        params, dropped = P.anthropic_request_params(
+            "the item", model="anthropic/claude-sonnet-5",
+            system_prompt="S" * 3000, temperature=0.0, cache_ttl="1h")
+        assert params["model"] == "claude-sonnet-5"
+        assert params["thinking"] == {"type": "disabled"}
+        assert "temperature" not in params
+        assert dropped == ("temperature",)
+        assert params["system"][0]["cache_control"] == \
+            {"type": "ephemeral", "ttl": "1h"}
+        # And a family that takes temperature keeps it.
+        params, dropped = P.anthropic_request_params(
+            "x", model="claude-sonnet-4-6", temperature=0.0)
+        assert params["temperature"] == 0.0 and dropped == ()
+
+    def test_anthropic_build_raises_under_strict(self, monkeypatch):
+        """Constructing 10,000 batch requests with a pin that will not
+        apply must fail before money moves, not after."""
+        import largeliterarymodels.providers as P
+        monkeypatch.setenv("LITMOD_STRICT_PARAMS", "1")
+        with pytest.raises(P.DroppedParameterError):
+            P.anthropic_request_params("x", model="claude-sonnet-5",
+                                       temperature=0.0)
+
+    def test_openai_body_consults_the_repair_memos(self, monkeypatch):
+        """A cold memo builds max_tokens for a gpt-5 model and 50,000
+        batch lines fail at once; the probe-first sync call warms it."""
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(P, "_TOKEN_PARAM",
+                            {("openai", "gpt-5.4-mini"):
+                             "max_completion_tokens"})
+        monkeypatch.setattr(P, "_NO_TEMPERATURE", set())
+        msgs = P.openai_messages("hi", "sys")
+        body = P.openai_request_body("openai", "openai/gpt-5.4-mini", msgs,
+                                     temperature=0.0, max_tokens=64)
+        assert body["max_completion_tokens"] == 64
+        assert "max_tokens" not in body
+        assert body["temperature"] == 0.0
+        assert body["model"] == "gpt-5.4-mini"
+        assert body["messages"][0] == {"role": "system", "content": "sys"}
+
+    def test_openai_body_respects_no_temperature_memo(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(P, "_TOKEN_PARAM", {})
+        monkeypatch.setattr(P, "_NO_TEMPERATURE", {("openai", "m")})
+        body = P.openai_request_body("openai", "m",
+                                     P.openai_messages("hi"),
+                                     temperature=0.0)
+        assert "temperature" not in body
+
+    def test_google_request_carries_the_thinking_setting(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
+        model, contents, config, setting = P.google_request(
+            "the item", model="google/gemini-3.6-flash",
+            system_prompt="sys", temperature=0.0)
+        assert model == "gemini-3.6-flash"
+        assert setting == ("thinking_level", "minimal")
+        assert "MINIMAL" in str(config.thinking_config.thinking_level).upper()
+        assert config.system_instruction == "sys"
+        model, _, config, setting = P.google_request(
+            "x", model="gemini-2.5-flash")
+        assert setting == ("thinking_budget", 0)
+        assert config.thinking_config.thinking_budget == 0

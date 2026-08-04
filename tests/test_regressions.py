@@ -1220,3 +1220,90 @@ class TestDroppedHintDedupe:
                            usage_sink=rec.append,
                            dropped_hint=("temperature",))
         assert rec[0]["dropped_params"] == ("temperature",)
+
+
+class TestGoogleThinkingDefault:
+    """Gemini reasons by default (measured: 363 thought tokens on a
+    two-field probe) and thoughts bill as output. Off by default where the
+    API permits; families that 400 on a zero budget get the Fable
+    arrangement — nothing sent, warned once — because healing the rejection
+    into a thinking-on call would store its output under a thinking-off
+    cache key."""
+
+    def test_flash_gets_budget_zero(self):
+        from largeliterarymodels.providers import google_thinking_budget
+        assert google_thinking_budget("gemini-2.5-flash") == 0
+
+    def test_cannot_disable_families_send_nothing_and_warn(self, monkeypatch,
+                                                           caplog):
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
+        with caplog.at_level("WARNING"):
+            assert P.google_thinking_budget("gemini-2.5-pro") is None
+            assert P.google_thinking_budget("gemini-3.1-pro-preview") is None
+        assert "only works in thinking mode" in caplog.text
+
+    def test_cross_provider_spellings_map(self):
+        from largeliterarymodels.providers import google_thinking_budget
+        assert google_thinking_budget("gemini-2.5-flash", None) is None
+        assert google_thinking_budget("gemini-2.5-flash", False) == 0
+        assert google_thinking_budget("gemini-2.5-flash",
+                                      {"type": "disabled"}) == 0
+        assert google_thinking_budget("gemini-2.5-flash", 128) == 128
+        with pytest.raises(ValueError):
+            google_thinking_budget("gemini-2.5-flash", object())
+
+    def test_fingerprint_splits_flash_keys_but_not_pro(self):
+        """Old flash entries are thinking-on output — they must orphan.
+        Pro's behaviour is unchanged (thinking then, thinking now), so its
+        keys must stay byte-stable."""
+        from largeliterarymodels.providers import thinking_fingerprint
+        assert thinking_fingerprint("gemini-2.5-flash") == "disabled"
+        assert thinking_fingerprint("gemini-2.5-pro") is None
+        assert thinking_fingerprint("gemini-2.5-flash", 128) == "budget:128"
+
+    def test_rejected_budget_is_loud_not_healed(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
+
+        class _Models:
+            @staticmethod
+            def generate_content(**kw):
+                raise Exception(
+                    "400 INVALID_ARGUMENT. Budget 0 is invalid. This model "
+                    "only works in thinking mode.")
+
+        client = type("C", (), {"models": _Models()})
+        monkeypatch.setattr(P, "_cached_client", lambda key, factory: client)
+        with pytest.raises(RuntimeError,
+                           match="_GOOGLE_THINKING_CANNOT_DISABLE"):
+            P.call_google("hi", model="gemini-9.9-hypothetical")
+
+    def test_budget_zero_reaches_the_config(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        seen = {}
+
+        class _Meta:
+            prompt_token_count = 10
+            candidates_token_count = 5
+            cached_content_token_count = 0
+            thoughts_token_count = None
+
+        class _Resp:
+            model_version = "gemini-2.5-flash-002"
+            usage_metadata = _Meta()
+            text = "{}"
+
+        class _Models:
+            @staticmethod
+            def generate_content(**kw):
+                seen.update(kw)
+                return _Resp()
+
+        client = type("C", (), {"models": _Models()})
+        monkeypatch.setattr(P, "_cached_client", lambda key, factory: client)
+        monkeypatch.setattr(P, "_LOGGED_RESOLUTIONS", set())
+        P.call_google("hi", model="gemini-2.5-flash")
+        assert seen["config"].thinking_config.thinking_budget == 0

@@ -606,6 +606,12 @@ def _routes_to_deepseek(model_lower):
                  or model_lower in _DEEPSEEK_API_MODELS))
 
 
+def _routes_to_google(model_lower):
+    return (not _routes_to_local(model_lower)
+            and ("gemini" in model_lower
+                 or model_lower.startswith("google/")))
+
+
 def route_provider(model):
     """Return the appropriate provider function for a model string."""
     model_lower = model.lower()
@@ -619,7 +625,7 @@ def route_provider(model):
         return call_deepseek
     elif "gpt" in model_lower or "o1" in model_lower or "o3" in model_lower or model_lower.startswith("openai/"):
         return call_openai
-    elif "gemini" in model_lower or model_lower.startswith("google/"):
+    elif _routes_to_google(model_lower):
         return call_google
     else:
         raise ValueError(
@@ -886,6 +892,60 @@ def _audit_thinking_disabled(provider, model, usage, response=None,
     return usage
 
 
+# Gemini families where thinking_budget=0 is a 400: "Budget 0 is invalid.
+# This model only works in thinking mode." (probed live 2026-08-04 on
+# 2.5-pro AND 3.1-pro-preview; 2.5-flash accepts 0 and emits no thoughts).
+# Static list, not a dynamic heal, on purpose: the cache-key fingerprint
+# must be decided before the call, and healing a rejected disable into a
+# thinking-on call would store thinking-on output under a thinking-off key
+# — the exact poisoning the fingerprint exists to prevent. A future model
+# joining this family fails LOUDLY with the API's own message plus a
+# pointer here; loud beats a silently wrong provenance record.
+_GOOGLE_THINKING_CANNOT_DISABLE = ("gemini-2.5-pro", "gemini-3.1-pro")
+
+_WARNED_GOOGLE_THINKING = set()
+
+
+def google_thinking_budget(model, thinking="auto"):
+    """The thinking_budget to send for a Gemini call, or None to send nothing.
+
+    "auto" resolves to 0 (thinking off) except on families that reject a
+    zero budget, where nothing is sent and a once-per-model warning states
+    the cost — the Fable arrangement. Callers may pass an int budget, the
+    cross-provider dict/bool spellings, or None to take the API default.
+    """
+    if thinking == "auto":
+        m = _strip_prefix(model).lower()
+        if any(_family_match(m, tag)
+               for tag in _GOOGLE_THINKING_CANNOT_DISABLE):
+            if model not in _WARNED_GOOGLE_THINKING:
+                _WARNED_GOOGLE_THINKING.add(model)
+                log.warning(
+                    "google: %r only works in thinking mode (a zero "
+                    "thinking_budget is a 400), so extraction calls bill "
+                    "thoughts as output — measured ~400 thought tokens per "
+                    "two-field probe. Use gemini-2.5-flash if that matters.",
+                    model,
+                )
+            return None
+        return 0
+    if thinking is None:
+        return None
+    if isinstance(thinking, bool):
+        return None if thinking else 0
+    if isinstance(thinking, int):
+        return thinking
+    if isinstance(thinking, str) and thinking.lower() in ("disabled", "enabled"):
+        return 0 if thinking.lower() == "disabled" else None
+    if isinstance(thinking, dict) and "type" in thinking:
+        return 0 if thinking.get("type") == "disabled" else None
+    raise ValueError(
+        f"thinking={thinking!r} is not a recognised value for a Gemini "
+        f"model. Use 'auto', None, an int thinking_budget, True/False, "
+        f"'enabled'/'disabled', or a dict with a 'type' key."
+    )
+
+
 def thinking_fingerprint(model, thinking="auto"):
     """The thinking state a call with these arguments will request, for
     cache-keying — or None when no thinking parameter would be sent.
@@ -900,6 +960,11 @@ def thinking_fingerprint(model, thinking="auto"):
     exactly the calls whose thinking state is part of their identity.
     """
     m = model.lower()
+    if _routes_to_google(m):
+        budget = google_thinking_budget(model, thinking)
+        if budget is None:
+            return None
+        return "disabled" if budget == 0 else f"budget:{budget}"
     resolved = None
     if _routes_to_anthropic(m):
         resolved = thinking_default(model) if thinking == "auto" else thinking
@@ -1314,8 +1379,18 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
 
 def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None,
-                timeout=None, usage_sink=None, **kwargs):
-    """Call Google's GenAI API directly."""
+                timeout=None, usage_sink=None, thinking="auto", **kwargs):
+    """Call Google's GenAI API directly.
+
+    Args:
+        thinking: "auto" (default) sends thinking_budget=0 on families that
+            accept it (gemini-2.5-flash) — Gemini reasons by default, and on
+            an extract call the thoughts are text we parse as JSON and
+            discard. Families that reject a zero budget (2.5-pro, 3.1-pro)
+            get nothing sent and a once-per-model cost warning, like Fable.
+            Pass None for the API default, an int for an explicit budget,
+            or the cross-provider 'disabled'/'enabled' spellings.
+    """
     from google import genai
     from google.genai import types
 
@@ -1341,6 +1416,9 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
     )
     if system_prompt:
         config.system_instruction = system_prompt
+    budget = google_thinking_budget(model, thinking)
+    if budget is not None:
+        config.thinking_config = types.ThinkingConfig(thinking_budget=budget)
 
     # Build contents
     if images:
@@ -1353,13 +1431,37 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
     else:
         contents = prompt
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=config,
-    )
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+    except Exception as e:
+        if budget == 0 and "only works in thinking mode" in str(e):
+            # Deliberately loud, not healed: retrying without the budget
+            # would run thinking-on and store the output under a
+            # thinking-off cache key — a silently wrong provenance record,
+            # which is worse than this error.
+            raise RuntimeError(
+                f"google: {model!r} rejects thinking_budget=0 — it belongs "
+                f"in providers._GOOGLE_THINKING_CANNOT_DISABLE (thinking "
+                f"then stays on, warned once, and billed as output). "
+                f"Original error: {e}"
+            ) from e
+        raise
     _log_resolved_model("google", model,
                         getattr(response, "model_version", None))
+    if budget == 0:
+        m = getattr(response, "usage_metadata", None)
+        thoughts = getattr(m, "thoughts_token_count", None) if m else None
+        if thoughts and model not in _WARNED_THINKING_NOT_DISABLED:
+            _WARNED_THINKING_NOT_DISABLED.add(model)
+            log.warning(
+                "google: asked %r for thinking_budget=0 and it thought "
+                "anyway (%d thought tokens billed as output). Treat these "
+                "runs as thinking-mode runs.", model, thoughts,
+            )
     if usage_sink is not None:
         usage_sink(_usage_google(response))
     text = response.text

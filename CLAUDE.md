@@ -161,11 +161,20 @@ Measured 2026-07-30, `claude-sonnet-5`, PassageFormTask instrument (6,863 tokens
   signal and reads as clean. **Gemini reasons by default too** (found by the
   doctor's first WARN sweep, 2026-08-04: 363 thought tokens against 14
   answer tokens on the two-field probe) and its `thoughts_token_count` is
-  *not* included in `candidates_token_count` — usage now sums them so
-  output_tokens means billed-output everywhere. No thinking-off default is
-  wired for Google yet (2.5-pro cannot disable; flash could via
-  `thinking_budget=0`) — `litmod doctor` WARNs on every Google tier until
-  someone does, which is the honest state.
+  *not* included in `candidates_token_count` — usage sums them so
+  output_tokens means billed-output everywhere. `google_thinking_budget`
+  now sends `thinking_budget=0` by default; measured on the same probe,
+  flash drops from 377 billed output tokens to 14. gemini-2.5-pro and
+  gemini-3.1-pro "only work in thinking mode" (probed: budget 0 is a 400),
+  so they get the Fable arrangement — nothing sent, warned once, doctor
+  WARNs — and a future model joining that family fails loudly with a
+  pointer to `_GOOGLE_THINKING_CANNOT_DISABLE` rather than being healed
+  into a thinking-on call whose output would land under a thinking-off
+  cache key. Old flash extract keys orphan (thinking-on output);
+  pro/3.1-pro keys are byte-stable (behaviour unchanged). OpenAI's gpt-5.4
+  tier is reasoning-capable but measured ZERO reasoning tokens on all
+  three doctor probes — nothing to cut, so nothing was changed on no
+  evidence.
 - **The cache key carries the thinking state and the *effective*
   temperature.** Thinking-on and thinking-off output must never share a key
   (a non-forced rerun would hand back one as the other, silently), and a key

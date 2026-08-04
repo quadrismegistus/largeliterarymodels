@@ -1401,3 +1401,100 @@ class TestClosingReviewFixesLLM:
                 task.map([f"i{n}" for n in range(12)], num_workers=4,
                          fail_fast=1)
         assert "extract_imap usage:" in caplog.text
+
+
+class TestUsageLogSidecar:
+    """The stash stores only response text; token counts die with the
+    process, so a past run cannot be priced (Registration P's pricing
+    worked only because that producer kept its own artifact). usage_log
+    persists the receipts additively — no stash value or key changes."""
+
+    def _task(self, tmp_path, monkeypatch, **kw):
+        import largeliterarymodels.task as task_mod
+        monkeypatch.setattr(task_mod, "STASH_PATH",
+                            str(tmp_path / "stash"))
+
+        class T(Task):
+            schema = Sentiment
+            system_prompt = "Assess."
+            retries = 0
+            usage_log = True
+        T.name = "usage_log_probe"
+        t = T(**kw)
+        t._stash = HashStash(engine="memory").clear()
+        return t, tmp_path / "usage_logs" / "usage_log_probe.jsonl"
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_batch_appends_one_record_with_item_rows(self, mock_call,
+                                                     tmp_path, monkeypatch):
+        import json as _json
+
+        def provider(**kw):
+            kw["usage_sink"]({"input_tokens": 10, "output_tokens": 7,
+                              "reasoning_tokens": 0,
+                              "response_model": "served-x"})
+            return '{"sentiment": "positive", "confidence": 0.9}'
+        mock_call.side_effect = provider
+        task, path = self._task(tmp_path, monkeypatch)
+        task.map(["a", "b"], num_workers=1,
+                 metadata_list=[{"id": "m1"}, {"id": "m2"}])
+        records = [_json.loads(l) for l in open(path)]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["batch"]["output_tokens"] == 14
+        assert rec["batch"]["response_models"] == {"served-x": 2}
+        assert rec["items"][0]["metadata"] == {"id": "m1"}
+        assert rec["ts"]
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_record_is_priceable(self, mock_call, tmp_path, monkeypatch):
+        """The point of the sidecar: a later process prices the run from
+        the log alone."""
+        import json as _json
+        from largeliterarymodels import costs
+
+        def provider(**kw):
+            kw["usage_sink"]({"input_tokens": 1000, "output_tokens": 200,
+                              "cache_read_tokens": 5000})
+            return '{"sentiment": "neutral", "confidence": 0.5}'
+        mock_call.side_effect = provider
+        task, path = self._task(tmp_path, monkeypatch)
+        task.map(["a", "b", "c"], num_workers=1,
+                 model="claude-sonnet-4-6")
+        rec = _json.loads(open(path).read())
+        est = costs.price_report(rec["model"], rec["batch"])
+        assert est["usd"] > 0
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_two_batches_two_records_not_cumulative(self, mock_call,
+                                                    tmp_path, monkeypatch):
+        import json as _json
+
+        def provider(**kw):
+            kw["usage_sink"]({"input_tokens": 10, "output_tokens": 5})
+            return '{"sentiment": "positive", "confidence": 0.9}'
+        mock_call.side_effect = provider
+        task, path = self._task(tmp_path, monkeypatch)
+        task.map(["a"], num_workers=1)
+        task.map(["b"], num_workers=1, force=True)
+        records = [_json.loads(l) for l in open(path)]
+        assert len(records) == 2
+        assert records[1]["batch"]["output_tokens"] == 5, \
+            "second record must not carry the first batch's tokens"
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_off_by_default_writes_nothing(self, mock_call, tmp_path,
+                                           monkeypatch):
+        import largeliterarymodels.task as task_mod
+        monkeypatch.setattr(task_mod, "STASH_PATH", str(tmp_path / "stash"))
+        mock_call.return_value = '{"sentiment": "positive", "confidence": 0.9}'
+
+        class T(Task):
+            schema = Sentiment
+            system_prompt = "Assess."
+            retries = 0
+        T.name = "no_log_probe"
+        t = T()
+        t._stash = HashStash(engine="memory").clear()
+        t.map(["a"], num_workers=1)
+        assert not (tmp_path / "usage_logs").exists()

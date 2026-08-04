@@ -65,6 +65,13 @@ class Task:
     # request reads an already-warm 5-minute entry instead of upgrading it,
     # so set this before a run rather than partway through.
     cache_ttl = None
+    # Opt-in durable usage receipts. The stash stores only the response
+    # text, so token counts — and with them any post-hoc price estimate —
+    # die with the process. usage_log=True appends one JSONL record per
+    # map() batch (run report + per-item rows: tokens, reasoning,
+    # response_model) to data/usage_logs/<task_name>.jsonl. Additive: no
+    # stash value or key is touched, old entries simply have no log rows.
+    usage_log = False
 
     # Attributes settable via __init__ kwargs even when the class doesn't
     # declare them (subclasses commonly set `model` as a class attribute,
@@ -265,15 +272,68 @@ class Task:
         if self.schema is None:
             raise ValueError(f"Task '{self.name}' has no schema defined.")
         llm = self._get_llm(model)
-        return llm.extract_map(
+        # With usage_log on, per-item usage is collected whether or not the
+        # caller asked for it — the durable record needs the rows either way.
+        log_items = {} if (self.usage_log and per_item_usage is None) \
+            else per_item_usage
+        results = llm.extract_map(
             prompts=prompts,
             **self._imap_kwargs(system_prompt=system_prompt, examples=examples,
                                 images_list=images_list,
                                 metadata_list=metadata_list,
                                 num_workers=num_workers, force=force,
                                 verbose=verbose, errors=errors,
-                                per_item_usage=per_item_usage, **kwargs),
+                                per_item_usage=log_items, **kwargs),
         )
+        if self.usage_log:
+            self._append_usage_log(llm, log_items, metadata_list)
+        return results
+
+    def _append_usage_log(self, llm, per_item, metadata_list):
+        """Append this batch's usage receipts as one JSONL record.
+
+        The stash stores only response text, so token counts (and any
+        post-hoc price estimate) are otherwise unrecoverable once the
+        process exits — Registration P's pricing worked only because that
+        producer kept its own artifact. One record per batch: timestamp,
+        model, the batch report, and per-item rows keyed by index with
+        metadata attached where given. Fully-cached batches log a report
+        of zeros — a receipt that nothing was billed is still a receipt.
+        """
+        import time
+
+        log_dir = os.path.join(os.path.dirname(STASH_PATH), "usage_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"{self.task_name}.jsonl")
+        items = []
+        for i, entry in sorted((per_item or {}).items()):
+            row = dict(entry)
+            if metadata_list and i < len(metadata_list) and metadata_list[i]:
+                row["metadata"] = metadata_list[i]
+            items.append(row)
+        # Batch totals from the per-item rows, not the Task-lifetime
+        # tracker: a record claiming to describe THIS batch must not carry
+        # every previous batch's tokens inside it.
+        token_keys = ("calls", "input_tokens", "output_tokens",
+                      "cache_read_tokens", "cache_write_tokens",
+                      "reasoning_tokens")
+        batch = {k: sum(e.get(k, 0) for e in items) for k in token_keys}
+        served = {}
+        for e in items:
+            rm = e.get("response_model")
+            if rm:
+                served[rm] = served.get(rm, 0) + 1
+        batch["response_models"] = served
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "task": self.task_name,
+            "model": llm.model,
+            "batch": batch,
+            "items": items,
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+        log.info("usage_log: appended %d item rows to %s", len(items), path)
 
     # ------------------------------------------------------------------
     # Instrument serialisation

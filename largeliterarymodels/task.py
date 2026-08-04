@@ -303,7 +303,7 @@ class Task:
     def map(self, prompts, model=None, system_prompt=None, examples=None,
             images_list=None, metadata_list=None,
             num_workers=4, force=False, verbose=False, errors=None,
-            per_item_usage=None, **kwargs):
+            per_item_usage=None, batch=False, **kwargs):
         """Extract structured data from multiple inputs, with parallelism.
 
         Like imap but collects all results into a list in prompt order.
@@ -338,15 +338,33 @@ class Task:
         pass_items = log_items if self.usage_log else per_item_usage
         log_errors = errors if errors is not None else (
             {} if self.usage_log else None)
-        results = llm.extract_map(
-            prompts=prompts,
-            **self._imap_kwargs(system_prompt=system_prompt, examples=examples,
-                                images_list=images_list,
-                                metadata_list=metadata_list,
-                                num_workers=num_workers, force=force,
-                                verbose=verbose, errors=log_errors,
-                                per_item_usage=pass_items, **kwargs),
-        )
+        if batch:
+            # The batch transport: 50% pricing where the provider offers
+            # it, identical stash keys, ledger-safe submission. See
+            # largeliterarymodels.batch.extract_batch for the contract.
+            if images_list:
+                raise ValueError(
+                    "batch=True does not carry images (payload size); use "
+                    "the concurrent path for image tasks.")
+            results = llm.extract_batch(
+                prompts, self.schema,
+                system_prompt=system_prompt or self.system_prompt,
+                examples=examples if examples is not None else self.examples,
+                metadata_list=metadata_list, force=force,
+                retries=self.retries, errors=log_errors,
+                per_item_usage=pass_items, **kwargs,
+            )
+        else:
+            results = llm.extract_map(
+                prompts=prompts,
+                **self._imap_kwargs(system_prompt=system_prompt,
+                                    examples=examples,
+                                    images_list=images_list,
+                                    metadata_list=metadata_list,
+                                    num_workers=num_workers, force=force,
+                                    verbose=verbose, errors=log_errors,
+                                    per_item_usage=pass_items, **kwargs),
+            )
         if self.usage_log:
             # A receipt must never fail the run it receipts: the results
             # exist, the stash holds them, and an unwritable log line is a

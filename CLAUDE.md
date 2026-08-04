@@ -265,6 +265,40 @@ Measured 2026-07-30, `claude-sonnet-5`, PassageFormTask instrument (6,863 tokens
   (retries accumulate). Output tokens per item are a free difficulty signal —
   no need to re-tokenise the text.
 
+## Batch transport
+
+`task.map(prompts, batch=True)` / `litmod run --batch` submits via the
+provider's batch API — **50% pricing on Anthropic, OpenAI and Google;
+DeepSeek has none (verified) and local endpoints have nothing to discount:
+both raise.** Blocks until the batch completes (usually well under the 24h
+window); `LLM.extract_batch(..., wait=False)` returns a `BatchHandle` that
+reconstructs from the ledger in a fresh process.
+
+What makes it safe to use on registered work:
+
+- **Identical stash keys.** Batch results write under exactly the keys the
+  streaming path computes — transport is not part of an administration's
+  identity — so warm reads serve batch results, a half-warm stash batches
+  only its cold half, and force/cache-cold discipline is unchanged.
+- **Ledger before money** (`data/batch_ledger/ledger.jsonl`). A rerun over
+  the same items *resumes* the open batch rather than resubmitting; a
+  process that died inside the submission call leaves the one ambiguous
+  state, which raises `AmbiguousBatchState` with operator instructions
+  rather than guessing. `force=True` resubmits deliberately.
+- **Probe-first** (default): one sync call before submission catches
+  rejected params where a batch has no repair loop, warms the OpenAI
+  param-rename memo, and is `fail_fast`'s only meaningful moment — after
+  submission the spend is committed.
+- **Receipts intact**: per-item usage with reasoning evidence and
+  `response_model`, tagged `transport: "batch"`, into `usage_log` and
+  `costs.price_report(batch=True)`.
+- **Effective discount ~48-49%**, not 50: failed/unparseable items fall
+  back to the sync path at list price (with the full retry machinery,
+  partial-field reprompts included), and the probe runs sync. Stated in
+  the completion log. Anthropic batches default `cache_ttl="1h"`.
+- No images on the batch path (payload size) — the concurrent path takes
+  those.
+
 ## Costing
 
 `costs.py` prices workloads against the packaged multi-provider table

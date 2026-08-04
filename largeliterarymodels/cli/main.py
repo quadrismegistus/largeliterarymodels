@@ -278,8 +278,12 @@ def cmd_run(args) -> int:
 
     task = task_cls()
     t0 = time.time()
-    results = task.map(prompts, model=model, metadata_list=metas,
-                       num_workers=args.num_workers, verbose=True)
+    if getattr(args, "batch", False):
+        results = task.map(prompts, model=model, metadata_list=metas,
+                           batch=True)
+    else:
+        results = task.map(prompts, model=model, metadata_list=metas,
+                           num_workers=args.num_workers, verbose=True)
     elapsed = time.time() - t0
 
     unshuffled = [None] * len(results)
@@ -578,6 +582,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--model', required=True,
                     help='short tag (sonnet, opus, qwen-35b, ...) or full ID')
     sp.add_argument('--num-workers', type=int, default=4)
+    sp.add_argument('--batch', action='store_true',
+                    help='submit via the provider batch API (50%% pricing '
+                         'on anthropic/openai/google; blocks until the '
+                         'batch completes, ledger-safe against resubmission)')
     sp.add_argument('--output', default=None,
                     help='output CSV path. Default: data/litmod_run_<task>_<model>.csv')
     sp.add_argument('--limit', type=int, default=0,

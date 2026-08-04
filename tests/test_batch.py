@@ -269,3 +269,41 @@ class TestRefusals:
         results = _run(llm, fake, ["a", "b", "c", "d", "e"], monkeypatch)
         assert len(fake.submitted) == 3
         assert all(r is not None for r in results)
+
+
+class TestTaskSurface:
+    def test_task_map_batch_true_routes_to_extract_batch(self, ledger,
+                                                         monkeypatch):
+        from hashstash import HashStash
+        from largeliterarymodels.task import Task
+        from pydantic import Field
+
+        class S(BaseModel):
+            x: int
+
+        class T(Task):
+            schema = S
+            system_prompt = "sys"
+            retries = 0
+            model = "claude-sonnet-4-6"
+        T.name = "batch_surface"
+        task = T()
+        task._stash = HashStash(engine="memory").clear()
+        fake = FakeAdapter()
+        monkeypatch.setattr(B, "_adapter_for", lambda m, t=None: fake)
+        results = task.map(["a", "b"], batch=True, probe=False)
+        assert [r.x for r in results] == [1, 1]
+        assert len(fake.submitted) == 1
+
+    def test_batch_with_images_refused(self):
+        from largeliterarymodels.task import Task
+
+        class S(BaseModel):
+            x: int
+
+        class T(Task):
+            schema = S
+            system_prompt = "sys"
+        T.name = "batch_images"
+        with pytest.raises(ValueError, match="images"):
+            T().map(["a"], batch=True, images_list=[["x.png"]])

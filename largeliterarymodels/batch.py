@@ -79,6 +79,12 @@ class AmbiguousBatchState(RuntimeError):
     (attach makes the next run resume it; abandon makes the next run
     resubmit.) This error is raised regardless of force=True: force is
     cache discipline, not permission to double-bill.
+
+    Seen on one machine but not another over the same ledger? Check NTP
+    before the ledger: the lookup's time window compares provider batch
+    timestamps against the local submission record, and clock skew fails
+    SAFE — a legitimate candidate gets dropped and you land here (a
+    false stop), never a wrong attach.
     """
 
 

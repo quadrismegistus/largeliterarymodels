@@ -134,6 +134,53 @@ class TestCaptureAndJoin:
         assert rec["failed"] == 1 and rec["recorded"] == 0
         assert "disk full" in rec["errors"][0]
 
+    def test_failed_calls_never_pollute_the_write_fault_count(
+            self, rawlog):
+        """receipt()['failed'] must count SIDECAR faults only: a call
+        that dies at the transport never reaches record(), so the two
+        kinds of 'missing' (no body to record vs body dropped) are
+        separable in-process — the separation malign-logits asked
+        whether the receipt already provides. It does; this pins it."""
+        llm = _llm(raw_log=rawlog)
+        with patch("largeliterarymodels.llm._call_provider",
+                   side_effect=ConnectionError("provider down")):
+            with pytest.raises(Exception):
+                llm.extract("a", Out, system_prompt="sys", retries=0)
+        assert rawlog.receipt() == {"recorded": 0, "failed": 0,
+                                    "errors": []}, \
+            "a transport failure is not a sidecar fault"
+        # Warm hit: annotation served from stash, no call, no body —
+        # missing from any audit, but still not a write fault.
+        stash = FakeStash()
+        llm2 = _llm(stash, raw_log=rawlog)
+        with patch("largeliterarymodels.llm._call_provider",
+                   side_effect=_provider_that_sinks({"b": 1})):
+            llm2.extract("w", Out, system_prompt="sys", retries=0)
+        before = rawlog.receipt()
+        with patch("largeliterarymodels.llm._call_provider") as never:
+            llm2.extract("w", Out, system_prompt="sys", retries=0)
+        assert never.call_count == 0 and rawlog.receipt() == before, \
+            "a warm hit records nothing and fails nothing"
+
+    def test_extraction_failures_still_leave_their_bodies(self, rawlog):
+        """The sink fires before parsing: an item whose extraction
+        failed leaves the raw record of the failure — the sidecar's
+        whole point, exercised on the least convenient path."""
+        llm = _llm(raw_log=rawlog)
+
+        def junk(**kw):
+            if kw.get("raw_sink") is not None:
+                kw["raw_sink"]({"the_actual_reply": "not json at all"})
+            return "not json at all"
+        with patch("largeliterarymodels.llm._call_provider",
+                   side_effect=junk):
+            with pytest.raises(Exception):
+                llm.extract("a", Out, system_prompt="sys", retries=0)
+        assert rawlog.receipt()["recorded"] == 1
+        [key] = list(rawlog.stash.keys())
+        assert rawlog.get(key)["body"]["the_actual_reply"] == \
+            "not json at all"
+
     def test_audit_makes_coverage_a_runnable_statement(self, rawlog):
         """'The sidecar has N of N' must be checkable against a scoped
         key set, with the missing keys named."""

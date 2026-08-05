@@ -106,6 +106,14 @@ class RawLog:
 
         'The sidecar has the bodies' is a claim about M being zero —
         state it from this, not from an absence of error lines.
+
+        M counts SIDECAR faults only, by construction: record() is
+        reached exclusively with a body in hand, after the provider
+        returned — a call that failed at the transport never fires the
+        sink, so it cannot inflate this count. (Note the converse
+        bonus: the sink fires before parsing, so items whose extraction
+        failed still leave their bodies here — the raw record of the
+        failure.)
         """
         with self._lock:
             return {"recorded": self.recorded, "failed": self.failed,
@@ -121,6 +129,18 @@ class RawLog:
         the keys of the run you are making the claim about (e.g. the
         annotation stash keys of one batch) and 'present == total' is
         a statement someone can run rather than infer.
+
+        RESIDUAL AMBIGUITY, stated rather than discovered: even scoped,
+        a missing key alone cannot say WHY it is missing — the sidecar
+        write failed, or no body ever reached the sink (a warm cache
+        hit made no call; a transport-level failure returned nothing;
+        another process annotated it with the sidecar off). This audit
+        is durable and cannot separate those. The IN-PROCESS receipt()
+        can, exactly: its failed count contains only write faults (see
+        receipt()), so the run-end claim has two parts — failed == 0
+        says no body was dropped, and this audit says which scoped keys
+        have bodies at all. State both; neither substitutes for the
+        other.
 
         Returns {'total': N, 'present': n, 'missing': [keys...]}.
         """

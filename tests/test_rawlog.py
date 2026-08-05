@@ -112,16 +112,39 @@ class TestCaptureAndJoin:
         assert len(rawlog.history(key)) == 2, \
             "every attempt's body is kept, oldest first"
 
-    def test_sidecar_failure_never_fails_the_run(self, rawlog):
+    def test_sidecar_failure_never_fails_the_run_but_is_counted(
+            self, rawlog):
+        """Never-fail alone makes completeness unverifiable: a missing
+        receipt is indistinguishable from a call never made. The failure
+        must be COUNTED so 'we have the bodies' is a claim about
+        receipt()['failed'] == 0, not about an absence of error lines."""
         llm = _llm(raw_log=rawlog)
-
-        def boom(*a, **kw):
-            raise OSError("disk full")
-        rawlog.stash.__setitem__ = boom
-        with patch("largeliterarymodels.llm._call_provider",
-                   side_effect=_provider_that_sinks({"b": 1})):
-            result = llm.extract("a", Out, system_prompt="sys", retries=0)
+        # Patch the CLASS: dunder lookup bypasses instance attributes, so
+        # an instance-level boom never fires — the first version of this
+        # test passed vacuously with the write succeeding underneath it.
+        # (llm.stash is a FakeStash, so only the sidecar store is hit.)
+        with patch.object(type(rawlog.stash), "__setitem__",
+                          side_effect=OSError("disk full")):
+            with patch("largeliterarymodels.llm._call_provider",
+                       side_effect=_provider_that_sinks({"b": 1})):
+                result = llm.extract("a", Out, system_prompt="sys",
+                                     retries=0)
         assert result.x == 1, "a receipt failure must not fail the run"
+        rec = rawlog.receipt()
+        assert rec["failed"] == 1 and rec["recorded"] == 0
+        assert "disk full" in rec["errors"][0]
+
+    def test_audit_makes_coverage_a_runnable_statement(self, rawlog):
+        """'The sidecar has N of N' must be checkable against a scoped
+        key set, with the missing keys named."""
+        keys = [{"prompt": p, "model": "m"} for p in ("a", "b", "c")]
+        rawlog.record(keys[0], {"x": 1})
+        rawlog.record(keys[2], {"x": 3})
+        report = rawlog.audit(keys)
+        assert (report["total"], report["present"]) == (3, 2)
+        assert report["missing"] == [keys[1]]
+        assert rawlog.receipt() == {"recorded": 2, "failed": 0,
+                                    "errors": []}
 
 
 class TestProviderThreading:

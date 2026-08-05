@@ -28,6 +28,7 @@ Design, settled by the same arguments that placed the batch ledger:
 """
 import logging
 import os
+import threading
 import time
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,16 @@ class RawLog:
         self.root = root or _default_root()
         self.stash = HashStash(self.root, engine="pairtree",
                                append_mode=True)
+        # Coverage counters (thread-safe: imap fans out). Never-fail
+        # writes make the run safe but would make the sidecar's own
+        # completeness unverifiable — a missing receipt is
+        # indistinguishable from a call never made (malign-logits seat).
+        # A sidecar that KNOWS how many it missed is still additive; one
+        # that only logged something is not.
+        self._lock = threading.Lock()
+        self.recorded = 0
+        self.failed = 0
+        self._errors = []
 
     @classmethod
     def resolve(cls, value):
@@ -64,7 +75,9 @@ class RawLog:
         """Append one serialized response under the annotation's key.
 
         Never raises: the sidecar documents a run, so a failure to
-        document must not become a failure of the run.
+        document must not become a failure of the run. But it COUNTS:
+        read receipt() before claiming this run's bodies are all here.
+        Returns True if the entry landed.
         """
         try:
             self.stash[key] = {
@@ -75,9 +88,46 @@ class RawLog:
                 "body": body,
             }
         except Exception as e:  # noqa: BLE001 — receipt-write discipline
+            with self._lock:
+                self.failed += 1
+                if len(self._errors) < 10:
+                    self._errors.append(f"{type(e).__name__}: {e}")
             log.error("raw_log: failed to record response (%s: %s) — the "
-                      "run continues; only the sidecar entry is lost",
-                      type(e).__name__, e)
+                      "run continues; only the sidecar entry is lost "
+                      "(failure COUNTED: receipt()['failed'] is now %d)",
+                      type(e).__name__, e, self.failed)
+            return False
+        with self._lock:
+            self.recorded += 1
+        return True
+
+    def receipt(self):
+        """This process's coverage: {'recorded': N, 'failed': M, ...}.
+
+        'The sidecar has the bodies' is a claim about M being zero —
+        state it from this, not from an absence of error lines.
+        """
+        with self._lock:
+            return {"recorded": self.recorded, "failed": self.failed,
+                    "errors": list(self._errors)}
+
+    def audit(self, keys):
+        """Durable, post-hoc coverage over a SCOPED key set: which of
+        these annotation keys have at least one sidecar body?
+
+        The scoping is the point — over an unscoped historical stash,
+        'missing' conflates 'the write failed' with 'the sidecar was
+        off when this was annotated', which are different claims. Pass
+        the keys of the run you are making the claim about (e.g. the
+        annotation stash keys of one batch) and 'present == total' is
+        a statement someone can run rather than infer.
+
+        Returns {'total': N, 'present': n, 'missing': [keys...]}.
+        """
+        keys = list(keys)
+        missing = [k for k in keys if self.get(k) is None]
+        return {"total": len(keys), "present": len(keys) - len(missing),
+                "missing": missing}
 
     def get(self, key):
         """Latest recorded envelope for an annotation key, or None."""

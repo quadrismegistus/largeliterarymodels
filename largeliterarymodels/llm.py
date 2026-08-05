@@ -864,13 +864,15 @@ class LLM:
         from .rawlog import RawLog
         self.raw_log = RawLog.resolve(raw_log)
 
-    def _raw_sink(self, key, transport):
+    def _raw_sink(self, key, transport, attempt=None):
         """Sink recording a serialized provider body under `key`, or None
         when the sidecar is off (None means providers do no raw work)."""
         if self.raw_log is None:
             return None
+        provider = route_provider(self.model).__name__.replace("call_", "")
         return lambda body: self.raw_log.record(
-            key, body, transport=transport, model=self.model)
+            key, body, transport=transport, model=self.model,
+            provider=provider, attempt=attempt)
 
     def _provider_kwargs(self, kwargs):
         """Per-call provider options this instance contributes.
@@ -938,6 +940,8 @@ class LLM:
             if hit:
                 return value
 
+        call_kwargs = self._provider_kwargs(kwargs)
+        call_kwargs.setdefault("raw_sink", self._raw_sink(key, "sync"))
         result = _call_provider(
             prompt=prompt,
             model=self.model,
@@ -945,8 +949,7 @@ class LLM:
             temperature=temperature,
             max_tokens=max_tokens,
             images=images,
-            raw_sink=self._raw_sink(key, "sync"),
-            **self._provider_kwargs(kwargs),
+            **call_kwargs,
         )
         self.stash[key] = result
         return result
@@ -1057,6 +1060,11 @@ class LLM:
             # value of the X field" — a complaint about JSON that this
             # attempt never produced.
             parsed = None
+            call_kwargs = self._provider_kwargs(kwargs)
+            call_kwargs.setdefault(
+                "raw_sink",
+                self._raw_sink(key, raw_transport or "sync",
+                               attempt=attempt))
             try:
                 raw = _call_provider(
                     prompt=call_prompt,
@@ -1065,8 +1073,7 @@ class LLM:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     images=images,
-                    raw_sink=self._raw_sink(key, raw_transport or "sync"),
-                    **self._provider_kwargs(kwargs),
+                    **call_kwargs,
                 )
                 parsed = _parse_json_response(raw)
                 result = _validate_parsed(parsed, schema)
@@ -1163,6 +1170,8 @@ class LLM:
 
         def _do_one(item):
             i, prompt, key, images = item
+            call_kwargs = self._provider_kwargs(kwargs)
+            call_kwargs.setdefault("raw_sink", self._raw_sink(key, "sync"))
             try:
                 result = _call_provider(
                     prompt=prompt,
@@ -1171,7 +1180,7 @@ class LLM:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     images=images,
-                    **self._provider_kwargs(kwargs),
+                    **call_kwargs,
                 )
             except Exception as e:
                 log.error("map: prompt %d failed (model=%s): %s",
@@ -1190,11 +1199,18 @@ class LLM:
             self.stash[key] = result
             return i, result
 
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(_do_one, item): item for item in to_compute}
-            for future in tqdm(as_completed(futures), total=len(to_compute), desc=f"Generating ({self.model})"):
-                i, result = future.result()
-                results[i] = result
+        try:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(_do_one, item): item for item in to_compute}
+                for future in tqdm(as_completed(futures), total=len(to_compute), desc=f"Generating ({self.model})"):
+                    i, result = future.result()
+                    results[i] = result
+        finally:
+            # Firing boundary, same discipline as extract_imap's. The
+            # context manager above joined the workers, so the flushed
+            # counters are final.
+            if self.raw_log is not None:
+                self.raw_log.flush_receipt()
 
         return results
 
@@ -1461,7 +1477,6 @@ class LLM:
             partial_field = None
             call_kwargs = dict(kwargs)
             call_kwargs["usage_sink"] = _item_sink(i)
-            call_kwargs["raw_sink"] = self._raw_sink(key, "sync")
             for attempt in range(1 + retries):
                 if breaker.tripped:
                     # Another item already proved this failure is systematic.
@@ -1479,6 +1494,12 @@ class LLM:
                 # binding turned a network error into a reprompt about JSON
                 # this attempt never produced.
                 parsed = None
+                # Rebuilt per attempt for the attempt marker; a
+                # caller-supplied raw_sink in kwargs wins, matching
+                # usage_sink's setdefault discipline.
+                if "raw_sink" not in kwargs:
+                    call_kwargs["raw_sink"] = self._raw_sink(
+                        key, "sync", attempt=attempt)
                 try:
                     raw = _call_provider(
                         prompt=call_prompt,
@@ -1598,8 +1619,12 @@ class LLM:
             # counters durably. Runs fire many times (resumption is the
             # normal case), so the run-level claim is a conjunction over
             # firings — a receipt that dies with the process cannot join
-            # it.
+            # it. Join stragglers first: shutdown(wait=False) above lets
+            # already-running futures continue, and a receipt flushed
+            # under them records counters that are still moving.
             if self.raw_log is not None:
+                if "executor" in locals():
+                    executor.shutdown(wait=True)
                 self.raw_log.flush_receipt()
             # The summary covers the warm-cache pre-flight too: an abort
             # raised there previously skipped this block entirely, losing

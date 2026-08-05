@@ -75,7 +75,10 @@ class FakeAdapter:
             if cid in self.omit_cids:
                 continue
             if cid in self.fail_cids:
-                yield cid, False, None, None, "errored: boom", None
+                # Real adapters now carry the provider's error payload as
+                # raw when asked — the fake mirrors that contract.
+                yield cid, False, None, None, "errored: boom", \
+                    ({"errored": cid} if want_raw else None)
                 continue
             usage = {"input_tokens": 10, "output_tokens": 5,
                      "cache_read_tokens": 0, "cache_write_tokens": 0,

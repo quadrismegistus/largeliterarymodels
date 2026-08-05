@@ -326,7 +326,8 @@ class _AnthropicAdapter:
                     yield r.custom_id, False, None, u, str(e), raw
             else:
                 detail = str(getattr(r.result, "error", "") or "")[:200]
-                yield r.custom_id, False, None, None, f"{kind}: {detail}", None
+                raw = P.serialize_response(r.result) if want_raw else None
+                yield r.custom_id, False, None, None, f"{kind}: {detail}", raw
 
 
 class _OpenAIAdapter:
@@ -408,9 +409,11 @@ class _OpenAIAdapter:
             else:
                 yield line["custom_id"], False, None, u, "no content", raw
         for line in self._lines(getattr(batch, "error_file_id", None)):
-            err = json.dumps((line.get("response") or {}).get("body")
-                             or line.get("error") or {})[:300]
-            yield line["custom_id"], False, None, None, err, None
+            payload = ((line.get("response") or {}).get("body")
+                       or line.get("error") or {})
+            err = json.dumps(payload)[:300]
+            yield line["custom_id"], False, None, None, err, \
+                (payload if want_raw else None)
 
 
 class _GoogleAdapter:
@@ -473,7 +476,9 @@ class _GoogleAdapter:
             resp = getattr(item, "response", None)
             if resp is None:
                 err = str(getattr(item, "error", "no response"))[:300]
-                yield cid, False, None, None, err, None
+                raw = (P.serialize_response(getattr(item, "error", None))
+                       if want_raw else None)
+                yield cid, False, None, None, err, raw
                 continue
             u = P._usage_google(resp)
             raw = P.serialize_response(resp) if want_raw else None
@@ -703,10 +708,25 @@ class BatchHandle:
         # outcomes, and a trip aborts collection with the row left open.
         breaker = _Breaker(floor=(fallback_cap or 5))
         got = set()
-        n_ok, n_fallback = 0, 0
-        results = {}
-        first_error = None
         want_raw = getattr(llm, "raw_log", None) is not None
+        results = {}
+        try:
+            return self._collect_inner(
+                a, llm, schema, retries, errors, per_item_usage, breaker,
+                got, results, want_raw, **sync_kwargs)
+        finally:
+            # Firing boundary in a FINALLY, unlike its first draft: the
+            # breaker abort deliberately leaves the ledger row open for
+            # a resume, and that is exactly the firing whose counters
+            # most need retaining.
+            if want_raw:
+                llm.raw_log.flush_receipt()
+
+    def _collect_inner(self, a, llm, schema, retries, errors,
+                       per_item_usage, breaker, got, results, want_raw,
+                       **sync_kwargs):
+        n_ok, n_fallback = 0, 0
+        first_error = None
         for cid, ok, text, usage, err, raw in a.results(
                 self.batch_id, order=self.order, want_raw=want_raw):
             key = self.cid_to_key.get(cid)
@@ -784,8 +804,6 @@ class BatchHandle:
                         "raw": "",
                         "transport": "batch+sync-fallback",
                     }
-        if want_raw:
-            llm.raw_log.flush_receipt()  # firing boundary, same as imap's
         missing = set(self.cid_to_key) - got
         if missing and not got:
             raise RuntimeError(
@@ -846,7 +864,7 @@ class CompletedHandle(BatchHandle):
 
 
 _BATCH_REJECTED_KWARGS = ("fail_fast", "num_workers", "verbose", "cache_key",
-                          "images_list", "warm_cache")
+                          "images_list", "warm_cache", "raw_transport")
 
 
 def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,

@@ -207,6 +207,36 @@ class Task:
             self._raw_log = RawLog.resolve(self.raw_log)
         return self._raw_log
 
+    @property
+    def raw_sidecar(self):
+        """The resolved RawLog store, or None when the sidecar is off.
+
+        The public accessor: `task.raw_log` is the *configuration*
+        (bool/path/RawLog) and has no methods when set with True —
+        `task.raw_sidecar.certify(...)` is the object call sites want.
+        """
+        return self._resolved_raw_log()
+
+    def certify_raw(self, keys=None, since=None):
+        """Certify sidecar coverage against this task's OWN annotation
+        stash — the independent record certify() requires. Passing keys
+        derived from the sidecar itself is the tautology its docstring
+        warns about; this method makes the correct call the easy one by
+        sourcing the denominator from the annotation store.
+
+        keys: iterable of annotation keys to scope to (default: every
+        key in this task's stash — fine for a task-sized claim, too
+        broad for a run-sized one; pass the run's keys for that).
+        """
+        sidecar = self._resolved_raw_log()
+        if sidecar is None:
+            raise ValueError(
+                f"Task {self.task_name!r} has no raw-response sidecar "
+                f"(raw_log is falsy) — nothing to certify.")
+        if keys is None:
+            keys = list(self.stash.keys())
+        return sidecar.certify(keys, since=since)
+
     def run(self, prompt, model=None, system_prompt=None, examples=None,
             images=None, metadata=None, force=False, **kwargs):
         """Extract structured data from a single input.

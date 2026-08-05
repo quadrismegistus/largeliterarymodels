@@ -9,6 +9,7 @@ bytes, or PIL Image objects.
 
 import base64
 import io
+import json
 import logging
 import os
 import re
@@ -160,7 +161,8 @@ def _healed_token_param(exc, current):
 # forwarded into an HTTP request body. `cache_ttl` is the live example: it is
 # an Anthropic prompt-cache concept that LLM._provider_kwargs injects into
 # every call, and an OpenAI-compatible endpoint 400s on it.
-_NON_API_KWARGS = frozenset({"cache_ttl", "thinking", "schema", "schema_name"})
+_NON_API_KWARGS = frozenset({"cache_ttl", "thinking", "schema", "schema_name",
+                             "raw_transport"})
 
 
 def _api_kwargs(kwargs):
@@ -236,6 +238,21 @@ def openai_request_body(provider, model, messages, temperature=0.7,
     return body, dropped
 
 
+def _sink_raw(raw_sink, response):
+    """Fire the raw sink, guarded: 'never fails the run' must be
+    structural, not a property of the sink object — serialize_response
+    runs before RawLog.record's own try, and the sink itself is
+    caller-supplied. Record BEFORE the usage path: a strict-mode audit
+    that raises must not destroy the body that proves its finding."""
+    if raw_sink is None:
+        return
+    try:
+        raw_sink(serialize_response(response))
+    except Exception as e:  # noqa: BLE001 — receipt-write discipline
+        log.error("raw_sink failed (%s: %s) — the call continues; only "
+                  "the sidecar entry is lost", type(e).__name__, e)
+
+
 def _chat_completion(client, provider, model, messages, temperature, max_tokens,
                      usage_sink=None, dropped_hint=(), usage_filter=None,
                      raw_sink=None, **extra):
@@ -308,6 +325,7 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
             raise
         _TOKEN_PARAM[memo] = param
         _log_resolved_model(provider, model, getattr(response, "model", None))
+        _sink_raw(raw_sink, response)
         if usage_sink is not None:
             u = _usage_openai_compat(response)
             if dropped:
@@ -315,8 +333,6 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
             if usage_filter is not None:
                 u = usage_filter(u, response) or u
             usage_sink(u)
-        if raw_sink is not None:
-            raw_sink(serialize_response(response))
         return response
 
     # Chain the API's own error: it is the one artifact this whole design
@@ -330,26 +346,46 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
 
 
 def serialize_response(response):
-    """Best-effort plain-JSON serialisation of a provider SDK response.
+    """Plain-JSON serialisation of a provider SDK response, VERIFIED.
 
     For the raw-response sidecar: the receipts carry only fields the
     normalizers knew to extract when they were written, and every
     provider-drift bug was diagnosed from a raw response that had
-    already been discarded. Best-effort by design — a body that cannot
-    be serialised is recorded as its repr rather than failing anything.
+    already been discarded. Each candidate result is round-tripped
+    through json.dumps before being accepted — without that check the
+    repr fallback was unreachable (python-mode model_dump() essentially
+    never raises, it just returns raw Python objects json cannot
+    export), so an unserialisable body was silently persisted and still
+    certified clean. A body no serialiser can express is recorded as
+    its repr; a repr that itself raises still yields a marker rather
+    than failing the call.
     """
+    def _json_safe(out):
+        json.dumps(out)
+        return out
+
     if isinstance(response, (dict, list, str)):
-        return response
-    for attempt in (lambda: response.model_dump(mode="json"),
-                    lambda: response.model_dump(),
-                    lambda: response.to_dict()):
         try:
-            out = attempt()
-        except Exception:  # noqa: BLE001 — try the next serialiser
-            continue
-        if isinstance(out, (dict, list)):
-            return out
-    return {"unserialisable": repr(response)[:100_000]}
+            return _json_safe(response)
+        except (TypeError, ValueError):
+            pass
+    else:
+        for attempt in (
+                lambda: json.loads(response.model_dump_json()),
+                lambda: response.model_dump(mode="json"),
+                lambda: response.model_dump(),
+                lambda: response.to_json_dict(),  # google-genai spelling
+                lambda: response.to_dict()):
+            try:
+                out = attempt()
+                if isinstance(out, (dict, list)):
+                    return _json_safe(out)
+            except Exception:  # noqa: BLE001 — try the next serialiser
+                continue
+    try:
+        return {"unserialisable": repr(response)[:100_000]}
+    except Exception:  # noqa: BLE001 — hostile __repr__
+        return {"unserialisable": f"<repr failed: {type(response).__name__}>"}
 
 
 # ---------------------------------------------------------------------------
@@ -1359,13 +1395,12 @@ def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
     response = client.messages.create(**api_kwargs)
     # Rolling aliases (claude-sonnet-4-6) resolve to dated snapshots; log which.
     _log_resolved_model("anthropic", model, getattr(response, "model", None))
+    _sink_raw(raw_sink, response)
     if usage_sink is not None:
         u = _usage_anthropic(response)
         if dropped:
             u["dropped_params"] = tuple(dropped)
         usage_sink(u)
-    if raw_sink is not None:
-        raw_sink(serialize_response(response))
     return _response_text(response.content, model,
                           stop_reason=getattr(response, "stop_reason", None))
 
@@ -1708,10 +1743,9 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                 "anyway (%d thought tokens billed as output). Treat these "
                 "runs as thinking-mode runs.", model, thoughts,
             )
+    _sink_raw(raw_sink, response)
     if usage_sink is not None:
         usage_sink(_usage_google(response))
-    if raw_sink is not None:
-        raw_sink(serialize_response(response))
     text = response.text
     if text is None:
         # A thinking model can spend the whole max_output_tokens budget on

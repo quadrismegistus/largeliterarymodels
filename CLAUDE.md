@@ -289,9 +289,20 @@ What makes it safe to use on registered work:
   `_Ledger().history(cid)`). Resolution is **per item**: a rerun over any
   overlap — subsets, after partial progress — resumes the open batch; a
   process that died inside the submission call leaves the one ambiguous
-  state, which raises `AmbiguousBatchState` with working operator
-  resolutions (`_Ledger().attach(sub, batch_id)` / `.abandon(sub)`)
-  rather than guessing, and `force=True` cannot bypass it. The
+  state, which is first **reconciled against the provider itself**:
+  submissions are tagged provider-visibly (OpenAI batch metadata, Google
+  `display_name`, Anthropic by deterministic custom_id content-match on
+  ended batches), so `reconcile(sub)` learns definitively whether the
+  death fell before the API accepted (no batch — abandon and resubmit)
+  or after (a live billable batch with no recorded id — attach and
+  resume; blind reclaim here is the double-bill). Only an inconclusive
+  lookup still raises `AmbiguousBatchState`, carrying the candidates,
+  with working operator resolutions (`reconcile(sub)` retry /
+  `_Ledger().attach(sub, batch_id)` / `.abandon(sub)`), and `force=True`
+  cannot bypass it. Neither crash window shows up under contention
+  testing — only under a kill in a specific millisecond (hashstash
+  seat's analysis) — so both are pinned by forged-death tests and were
+  drilled live against real batches on all three providers. The
   read-decide-submit section runs under hashstash's cross-process
   `key_lock` (an unlocked race measured 8/8 double-submissions). Stated
   limits: the lock is a local flock — one machine per task's batches —

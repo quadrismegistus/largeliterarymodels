@@ -36,16 +36,32 @@ class FakeAdapter:
         self.omit_cids = set()
         self.batches = {}
         self.done = {}
+        self.subs = {}
+        self.reconcile_mode = "absent"
 
     def request_bytes(self, req):
         return len(json.dumps(req[1], default=str))
 
-    def submit(self, requests):
+    def submit(self, requests, sub=None):
         bid = f"fake-batch-{len(self.batches)}"
         self.submitted.append(requests)
         self.batches[bid] = list(requests)
         self.done[bid] = True
+        self.subs[bid] = sub
         return bid
+
+    def find_sub(self, sub, cids, since_ts):
+        """Realistic for the tagged providers: a batch that reached the
+        endpoint is discoverable by its sub tag, and a completed scan
+        with no match is definitive absence. reconcile_mode='candidates'
+        scripts the one inconclusive case (Anthropic in-progress batches
+        cannot be content-checked)."""
+        for bid, s in self.subs.items():
+            if s is not None and s == sub:
+                return ("found", bid)
+        if self.reconcile_mode == "candidates":
+            return ("candidates", [("fake-cand", len(list(cids)))])
+        return ("absent", None)
 
     def is_done(self, batch_id):
         return self.done[batch_id]
@@ -117,9 +133,9 @@ class TestKeyIdentity:
         llm = _llm(stash)
         fake = FakeAdapter()
 
-        def submit(requests):
+        def submit(requests, sub=None):
             fake.fail_cids = {requests[0][0]}  # first batch item falls back
-            return FakeAdapter.submit(fake, requests)
+            return FakeAdapter.submit(fake, requests, sub=sub)
         fake.submit = submit
         metas = [{"text_id": f"T{i}"} for i in range(4)]
         with patch("largeliterarymodels.llm._call_provider",
@@ -181,8 +197,8 @@ class TestLedgerMoneySafety:
         fake = FakeAdapter()
         fake.done = {}
 
-        def submit(requests):
-            bid = FakeAdapter.submit(fake, requests)
+        def submit(requests, sub=None):
+            bid = FakeAdapter.submit(fake, requests, sub=sub)
             fake.done[bid] = False   # still processing when run 1 'dies'
             return bid
         fake.submit = submit
@@ -194,7 +210,7 @@ class TestLedgerMoneySafety:
         # Run 2: same PERSISTENT stash (probe item now warm — the cold set
         # has shifted), batch now done.
         fake.done[handle.batch_id] = True
-        fake.submit = lambda requests: (_ for _ in ()).throw(
+        fake.submit = lambda requests, sub=None: (_ for _ in ()).throw(
             AssertionError("resubmitted a live batch"))
         with patch("largeliterarymodels.llm._call_provider",
                    side_effect=_sync_provider):
@@ -210,19 +226,25 @@ class TestLedgerMoneySafety:
         fake = FakeAdapter()
         handle = _run(_llm(stash), fake, ["a", "b", "c"], monkeypatch,
                       ledger=ledger, probe=False, wait=False)
-        fake.submit = lambda requests: (_ for _ in ()).throw(
+        fake.submit = lambda requests, sub=None: (_ for _ in ()).throw(
             AssertionError("resubmitted"))
         results = _run(_llm(stash), fake, ["a", "b"], monkeypatch,
                        ledger=ledger, probe=False)
         assert all(r is not None for r in results)
 
-    def test_died_mid_submit_stops_loudly_even_with_probe(self, ledger,
-                                                          monkeypatch):
+    def test_died_before_accept_reconciles_to_resubmit(self, ledger,
+                                                       monkeypatch):
+        """Crash window (1): die after marking cids 'submitting', before
+        the provider accepted anything. A fresh row still stops (could
+        be a live process); a stale one is reconciled against the
+        provider — nothing found, so the items are abandoned and the
+        rerun resubmits, instead of being stuck behind an operator
+        prompt for a batch that never existed."""
         stash = FakeStash()
         fake = FakeAdapter()
 
         class Dies(FakeAdapter):
-            def submit(self, requests):
+            def submit(self, requests, sub=None):
                 raise KeyboardInterrupt("dies mid-submit")
 
         with patch("largeliterarymodels.llm._call_provider",
@@ -239,16 +261,17 @@ class TestLedgerMoneySafety:
         _age_submission(ledger, _sub_from_exc(exc))
         with patch("largeliterarymodels.llm._call_provider",
                    side_effect=_sync_provider):
-            with pytest.raises(B.AmbiguousBatchState):
-                _run(_llm(stash), fake, ["a", "b", "c"], monkeypatch,
-                     ledger=ledger, probe=True)
+            results = _run(_llm(stash), fake, ["a", "b", "c"], monkeypatch,
+                           ledger=ledger, probe=True)
+        assert all(r is not None for r in results)
+        assert len(fake.submitted) == 1, "reconcile abandoned, rerun submits"
 
     def test_fresh_submitting_row_reads_as_another_process(self, ledger,
                                                            monkeypatch):
         stash = FakeStash()
 
         class Dies(FakeAdapter):
-            def submit(self, requests):
+            def submit(self, requests, sub=None):
                 raise KeyboardInterrupt("dies mid-submit")
 
         with pytest.raises(KeyboardInterrupt):
@@ -258,23 +281,29 @@ class TestLedgerMoneySafety:
             _run(_llm(stash), FakeAdapter(), ["a", "b"], monkeypatch,
                  ledger=ledger, probe=False)
 
-    def test_ambiguity_survives_force(self, ledger, monkeypatch):
-        """force is cache discipline, not permission to double-bill."""
+    def test_unresolvable_ambiguity_survives_force(self, ledger,
+                                                   monkeypatch):
+        """force is cache discipline, not permission to double-bill:
+        when reconciliation is inconclusive (the Anthropic in-progress
+        case), the loud stop still fires through force=True, and the
+        message carries what the lookup DID find."""
         stash = FakeStash()
 
         class Dies(FakeAdapter):
-            def submit(self, requests):
+            def submit(self, requests, sub=None):
                 raise KeyboardInterrupt("dies mid-submit")
 
         with pytest.raises(KeyboardInterrupt):
             _run(_llm(stash), Dies(), ["a"], monkeypatch, ledger=ledger,
                  probe=False)
+        fake = FakeAdapter()
+        fake.reconcile_mode = "candidates"
         with pytest.raises(B.BatchInProgress) as exc:
-            _run(_llm(stash), FakeAdapter(), ["a"], monkeypatch,
+            _run(_llm(stash), fake, ["a"], monkeypatch,
                  ledger=ledger, probe=False)
         _age_submission(ledger, _sub_from_exc(exc))
-        with pytest.raises(B.AmbiguousBatchState):
-            _run(_llm(stash), FakeAdapter(), ["a"], monkeypatch,
+        with pytest.raises(B.AmbiguousBatchState, match="inconclusive"):
+            _run(_llm(stash), fake, ["a"], monkeypatch,
                  ledger=ledger, probe=False, force=True)
 
     def test_operator_resolution_lines_work(self, ledger, monkeypatch):
@@ -283,7 +312,7 @@ class TestLedgerMoneySafety:
         stash = FakeStash()
 
         class Dies(FakeAdapter):
-            def submit(self, requests):
+            def submit(self, requests, sub=None):
                 raise KeyboardInterrupt("dies")
 
         with pytest.raises(KeyboardInterrupt):
@@ -354,8 +383,8 @@ class TestLedgerMoneySafety:
         fake = FakeAdapter()
         fake.done = {}
 
-        def submit(requests):
-            bid = FakeAdapter.submit(fake, requests)
+        def submit(requests, sub=None):
+            bid = FakeAdapter.submit(fake, requests, sub=sub)
             fake.done[bid] = False
             return bid
         fake.submit = submit
@@ -410,9 +439,9 @@ class TestLedgerMoneySafety:
         stash = FakeStash()
         fake = FakeAdapter()
 
-        def submit(requests):
+        def submit(requests, sub=None):
             fake.fail_cids = {c for c, _ in requests}
-            return FakeAdapter.submit(fake, requests)
+            return FakeAdapter.submit(fake, requests, sub=sub)
         fake.submit = submit
         sync_calls = []
         with patch("largeliterarymodels.llm._call_provider",
@@ -459,9 +488,9 @@ class TestReceipts:
         llm = _llm()
         fake = FakeAdapter()
 
-        def submit(requests):
+        def submit(requests, sub=None):
             fake.fail_cids = {requests[0][0]}
-            return FakeAdapter.submit(fake, requests)
+            return FakeAdapter.submit(fake, requests, sub=sub)
         fake.submit = submit
         per_item = {}
         with patch("largeliterarymodels.llm._call_provider",
@@ -553,6 +582,92 @@ class TestSurface:
         results = task.map(["a", "b"], batch=True, probe=False, retries=2,
                            ledger=ledger)
         assert [r.x for r in results] == [1, 1]
+
+
+class TestReconcile:
+    """The two crash windows the lock cannot close — it deliberately does
+    not span the network submit — settled by asking the provider, which
+    is the only party that knows whether the batch exists."""
+
+    def test_died_after_accept_attaches_and_resumes(self, ledger,
+                                                    monkeypatch):
+        """Crash window (2), the double-bill one: the provider ACCEPTED
+        the batch but the process died before the id was written back.
+        Blind reclaim would resubmit paid work; the reconciled rerun
+        must find the tagged batch and resume it. The fake's submit
+        raises unconditionally after run 1, so any resubmission attempt
+        is an exception, not a silent pass."""
+        stash = FakeStash()
+
+        class DiesAfterAccept(FakeAdapter):
+            def submit(self, requests, sub=None):
+                FakeAdapter.submit(self, requests, sub=sub)
+                raise KeyboardInterrupt("died after the provider accepted")
+
+        fake = DiesAfterAccept()
+        with pytest.raises(KeyboardInterrupt):
+            _run(_llm(stash), fake, ["a", "b"], monkeypatch,
+                 ledger=ledger, probe=False)
+        assert len(fake.submitted) == 1, "the batch EXISTS provider-side"
+        with pytest.raises(B.BatchInProgress) as exc:
+            _run(_llm(stash), fake, ["a", "b"], monkeypatch,
+                 ledger=ledger, probe=False)
+        _age_submission(ledger, _sub_from_exc(exc))
+        results = _run(_llm(stash), fake, ["a", "b"], monkeypatch,
+                       ledger=ledger, probe=False)
+        assert all(r is not None for r in results)
+        assert len(fake.submitted) == 1, "reconciled and resumed, not resold"
+
+    def test_reconcile_is_definitive_where_tags_exist(self, ledger):
+        """reconcile() itself: absent -> abandon (items resubmittable),
+        found-by-tag -> attach (items open under the recovered id)."""
+        fake = FakeAdapter()
+
+        def plant(sub):
+            ledger.set_sub(sub, ["c1", "c2"], "anthropic",
+                           "claude-sonnet-4-6")
+            for cid in ("c1", "c2"):
+                ledger.set_cid(cid, state="submitting", sub=sub,
+                               batch_id=None, provider="anthropic",
+                               key={"k": cid})
+        plant("sub-x")
+        verdict, detail = B.reconcile("sub-x", ledger=ledger, adapter=fake)
+        assert (verdict, detail) == ("abandoned", None)
+        assert ledger.get_cid("c1")["state"] == "abandoned"
+        bid = fake.submit([("c1", {}), ("c2", {})], sub="sub-y")
+        plant("sub-y")
+        verdict, detail = B.reconcile("sub-y", ledger=ledger, adapter=fake)
+        assert (verdict, detail) == ("attached", bid)
+        assert ledger.get_cid("c2")["state"] == "open"
+        assert ledger.get_cid("c2")["batch_id"] == bid
+        assert ledger.get_cid("c2")["key"] == {"k": "c2"}, \
+            "attach must preserve the stash key material"
+
+    def test_reconcile_failure_falls_back_to_the_loud_stop(self, ledger,
+                                                           monkeypatch):
+        """A dead network or missing key during reconciliation must not
+        crash the resolution pass — it degrades to AmbiguousBatchState
+        with the failure named."""
+        stash = FakeStash()
+
+        class Dies(FakeAdapter):
+            def submit(self, requests, sub=None):
+                raise KeyboardInterrupt("dies")
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(_llm(stash), Dies(), ["a"], monkeypatch, ledger=ledger,
+                 probe=False)
+        fake = FakeAdapter()
+        fake.find_sub = lambda *a: (_ for _ in ()).throw(
+            ConnectionError("provider unreachable"))
+        with pytest.raises(B.BatchInProgress) as exc:
+            _run(_llm(stash), fake, ["a"], monkeypatch, ledger=ledger,
+                 probe=False)
+        _age_submission(ledger, _sub_from_exc(exc))
+        with pytest.raises(B.AmbiguousBatchState,
+                           match="auto-reconcile failed"):
+            _run(_llm(stash), fake, ["a"], monkeypatch, ledger=ledger,
+                 probe=False)
 
 
 class TestLockDesign:

@@ -64,11 +64,15 @@ class AmbiguousBatchState(RuntimeError):
     """A ledger record says 'submitting' with no batch id, and it is old.
 
     The submitting process died inside the submission call: the provider
-    may or may not hold a live, billable batch. Nothing here can know, so
-    nothing here guesses — check the provider's console/API for a batch
-    created around the record's timestamp, then resolve it:
+    may or may not hold a live, billable batch. The run already tried to
+    settle this automatically — reconcile() asks the provider, using the
+    sub id tagged into each submission — so seeing this error means the
+    lookup itself failed or was inconclusive (details appended below).
+    Retry it, or check the provider's console for a batch created around
+    the record's timestamp, then resolve by hand:
 
-        from largeliterarymodels.batch import _Ledger
+        from largeliterarymodels.batch import reconcile, _Ledger
+        reconcile("<sub id>")                                  # retry lookup
         _Ledger().attach("<sub id>", "<provider batch id>")   # it exists
         _Ledger().abandon("<sub id>")                          # it does not
 
@@ -262,7 +266,7 @@ class _AnthropicAdapter:
     def request_bytes(self, req):
         return len(json.dumps(req[1], default=str))
 
-    def submit(self, requests):
+    def submit(self, requests, sub=None):
         batch = self.client.messages.batches.create(requests=[
             {"custom_id": cid, "params": params} for cid, params in requests
         ])
@@ -271,6 +275,34 @@ class _AnthropicAdapter:
     def is_done(self, batch_id):
         return self.client.messages.batches.retrieve(
             batch_id).processing_status == "ended"
+
+    def find_sub(self, sub, cids, since_ts):
+        """Reconcile a died-mid-submit window against the provider.
+
+        Anthropic offers no batch-level tag, so identification is by
+        CONTENT: our custom_ids are deterministic, so an ended batch
+        whose result ids intersect ours is ours, definitively. An
+        in-progress batch cannot be opened to check — it is reported as
+        a candidate (matching request count, created after the
+        submission record) rather than guessed at.
+        """
+        cids = set(cids)
+        candidates = []
+        for b in self.client.messages.batches.list(limit=20):
+            created = getattr(b, "created_at", None)
+            ts = created.timestamp() if hasattr(created, "timestamp") else 0
+            if ts and ts < since_ts - 60:
+                continue
+            if b.processing_status == "ended":
+                for r in self.client.messages.batches.results(b.id):
+                    if r.custom_id in cids:
+                        return ("found", b.id)
+                    break  # one id decides: batches don't interleave subs
+            else:
+                total = getattr(getattr(b, "request_counts", None),
+                                "processing", None)
+                candidates.append((b.id, total))
+        return ("candidates", candidates) if candidates else ("absent", None)
 
     def results(self, batch_id, order=None):
         for r in self.client.messages.batches.results(batch_id):
@@ -309,7 +341,7 @@ class _OpenAIAdapter:
     def request_bytes(self, req):
         return len(self._line(*req)) + 1
 
-    def submit(self, requests):
+    def submit(self, requests, sub=None):
         import io
         buf = io.BytesIO()
         for cid, body in requests:
@@ -318,10 +350,28 @@ class _OpenAIAdapter:
         buf.seek(0)
         buf.name = "batch.jsonl"
         f = self.client.files.create(file=buf, purpose="batch")
+        # The sub id rides in batch metadata so a died-mid-submit window
+        # is reconcilable by ASKING the provider, not guessing. (A crash
+        # between files.create and batches.create leaves an orphan file
+        # but no billable batch — find_sub correctly reports absent.)
         batch = self.client.batches.create(
             input_file_id=f.id, endpoint="/v1/chat/completions",
-            completion_window="24h")
+            completion_window="24h",
+            metadata={"litmod_sub": sub} if sub else None)
         return batch.id
+
+    def find_sub(self, sub, cids, since_ts):
+        """Definitive either way: submissions are tagged in batch
+        metadata, so a match is ours and a completed scan with no match
+        means no billable batch exists."""
+        for b in self.client.batches.list(limit=50):
+            if (getattr(b, "metadata", None) or {}).get(
+                    "litmod_sub") == sub:
+                return ("found", b.id)
+            created = getattr(b, "created_at", 0) or 0
+            if created and created < since_ts - 60:
+                break  # newest-first: past the window, nothing older is ours
+        return ("absent", None)
 
     def is_done(self, batch_id):
         return self.client.batches.retrieve(batch_id).status in (
@@ -373,14 +423,26 @@ class _GoogleAdapter:
         sysi = getattr(r["config"], "system_instruction", None) or ""
         return size + len(sysi) + 512
 
-    def submit(self, requests):
+    def submit(self, requests, sub=None):
         model = requests[0][1]["model"]
         inline = [{"contents": r["contents"], "config": r["config"]}
                   for _, r in requests]
+        # display_name carries the sub id (not a timestamp): it is the
+        # only provider-visible field we control, and it is what makes a
+        # died-mid-submit window reconcilable via find_sub.
         job = self.client.batches.create(
             model=model, src=inline,
-            config={"display_name": f"litmod-{int(time.time())}"})
+            config={"display_name": f"litmod-{sub}" if sub
+                    else f"litmod-{int(time.time())}"})
         return job.name
+
+    def find_sub(self, sub, cids, since_ts):
+        """Definitive either way: the sub id is the display_name."""
+        want = f"litmod-{sub}"
+        for job in self.client.batches.list(config={"page_size": 50}):
+            if getattr(job, "display_name", None) == want:
+                return ("found", job.name)
+        return ("absent", None)
 
     def is_done(self, batch_id):
         state = str(self.client.batches.get(name=batch_id).state)
@@ -453,6 +515,49 @@ def _adapter_for(model, timeout=None):
     if P._routes_to_google(m):
         return _GoogleAdapter(timeout)
     return _OpenAIAdapter(timeout)
+
+
+def reconcile(sub, ledger=None, adapter=None, timeout=None):
+    """Resolve a died-mid-submit submission by ASKING the provider.
+
+    The lock deliberately does not span the network submit, which leaves
+    two crash windows it cannot close (hashstash seat's analysis): die
+    after marking cids 'submitting' but before the API accepted (no
+    batch exists — safe to resubmit), or die after it accepted but
+    before the batch id was written back (a LIVE billable batch with no
+    ledger record — resubmitting double-bills). The two are
+    indistinguishable client-side, so the ledger alone must stop; but
+    the provider knows which happened. Submissions are tagged
+    provider-visibly (OpenAI batch metadata, Google display_name;
+    Anthropic by deterministic custom_id content-match on ended
+    batches), so this lookup is definitive where tags exist, and
+    candidate-listing where they don't.
+
+    Returns ("attached", batch_id) — the batch exists, the ledger now
+    resumes it; ("abandoned", None) — no batch exists, the next run
+    resubmits; or ("candidates", [...]) — inconclusive (untaggable
+    in-progress Anthropic batches), left for the operator.
+    """
+    ledger = ledger or _Ledger()
+    rec = ledger.get_sub(sub)
+    if rec is None:
+        raise ValueError(f"no submission {sub!r} in the ledger under "
+                         f"{ledger.root}")
+    adapter = adapter or _adapter_for(rec["model"], timeout)
+    verdict, detail = adapter.find_sub(sub, rec["cids"],
+                                       rec.get("ts") or 0)
+    if verdict == "found":
+        ledger.attach(sub, detail)
+        log.warning("batch reconcile: %s DID reach %s as %s — attached; "
+                    "the next run resumes it", sub, adapter.provider, detail)
+        return ("attached", detail)
+    if verdict == "absent":
+        ledger.abandon(sub)
+        log.warning("batch reconcile: %s never reached %s — abandoned; "
+                    "the next run resubmits its items", sub,
+                    adapter.provider)
+        return ("abandoned", None)
+    return ("candidates", detail)
 
 
 def _build_request(model, prompt, full_system, temperature, max_tokens,
@@ -805,10 +910,33 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
     # Per-item ledger resolution: open items resume their batches;
     # submitting items stop (fresh -> another process; stale ->
     # ambiguous); everything else submits fresh.
-    states = ledger.states_for([item[1] for item in to_compute])
+    cids_all = [item[1] for item in to_compute]
+    states = ledger.states_for(cids_all)
+    now = time.time()
+    # Died-mid-submit reconciliation: a STALE 'submitting' row is first
+    # resolved against the provider itself — the ledger alone cannot
+    # know whether the death fell before the API accepted (no batch,
+    # safe to resubmit) or after (a live billable batch with no id
+    # recorded, where resubmitting double-bills), but the provider can.
+    # Only what the lookup cannot settle still raises.
+    stale_subs = {st.get("sub") for st in states.values()
+                  if st.get("state") == "submitting" and st.get("sub")
+                  and now - st["ts"] >= _SUBMITTING_FRESH_SECONDS}
+    unresolved = {}
+    for sub_id in sorted(stale_subs):
+        try:
+            verdict, detail = reconcile(sub_id, ledger=ledger)
+        except Exception as e:  # noqa: BLE001 — fall back to the loud stop
+            unresolved[sub_id] = f"auto-reconcile failed: {e}"
+            continue
+        if verdict == "candidates":
+            unresolved[sub_id] = ("auto-reconcile inconclusive — "
+                                  f"in-progress candidate batches "
+                                  f"(id, request_count): {detail}")
+    if stale_subs:
+        states = ledger.states_for(cids_all)
     resume_by_batch = {}
     fresh = []
-    now = time.time()
     for item in to_compute:
         st = states.get(item[1])
         if st and st["state"] == "submitting":
@@ -820,7 +948,8 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
                     + f"\n\nsubmission id: {st.get('sub')}")
             raise AmbiguousBatchState(
                 AmbiguousBatchState.__doc__
-                + f"\n\nsubmission id: {st.get('sub')}")
+                + f"\n\nsubmission id: {st.get('sub')}"
+                + "\n" + unresolved.get(st.get("sub"), ""))
         if st is None or st["state"] in ("closed", "abandoned") or force:
             if force and st and st["state"] == "open":
                 log.warning(
@@ -926,7 +1055,8 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
                                    provider=adapter.provider, key=key)
             finally:
                 _Ledger.unlock(lk)
-            batch_id = adapter.submit([(c[1], c[4]) for c in chunk])
+            batch_id = adapter.submit([(c[1], c[4]) for c in chunk],
+                                      sub=sub)
             for i, cid, prompt, key, req in chunk:
                 ledger.set_cid(cid, state="open", sub=sub,
                                batch_id=batch_id,

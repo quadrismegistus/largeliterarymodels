@@ -1594,6 +1594,13 @@ class LLM:
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
         finally:
+            # Batch boundary: retain this firing's sidecar coverage
+            # counters durably. Runs fire many times (resumption is the
+            # normal case), so the run-level claim is a conjunction over
+            # firings — a receipt that dies with the process cannot join
+            # it.
+            if self.raw_log is not None:
+                self.raw_log.flush_receipt()
             # The summary covers the warm-cache pre-flight too: an abort
             # raised there previously skipped this block entirely, losing
             # the batch receipt for exactly the runs that need it most.

@@ -76,7 +76,7 @@ class TestWritePathIsolation:
             _llm(stash_on, raw_log=rawlog).extract(
                 "a", Out, system_prompt="sys", retries=0)
         assert dict(stash_off) == dict(stash_on)
-        assert len(list(rawlog.stash.keys())) == 1, \
+        assert len(list(rawlog.keys())) == 1, \
             "the only extra write goes to the sidecar root"
 
 
@@ -89,7 +89,7 @@ class TestCaptureAndJoin:
             llm.extract("a", Out, system_prompt="sys", retries=0)
         [ann_key] = list(stash.keys())  # FakeStash canonicalises to JSON
         [raw_key] = [json.dumps(k, sort_keys=True, default=str)
-                     for k in rawlog.stash.keys()]
+                     for k in rawlog.keys()]
         assert ann_key == raw_key, \
             "raw <-> annotation joins must be a lookup, not a correlation"
         env = rawlog.get(json.loads(raw_key))
@@ -108,7 +108,7 @@ class TestCaptureAndJoin:
         with patch("largeliterarymodels.llm._call_provider",
                    side_effect=flaky):
             llm.extract("a", Out, system_prompt="sys", retries=1)
-        [key] = list(rawlog.stash.keys())
+        [key] = list(rawlog.keys())
         assert len(rawlog.history(key)) == 2, \
             "every attempt's body is kept, oldest first"
 
@@ -177,7 +177,7 @@ class TestCaptureAndJoin:
             with pytest.raises(Exception):
                 llm.extract("a", Out, system_prompt="sys", retries=0)
         assert rawlog.receipt()["recorded"] == 1
-        [key] = list(rawlog.stash.keys())
+        [key] = list(rawlog.keys())
         assert rawlog.get(key)["body"]["the_actual_reply"] == \
             "not json at all"
 
@@ -192,6 +192,79 @@ class TestCaptureAndJoin:
         assert report["missing"] == [keys[1]]
         assert rawlog.receipt() == {"recorded": 2, "failed": 0,
                                     "errors": []}
+
+
+class TestReceiptRetention:
+    """A run fires many times (resumption is the normal case), so the
+    run-level claim quantifies over firings — receipts must be RETAINED,
+    and the claim must not silently weaken when they are not."""
+
+    def test_receipts_survive_the_process_per_firing(self, rawlog):
+        rawlog.record({"k": 1}, {"b": 1})
+        rawlog.flush_receipt()
+        second = RawLog(root=rawlog.root)  # a later firing, same store
+        second.record({"k": 2}, {"b": 2})
+        second.flush_receipt()
+        second.flush_receipt()  # repeat flushes: latest per firing wins
+        rows = {r["firing"]: r for r in second.receipts()}
+        assert len(rows) == 2, "one retained receipt per firing"
+        assert sorted(r["recorded"] for r in rows.values()) == [1, 1]
+
+    def test_imap_boundary_flushes_automatically(self, rawlog):
+        llm = _llm(raw_log=rawlog)
+        with patch("largeliterarymodels.llm._call_provider",
+                   side_effect=_provider_that_sinks({"b": 1})):
+            llm.extract_map(["a", "b"], Out, system_prompt="sys",
+                            retries=0)
+        [row] = rawlog.receipts()
+        assert row["recorded"] == 2 and row["failed"] == 0
+
+    def test_a_counted_failure_is_flushed_immediately(self, rawlog):
+        """The row that says bodies were dropped must not wait for a
+        batch boundary a crashing process never reaches. Body writes
+        fail here while the receipt row still lands — the partial-outage
+        case; a store-wide outage is certify()'s job, not this flush's."""
+        orig = type(rawlog.stash).__setitem__
+
+        def body_writes_fail(self, key, value, _orig=orig):
+            if key != RawLog._RECEIPTS_KEY:
+                raise OSError("body store full")
+            return _orig(self, key, value)
+        with patch.object(type(rawlog.stash), "__setitem__",
+                          body_writes_fail):
+            rawlog.record({"k": 1}, {"b": 1})
+        later = RawLog(root=rawlog.root)  # fresh process, durable read
+        [row] = later.receipts()
+        assert row["failed"] == 1 and "body store full" in row["errors"][0]
+
+    def test_certify_complete_is_retention_independent(self, rawlog):
+        """Presence proves completeness with ZERO receipts retained —
+        lost receipts cannot undermine a store that has every body."""
+        keys = [{"k": i} for i in range(3)]
+        for k in keys:
+            rawlog.record(k, {"b": 1})
+        # No flush anywhere: simulates every firing dying pre-boundary.
+        cert = RawLog(root=rawlog.root).certify(keys)
+        assert cert["complete"] is True
+        assert cert["firings_retained"] == 0
+
+    def test_certify_treats_unaccounted_absence_as_dropped(self, rawlog):
+        """Missing beyond what retained receipts explain must surface as
+        unaccounted — never fold into 'clean': retention bounds what
+        absence can be EXPLAINED, not what presence PROVES."""
+        keys = [{"k": i} for i in range(4)]
+        rawlog.record(keys[0], {"b": 1})
+        rawlog.record(keys[1], {"b": 1})
+        with patch.object(type(rawlog.stash), "__setitem__",
+                          side_effect=OSError("down")):
+            rawlog.record(keys[2], {"b": 1})  # counted, receipt lost too
+        rawlog.flush_receipt()  # store back up: failed=1 now retained
+        cert = rawlog.certify(keys)
+        assert cert["complete"] is False
+        assert (cert["present"], len(cert["missing"])) == (2, 2)
+        assert cert["known_drops"] == 1, "the retained receipt explains one"
+        assert cert["unaccounted"] == 1, \
+            "the other missing key is suspect, not clean"
 
 
 class TestProviderThreading:
@@ -252,9 +325,9 @@ class TestBatchCapture:
                                       poll_interval=0, ledger=ledger)
         assert all(r is not None for r in results)
         transports = sorted(env["transport"] for env in
-                            (rawlog.get(k) for k in rawlog.stash.keys()))
+                            (rawlog.get(k) for k in rawlog.keys()))
         assert transports == ["batch", "sync-fallback", "sync-probe"]
-        batch_env = [rawlog.get(k) for k in rawlog.stash.keys()
+        batch_env = [rawlog.get(k) for k in rawlog.keys()
                      if rawlog.get(k)["transport"] == "batch"]
         assert batch_env[0]["body"] == {"fake_body": next(
             c for c, _ in fake.submitted[0]

@@ -784,6 +784,8 @@ class BatchHandle:
                         "raw": "",
                         "transport": "batch+sync-fallback",
                     }
+        if want_raw:
+            llm.raw_log.flush_receipt()  # firing boundary, same as imap's
         missing = set(self.cid_to_key) - got
         if missing and not got:
             raise RuntimeError(

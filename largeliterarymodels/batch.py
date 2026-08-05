@@ -29,7 +29,6 @@ DeepSeek has no batch API (verified absent, not assumed); local
 endpoints have nothing to discount — both raise.
 """
 
-import fcntl
 import hashlib
 import json
 import logging
@@ -62,17 +61,20 @@ _SUBMITTING_FRESH_SECONDS = 600
 
 
 class AmbiguousBatchState(RuntimeError):
-    """A ledger row says 'submitting' with no batch id, and it is old.
+    """A ledger record says 'submitting' with no batch id, and it is old.
 
     The submitting process died inside the submission call: the provider
     may or may not hold a live, billable batch. Nothing here can know, so
     nothing here guesses — check the provider's console/API for a batch
-    created around the row's timestamp, then append a resolution line to
-    the ledger: {"event": "resolved", "sub": "<sub id>", "batch_id":
-    "<id>"} if the batch exists (the next run resumes it), or
-    {"event": "abandoned", "sub": "<sub id>"} if it does not (the next
-    run resubmits). This error is raised regardless of force=True: force
-    is cache discipline, not permission to double-bill.
+    created around the record's timestamp, then resolve it:
+
+        from largeliterarymodels.batch import _Ledger
+        _Ledger().attach("<sub id>", "<provider batch id>")   # it exists
+        _Ledger().abandon("<sub id>")                          # it does not
+
+    (attach makes the next run resume it; abandon makes the next run
+    resubmit.) This error is raised regardless of force=True: force is
+    cache discipline, not permission to double-bill.
     """
 
 
@@ -96,95 +98,136 @@ def _custom_id(key):
 # ---------------------------------------------------------------------------
 
 class _Ledger:
+    """Money-critical bookkeeping on a SIBLING-root pairtree HashStash.
+
+    Design settled with the hashstash seat, from their multi-process test
+    receipts rather than doc reading:
+
+      * a SIBLING root, never a sub-stash: parent.clear() rmtree-s its own
+        dirname and takes any nested sub-stash with it — a cache cleanup
+        must not be able to vaporise a billing record. A ledger does not
+        share a lifetime with a cache.
+      * PAIRTREE, not jsonl: one file per version via tmp+atomic-rename,
+        so the torn-line failure class does not exist (their receipt: a
+        SIGKILLed writer lost zero of 5,802 versions; a planted garbage
+        .tmp is invisible to readers).
+      * append_mode gives the state progression for free: setting the
+        same cid again appends a version; get() is latest-wins, and
+        get_all(all_results=True) is the audit trail (submitting ->
+        open -> closed, with _written_at).
+      * read-decide-append is NOT atomic on any engine — their 8-process
+        race double-billed 8/8 without a lock — so the decide phase runs
+        under stash.key_lock(), hashstash's public cross-process lock.
+
+    Stated limits, theirs verbatim: the lock is a LOCAL flock — one
+    machine only; two hosts (or NFS) submitting the same items are not
+    protected. And there is no fsync, so an OS crash (not a process
+    crash) can lose page-cached rows. Single-machine submission
+    discipline per task is the operating assumption.
+    """
+
+    _SUBMIT_LOCK = "__batch_submit__"
+
     def __init__(self, root=None):
+        from hashstash import HashStash
         self.root = root or LEDGER_DIR
-        os.makedirs(self.root, exist_ok=True)
-        self.path = os.path.join(self.root, "ledger.jsonl")
-        self._lock_path = os.path.join(self.root, ".lock")
+        self.stash = HashStash(self.root, engine="pairtree",
+                               append_mode=True)
+
+    # -- records -----------------------------------------------------------
+    # cid          -> {"state", "sub", "batch_id", "provider", "ts", "key"}
+    # ("sub", s)   -> {"cids": [...], "provider", "model"}
+    # ("batch", b) -> {"order": [...], "sub", "model", "provider",
+    #                  "dropped": [...]}
 
     def lock(self):
-        fh = open(self._lock_path, "a+")
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        return fh
+        ctx = self.stash.key_lock(self._SUBMIT_LOCK)
+        ctx.__enter__()
+        return ctx
 
     @staticmethod
-    def unlock(fh):
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        fh.close()
+    def unlock(ctx):
+        ctx.__exit__(None, None, None)
 
-    def append(self, row):
-        row = dict(row, ts=time.time())
-        with open(self.path, "a") as f:
-            f.write(json.dumps(row, default=str) + "\n")
-        return row
+    def set_cid(self, cid, ts=None, **fields):
+        self.stash[cid] = dict(fields, ts=ts if ts is not None
+                               else time.time())
 
-    def rows(self):
-        if not os.path.exists(self.path):
-            return
-        with open(self.path) as f:
-            for n, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    # One torn line from a killed process must not block
-                    # collection of every live batch in the ledger.
-                    log.warning("ledger: skipping unparseable line %d of %s",
-                                n, self.path)
+    def get_cid(self, cid):
+        try:
+            return self.stash[cid]
+        except KeyError:
+            return None
 
-    def cid_states(self):
-        """cid -> latest {'state', 'sub', 'batch_id', 'ts', 'provider'}.
+    def history(self, cid):
+        """Every recorded state for a cid, oldest first — the audit trail."""
+        try:
+            return self.stash.get_all(cid, all_results=True)
+        except (KeyError, TypeError):
+            return []
 
-        Events: submitting -> open -> closed, plus operator resolutions
-        ('resolved' == open, 'abandoned' == cleared).
+    def states_for(self, cids):
+        """cid -> latest record, for exactly the cids asked about.
+
+        O(len(cids)) point reads — the previous JSONL design re-parsed
+        the ENTIRE ledger on every call, and one 50k batch made that
+        file gigabytes.
         """
-        state = {}
-        subs = {}
-        for row in self.rows():
-            ev = row.get("event")
-            sub = row.get("sub")
-            if ev == "submitting":
-                subs[sub] = row
-                for cid in row.get("cids", ()):
-                    state[cid] = {"state": "submitting", "sub": sub,
-                                  "batch_id": None, "ts": row["ts"],
-                                  "provider": row.get("provider")}
-            elif ev in ("open", "resolved"):
-                base = subs.get(sub, row)
-                for cid in base.get("cids", row.get("cids", ())):
-                    state[cid] = {"state": "open", "sub": sub,
-                                  "batch_id": row.get("batch_id"),
-                                  "ts": row["ts"],
-                                  "provider": row.get("provider",
-                                                      base.get("provider"))}
-            elif ev == "closed":
-                for cid, s in list(state.items()):
-                    if s.get("batch_id") == row.get("batch_id") or \
-                            s.get("sub") == sub:
-                        state[cid] = dict(s, state="closed")
-            elif ev == "abandoned":
-                for cid, s in list(state.items()):
-                    if s.get("sub") == sub:
-                        state[cid] = dict(s, state="abandoned")
-        return state
+        out = {}
+        for cid in cids:
+            rec = self.get_cid(cid)
+            if rec is not None:
+                out[cid] = rec
+        return out
 
-    # Sidecar: key material + submission order, one file per submission.
-    def write_sidecar(self, sub, payload):
-        with open(os.path.join(self.root, f"{sub}.keys.json"), "w") as f:
-            json.dump(payload, f, default=str)
+    def set_sub(self, sub, cids, provider, model):
+        self.stash[("sub", sub)] = {"cids": list(cids),
+                                    "provider": provider, "model": model,
+                                    "ts": time.time()}
 
-    def read_sidecar(self, sub):
-        with open(os.path.join(self.root, f"{sub}.keys.json")) as f:
-            return json.load(f)
+    def get_sub(self, sub):
+        try:
+            return self.stash[("sub", sub)]
+        except KeyError:
+            return None
 
-    def sidecar_for_batch(self, batch_id):
-        for row in self.rows():
-            if row.get("batch_id") == batch_id and row.get("event") in (
-                    "open", "resolved"):
-                return row.get("sub"), row
-        return None, None
+    def set_batch(self, batch_id, **fields):
+        self.stash[("batch", batch_id)] = dict(fields, ts=time.time())
+
+    def get_batch(self, batch_id):
+        try:
+            return self.stash[("batch", batch_id)]
+        except KeyError:
+            return None
+
+    # -- operator resolutions (the AmbiguousBatchState instructions) ------
+
+    def abandon(self, sub):
+        """Operator: the died-mid-submit batch does NOT exist upstream —
+        clear its items so the next run resubmits them."""
+        rec = self.get_sub(sub)
+        if rec is None:
+            raise ValueError(f"no submission {sub!r} in the ledger")
+        for cid in rec["cids"]:
+            self.set_cid(cid, state="abandoned", sub=sub, batch_id=None,
+                         provider=rec.get("provider"))
+        return len(rec["cids"])
+
+    def attach(self, sub, batch_id):
+        """Operator: the died-mid-submit batch DOES exist upstream under
+        `batch_id` — attach it so the next run resumes instead of
+        resubmitting. Restores per-cid order from the submission record."""
+        rec = self.get_sub(sub)
+        if rec is None:
+            raise ValueError(f"no submission {sub!r} in the ledger")
+        for cid in rec["cids"]:
+            old = self.get_cid(cid) or {}
+            self.set_cid(cid, state="open", sub=sub, batch_id=batch_id,
+                         provider=rec.get("provider"), key=old.get("key"))
+        self.set_batch(batch_id, order=rec["cids"], sub=sub,
+                       model=rec.get("model"), provider=rec.get("provider"),
+                       dropped=[])
+        return len(rec["cids"])
 
 
 # ---------------------------------------------------------------------------
@@ -463,31 +506,42 @@ class BatchHandle:
     @classmethod
     def from_ledger(cls, batch_id_or_sub, timeout=None, ledger=None):
         ledger = ledger or _Ledger()
-        target = None
-        for row in ledger.rows():
-            if batch_id_or_sub in (row.get("batch_id"), row.get("sub")):
-                target = row if target is None or row["ts"] >= target["ts"] \
-                    else target
-        if target is None:
-            raise ValueError(f"no ledger row for {batch_id_or_sub!r} in "
-                             f"{ledger.path}")
-        if target.get("event") == "closed":
+        meta = ledger.get_batch(batch_id_or_sub)
+        batch_id = batch_id_or_sub if meta else None
+        if meta is None:
+            # Maybe a submission id: resolve through its cids' states.
+            sub_rec = ledger.get_sub(batch_id_or_sub)
+            if sub_rec is None:
+                raise ValueError(
+                    f"no ledger record for {batch_id_or_sub!r} under "
+                    f"{ledger.root}")
+            states = ledger.states_for(sub_rec["cids"])
+            open_ids = {s.get("batch_id") for s in states.values()
+                        if s.get("state") == "open"}
+            if not open_ids:
+                if any(s.get("state") == "submitting"
+                       for s in states.values()):
+                    raise AmbiguousBatchState(
+                        AmbiguousBatchState.__doc__
+                        + f"\n\nsubmission id: {batch_id_or_sub}")
+                raise ValueError(
+                    f"submission {batch_id_or_sub!r} has no open batch — "
+                    f"already collected or abandoned.")
+            batch_id = open_ids.pop()
+            meta = ledger.get_batch(batch_id)
+        sub = meta["sub"]
+        cids = meta["order"] or ledger.get_sub(sub)["cids"]
+        states = ledger.states_for(cids)
+        if states and all(s.get("state") == "closed"
+                          for s in states.values()):
             raise ValueError(
-                f"batch {batch_id_or_sub!r} is already collected (ledger "
-                f"row closed) — its results are in the stash; a warm run "
-                f"serves them.")
-        if target.get("event") == "submitting":
-            raise AmbiguousBatchState(AmbiguousBatchState.__doc__)
-        sub = target["sub"]
-        side = ledger.read_sidecar(sub)
-        return cls(target.get("provider"), side["model"],
-                   target.get("batch_id"), sub,
-                   {c: json.loads(k) for c, k in side["keys"].items()},
-                   # JSON object keys are strings; indices must come back
-                   # as the ints they were.
-                   {c: int(i) for c, i in side.get("indices", {}).items()},
-                   side.get("order"), side.get("dropped", ()),
-                   ledger=ledger)
+                f"batch {batch_id_or_sub!r} is already collected — its "
+                f"results are in the stash; a warm run serves them.")
+        cid_to_key = {c: s.get("key") for c, s in states.items()
+                      if s.get("key") is not None}
+        return cls(meta.get("provider"), meta.get("model"), batch_id, sub,
+                   cid_to_key, {}, meta.get("order"),
+                   meta.get("dropped", ()), ledger=ledger)
 
     def adapter(self, timeout=None):
         if self._adapter is None:
@@ -617,11 +671,17 @@ class BatchHandle:
                     "prompt_head": (key.get("prompt") or "")[:200],
                     "raw": "", "transport": "batch",
                 }
-        self._ledger.append({"event": "closed", "sub": self.sub,
-                             "batch_id": self.batch_id,
-                             "provider": self.provider,
-                             "n_ok": n_ok, "n_fallback": n_fallback,
-                             "n_missing": len(missing)})
+        for cid in self.cid_to_key:
+            self._ledger.set_cid(cid, state="closed", sub=self.sub,
+                                 batch_id=self.batch_id,
+                                 provider=self.provider)
+        self._ledger.set_batch(self.batch_id, order=self.order,
+                               sub=self.sub, model=self.model,
+                               provider=self.provider,
+                               dropped=list(self.dropped),
+                               closed=True, n_ok=n_ok,
+                               n_fallback=n_fallback,
+                               n_missing=len(missing))
         if n_fallback or missing:
             log.warning(
                 "batch %s: %d ok, %d sync fallbacks (billed at list), %d "
@@ -728,10 +788,44 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
         seen[cid] = i
         to_compute.append((i, cid, prompt, key, metadata))
 
-    if probe and to_compute:
-        i, cid, prompt, key, metadata = to_compute[0]
+    # Per-item ledger resolution: open items resume their batches;
+    # submitting items stop (fresh -> another process; stale ->
+    # ambiguous); everything else submits fresh.
+    states = ledger.states_for([item[1] for item in to_compute])
+    resume_by_batch = {}
+    fresh = []
+    now = time.time()
+    for item in to_compute:
+        st = states.get(item[1])
+        if st and st["state"] == "submitting":
+            # Checked BEFORE force: force is cache discipline, not
+            # permission to double-bill through the one ambiguous state.
+            if now - st["ts"] < _SUBMITTING_FRESH_SECONDS:
+                raise BatchInProgress(
+                    BatchInProgress.__doc__
+                    + f"\n\nsubmission id: {st.get('sub')}")
+            raise AmbiguousBatchState(
+                AmbiguousBatchState.__doc__
+                + f"\n\nsubmission id: {st.get('sub')}")
+        if st is None or st["state"] in ("closed", "abandoned") or force:
+            if force and st and st["state"] == "open":
+                log.warning(
+                    "batch: force=True resubmits %s… already live in "
+                    "batch %s — that batch's spend is orphaned, "
+                    "deliberately", item[1][:12], st["batch_id"])
+            fresh.append(item)
+        elif st["state"] == "open":
+            resume_by_batch.setdefault(st["batch_id"], []).append(item)
+
+    # PROBE AFTER RESOLUTION, from the fresh set only. Probing before
+    # resolution sync-billed one item per rerun that was already sitting
+    # in an open (or ambiguous) batch — silently draining an
+    # AmbiguousBatchState one paid call at a time instead of stopping,
+    # and double-paying items whose results the batch already holds.
+    if probe and fresh:
+        i, cid, prompt, key, metadata = fresh[0]
         log.info("batch probe: 1 sync call before committing %d requests",
-                 len(to_compute) - 1)
+                 len(fresh) - 1)
 
         def probe_sink(u):
             u = dict(u, transport="sync-probe")
@@ -744,32 +838,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
             max_tokens=max_tokens, retries=retries, force=force,
             cache_ttl=cache_ttl, metadata=metadata, usage_sink=probe_sink,
             **kwargs)
-        to_compute = to_compute[1:]
-
-    # Per-item ledger resolution: open items resume their batches;
-    # submitting items stop (fresh -> another process; stale ->
-    # ambiguous); everything else submits fresh.
-    states = ledger.cid_states()
-    resume_by_batch = {}
-    fresh = []
-    now = time.time()
-    for item in to_compute:
-        st = states.get(item[1])
-        if st and st["state"] == "submitting":
-            # Checked BEFORE force: force is cache discipline, not
-            # permission to double-bill through the one ambiguous state.
-            if now - st["ts"] < _SUBMITTING_FRESH_SECONDS:
-                raise BatchInProgress(BatchInProgress.__doc__)
-            raise AmbiguousBatchState(AmbiguousBatchState.__doc__)
-        if st is None or st["state"] in ("closed", "abandoned") or force:
-            if force and st and st["state"] == "open":
-                log.warning(
-                    "batch: force=True resubmits %s… already live in "
-                    "batch %s — that batch's spend is orphaned, "
-                    "deliberately", item[1][:12], st["batch_id"])
-            fresh.append(item)
-        elif st["state"] == "open":
-            resume_by_batch.setdefault(st["batch_id"], []).append(item)
+        fresh = fresh[1:]
 
     handles = []
     for batch_id, items in resume_by_batch.items():
@@ -819,19 +888,14 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
         for chunk in chunks:
             sub = f"sub-{int(time.time() * 1e6)}-{os.getpid()}"
             cids = [c[1] for c in chunk]
-            ledger.write_sidecar(sub, {
-                "model": model,
-                "keys": {c[1]: json.dumps(c[3], sort_keys=True,
-                                          default=str) for c in chunk},
-                "indices": {c[1]: c[0] for c in chunk},
-                "order": cids,
-                "dropped": list(dropped_all),
-            })
-            # Read-decide-append under the lock: two processes over the
-            # same items must not both submit.
-            fh = ledger.lock()
+            ledger.set_sub(sub, cids, adapter.provider, model)
+            # Read-decide-append under hashstash's cross-process key_lock:
+            # the flock on individual appends covers only the append, and
+            # an unlocked read-decide race measured 8/8 double-submissions
+            # in the hashstash seat's 8-process test.
+            lk = ledger.lock()
             try:
-                latest = ledger.cid_states()
+                latest = ledger.states_for(cids)
                 clash = [
                     c for c in cids
                     if latest.get(c, {}).get("state") == "submitting"
@@ -839,16 +903,23 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
                         and not force)
                 ]
                 if clash:
-                    raise BatchInProgress(BatchInProgress.__doc__)
-                ledger.append({"event": "submitting", "sub": sub,
-                               "provider": adapter.provider, "model": model,
-                               "cids": cids, "pid": os.getpid()})
+                    raise BatchInProgress(
+                        BatchInProgress.__doc__ + f"\n\nsubmission id: "
+                        f"{latest[clash[0]].get('sub')}")
+                for i, cid, prompt, key, req in chunk:
+                    ledger.set_cid(cid, state="submitting", sub=sub,
+                                   batch_id=None,
+                                   provider=adapter.provider, key=key)
             finally:
-                _Ledger.unlock(fh)
+                _Ledger.unlock(lk)
             batch_id = adapter.submit([(c[1], c[4]) for c in chunk])
-            ledger.append({"event": "open", "sub": sub,
-                           "provider": adapter.provider,
-                           "batch_id": batch_id, "cids": cids})
+            for i, cid, prompt, key, req in chunk:
+                ledger.set_cid(cid, state="open", sub=sub,
+                               batch_id=batch_id,
+                               provider=adapter.provider, key=key)
+            ledger.set_batch(batch_id, order=cids, sub=sub, model=model,
+                             provider=adapter.provider,
+                             dropped=list(dropped_all))
             log.info("batch: submitted %d requests to %s as %s",
                      len(chunk), adapter.provider, batch_id)
             handles.append(BatchHandle(

@@ -280,11 +280,22 @@ What makes it safe to use on registered work:
   streaming path computes — transport is not part of an administration's
   identity — so warm reads serve batch results, a half-warm stash batches
   only its cold half, and force/cache-cold discipline is unchanged.
-- **Ledger before money** (`data/batch_ledger/ledger.jsonl`). A rerun over
-  the same items *resumes* the open batch rather than resubmitting; a
+- **Ledger before money** (`data/batch_ledger/`, a sibling-root pairtree
+  HashStash — settled with the hashstash seat from multi-process test
+  receipts: sibling because `parent.clear()` destroys nested sub-stashes
+  and a billing record must not share a lifetime with a cache; pairtree
+  because atomic-rename-per-version has no torn-line failure class;
+  `append_mode` versioning IS the submitting→open→closed audit trail via
+  `_Ledger().history(cid)`). Resolution is **per item**: a rerun over any
+  overlap — subsets, after partial progress — resumes the open batch; a
   process that died inside the submission call leaves the one ambiguous
-  state, which raises `AmbiguousBatchState` with operator instructions
-  rather than guessing. `force=True` resubmits deliberately.
+  state, which raises `AmbiguousBatchState` with working operator
+  resolutions (`_Ledger().attach(sub, batch_id)` / `.abandon(sub)`)
+  rather than guessing, and `force=True` cannot bypass it. The
+  read-decide-submit section runs under hashstash's cross-process
+  `key_lock` (an unlocked race measured 8/8 double-submissions). Stated
+  limits: the lock is a local flock — one machine per task's batches —
+  and no fsync means an OS crash can lose page-cached records.
 - **Probe-first** (default): one sync call before submission catches
   rejected params where a batch has no repair loop, warms the OpenAI
   param-rename memo, and is `fail_fast`'s only meaningful moment — after

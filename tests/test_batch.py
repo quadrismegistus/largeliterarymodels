@@ -86,6 +86,19 @@ def _run(llm, fake, prompts, monkeypatch, ledger=None, **kw):
                            ledger=ledger, **kw)
 
 
+def _age_submission(ledger, sub, seconds=3600):
+    """Backdate a submission's cid records past the fresh window."""
+    rec = ledger.get_sub(sub)
+    for cid in rec["cids"]:
+        st = dict(ledger.get_cid(cid))
+        ts = st.pop("ts")
+        ledger.set_cid(cid, ts=ts - seconds, **st)
+
+
+def _sub_from_exc(excinfo):
+    return str(excinfo.value).rsplit("submission id: ", 1)[1].strip()
+
+
 def _sync_provider(**kw):
     """A well-behaved provider for probe/fallback sync calls."""
     if "usage_sink" in kw and kw["usage_sink"]:
@@ -217,11 +230,13 @@ class TestLedgerMoneySafety:
             with pytest.raises(KeyboardInterrupt):
                 _run(_llm(stash), Dies(), ["a", "b", "c"], monkeypatch,
                      ledger=ledger, probe=True)
-        # Age the submitting row past the fresh window.
-        rows = [json.loads(l) for l in open(ledger.path)]
-        rows[-1]["ts"] -= 3600
-        open(ledger.path, "w").write(
-            "\n".join(json.dumps(r) for r in rows) + "\n")
+        # A fresh row reads as another process; age it past the window.
+        with patch("largeliterarymodels.llm._call_provider",
+                   side_effect=_sync_provider):
+            with pytest.raises(B.BatchInProgress) as exc:
+                _run(_llm(stash), fake, ["a", "b", "c"], monkeypatch,
+                     ledger=ledger, probe=True)
+        _age_submission(ledger, _sub_from_exc(exc))
         with patch("largeliterarymodels.llm._call_provider",
                    side_effect=_sync_provider):
             with pytest.raises(B.AmbiguousBatchState):
@@ -254,10 +269,10 @@ class TestLedgerMoneySafety:
         with pytest.raises(KeyboardInterrupt):
             _run(_llm(stash), Dies(), ["a"], monkeypatch, ledger=ledger,
                  probe=False)
-        rows = [json.loads(l) for l in open(ledger.path)]
-        rows[-1]["ts"] -= 3600
-        open(ledger.path, "w").write(
-            "\n".join(json.dumps(r) for r in rows) + "\n")
+        with pytest.raises(B.BatchInProgress) as exc:
+            _run(_llm(stash), FakeAdapter(), ["a"], monkeypatch,
+                 ledger=ledger, probe=False)
+        _age_submission(ledger, _sub_from_exc(exc))
         with pytest.raises(B.AmbiguousBatchState):
             _run(_llm(stash), FakeAdapter(), ["a"], monkeypatch,
                  ledger=ledger, probe=False, force=True)
@@ -274,25 +289,32 @@ class TestLedgerMoneySafety:
         with pytest.raises(KeyboardInterrupt):
             _run(_llm(stash), Dies(), ["a"], monkeypatch, ledger=ledger,
                  probe=False)
-        sub = [json.loads(l) for l in open(ledger.path)][-1]["sub"]
-        ledger.append({"event": "abandoned", "sub": sub})
+        with pytest.raises(B.BatchInProgress) as exc:
+            _run(_llm(stash), FakeAdapter(), ["a"], monkeypatch,
+                 ledger=ledger, probe=False)
+        sub = _sub_from_exc(exc)
+        _age_submission(ledger, sub)
+        ledger.abandon(sub)
         fake = FakeAdapter()
         results = _run(_llm(stash), fake, ["a"], monkeypatch,
                        ledger=ledger, probe=False)
         assert results[0].x == 1 and len(fake.submitted) == 1
 
-    def test_torn_ledger_line_does_not_block(self, ledger, monkeypatch,
-                                             caplog):
+    def test_stray_garbage_in_ledger_dir_does_not_block(self, ledger,
+                                                        monkeypatch):
+        """Pairtree has no torn-line failure class (one file per version,
+        atomic rename — hashstash seat's SIGKILL receipts); a stray temp
+        file from a killed writer must be invisible."""
+        import os
         stash = FakeStash()
         fake = FakeAdapter()
         _run(_llm(stash), fake, ["a"], monkeypatch, ledger=ledger,
              probe=False)
-        with open(ledger.path, "a") as f:
-            f.write('{"event": "submitting", "sub": "torn')  # killed mid-write
+        with open(os.path.join(ledger.root, "garbage.tmp.99999"), "w") as f:
+            f.write("{torn nonsense")
         results = _run(_llm(stash), fake, ["b"], monkeypatch,
                        ledger=ledger, probe=False)
         assert results[0].x == 1
-        assert "unparseable line" in caplog.text
 
     def test_concurrent_processes_submit_once(self, ledger, monkeypatch):
         """Two threads, same items: the lock's read-decide-append must
@@ -341,7 +363,7 @@ class TestLedgerMoneySafety:
                       probe=False, wait=False)
         with pytest.raises(RuntimeError, match="still processing"):
             handle.collect(_llm(stash), Out)
-        states = ledger.cid_states()
+        states = ledger.states_for(list(handle.cid_to_key))
         assert all(s["state"] == "open" for s in states.values())
 
     def test_recollecting_a_closed_batch_raises(self, ledger, monkeypatch):
@@ -375,8 +397,10 @@ class TestLedgerMoneySafety:
         monkeypatch.setattr(B, "_adapter_for", lambda m, t=None: fake)
         llm2 = _llm(FakeStash())
         got = fresh.collect(llm2, Out)
-        by_index = {fresh.cid_to_index[c]: v for c, v in got.items()}
-        assert {int(i): v.x for i, v in by_index.items()} == \
+        # A from_ledger handle has no run-local indices; submission order
+        # (persisted) is the positional truth.
+        by_pos = {fresh.order.index(c): v for c, v in got.items()}
+        assert {i: v.x for i, v in by_pos.items()} == \
             {0: 0, 1: 1, 2: 2}, "results must map to THEIR items"
 
     def test_all_errored_batch_aborts_instead_of_repaying_corpus(
@@ -398,9 +422,10 @@ class TestLedgerMoneySafety:
                      monkeypatch, ledger=ledger, probe=False)
         assert len(sync_calls) < 8, \
             f"{len(sync_calls)} sync calls — the corpus was being repaid"
-        states = ledger.cid_states()
+        submitted_cids = [c for c, _ in fake.submitted[0]]
+        states = ledger.states_for(submitted_cids)
         assert all(s["state"] == "open" for s in states.values()), \
-            "the row must stay open: results remain on the provider"
+            "the records must stay open: results remain on the provider"
 
 
 class TestReceipts:

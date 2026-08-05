@@ -166,6 +166,18 @@ class RawLog:
         is unaccounted — treat unaccounted as dropped, never as clean:
         receipt retention bounds what absence can be EXPLAINED, never
         what presence PROVES.
+
+        KEY PROVENANCE IS THE CLAIM'S FOUNDATION: `keys` must come from
+        a record INDEPENDENT of this sidecar — the annotation stash (the
+        record of what was completed), the batch ledger, the input
+        manifest. Never pass keys derived from the sidecar itself
+        (RawLog.keys() or anything downstream of it): a dropped body
+        takes its key with it and never appears in the denominator, so
+        certify would be checking a set against itself and complete=True
+        would be guaranteed by construction rather than earned — a guard
+        taking its threshold from the artifact it guards (malign-logits
+        seat). The tautology is exhibited, deliberately, in the test
+        suite.
         """
         report = self.audit(keys)
         recs = self.receipts()

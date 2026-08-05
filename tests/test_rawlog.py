@@ -248,6 +248,33 @@ class TestReceiptRetention:
         assert cert["complete"] is True
         assert cert["firings_retained"] == 0
 
+    def test_certify_against_self_derived_keys_is_a_tautology(
+            self, rawlog):
+        """Executable warning, not a feature. Keys derived FROM the
+        sidecar make certify() check a set against itself: a dropped
+        body takes its key with it and never appears in the
+        denominator, so complete=True is guaranteed by construction
+        rather than earned — a guard taking its threshold from the
+        artifact it guards. The claim is a cross-check only when keys
+        come from an independent record (the annotation stash, the
+        ledger, the input manifest). Exhibited here so nobody
+        rediscovers it as a surprise."""
+        rawlog.record({"k": 0}, {"b": 1})
+        with patch.object(type(rawlog.stash), "__setitem__",
+                          side_effect=OSError("down")):
+            rawlog.record({"k": 1}, {"b": 1})  # dropped; key never lands
+        # (The failure-triggered flush ran INSIDE the outage and was lost
+        # with the body — the correlated-failure caveat, live. Store back
+        # up: retain the count, as the crash-recovery path would.)
+        rawlog.flush_receipt()
+        tautology = rawlog.certify(rawlog.keys())  # self-derived scope
+        assert tautology["complete"] is True, \
+            "the drop is invisible to a denominator the sidecar chose"
+        honest = rawlog.certify([{"k": 0}, {"k": 1}])  # independent scope
+        assert honest["complete"] is False
+        assert honest["known_drops"] == 1, \
+            "the independent denominator sees what the self-check cannot"
+
     def test_certify_treats_unaccounted_absence_as_dropped(self, rawlog):
         """Missing beyond what retained receipts explain must surface as
         unaccounted — never fold into 'clean': retention bounds what

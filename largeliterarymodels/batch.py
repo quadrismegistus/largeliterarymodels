@@ -126,6 +126,20 @@ class _Ledger:
     discipline per task is the operating assumption.
     """
 
+    # ONE global lock per ledger, deliberately — not per-cid and not
+    # per-chunk. Per-cid would mean acquiring N flocks in sequence: not
+    # atomic (another process can be mid-sequence on an overlapping set)
+    # and a deadlock under different acquisition orders, since the
+    # underlying flock is blocking with no timeout. Per-chunk sounds
+    # cleaner but reintroduces the first hazard here, because chunk
+    # boundaries are NOT stable identities — chunking depends on the
+    # cold set, which shifts between runs, so two processes with
+    # overlapping items chunked differently would hold different locks
+    # while racing the same cids. The cost of global is serializing a
+    # milliseconds-long scan-and-mark section that never spans the
+    # network submit; the benefit is that the critical section's
+    # identity cannot drift out from under it. (Hazard analysis from
+    # the hashstash seat; the choice and its rationale are ours.)
     _SUBMIT_LOCK = "__batch_submit__"
 
     def __init__(self, root=None):

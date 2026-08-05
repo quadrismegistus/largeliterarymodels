@@ -553,3 +553,34 @@ class TestSurface:
         results = task.map(["a", "b"], batch=True, probe=False, retries=2,
                            ledger=ledger)
         assert [r.x for r in results] == [1, 1]
+
+
+class TestLockDesign:
+    def test_submit_lock_is_global_not_chunk_shaped(self, ledger):
+        """Design pin: the submit lock's identity must not depend on what
+        is being submitted. Per-cid locks deadlock under differently-
+        ordered overlapping sets (blocking flock, no timeout); per-chunk
+        locks race on shared cids because chunk boundaries shift with the
+        cold set. If this test fails, someone 'optimized' the lock —
+        re-read the comment on _SUBMIT_LOCK before shipping it."""
+        import largeliterarymodels.batch as B2
+        assert B2._Ledger._SUBMIT_LOCK == "__batch_submit__"
+        # Two ledgers over the same root contend on the same lock file
+        # regardless of any chunk identity.
+        other = B2._Ledger(root=ledger.root)
+        lk = ledger.lock()
+        try:
+            import threading
+            acquired = threading.Event()
+
+            def try_other():
+                lk2 = other.lock()
+                acquired.set()
+                B2._Ledger.unlock(lk2)
+            t = threading.Thread(target=try_other, daemon=True)
+            t.start()
+            t.join(timeout=0.3)
+            assert not acquired.is_set(), \
+                "second locker must block while the first holds"
+        finally:
+            B2._Ledger.unlock(lk)

@@ -530,6 +530,27 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
                   and unchangeable now without orphaning every
                   metadata-bearing key, which is the norm for litmod
                   runs. Treat metadata as identity, not decoration.
+        schema_name: A DISCRIMINATOR, not the schema's identity carrier.
+                  On the extract path the built instrument — which
+                  embeds the schema's full JSON spec, descriptions
+                  included — is this key's system_prompt, so a field
+                  OR description change re-keys (same sign as
+                  metadata: costs money, receipts honest; for a
+                  research instrument a "cosmetic" edit to the
+                  questionnaire is an edit to the questionnaire).
+                  Custom cache_key dicts are the exception: they carry
+                  schema by NAME only, so a questionnaire change does
+                  NOT re-key there and a warm read serves answers to a
+                  question that no longer exists (malign seat's
+                  mirror-image report). The sanctioned mechanisms:
+                  SequentialTask.prompt_version (enters the chunk key;
+                  for revisions of the same construct) or rename the
+                  class (for a different construct). One validation
+                  backstop and its stated limit: warm hits re-validate
+                  against the CURRENT schema and recompute on failure,
+                  but pydantic ignores extra fields, so a pure field
+                  REMOVAL leaves old rows validating — the one drift
+                  validation cannot see.
         images: Optional list of images. Paths are keyed as-is; bytes and
                 PIL images are keyed by content hash (bytes are not stored).
         thinking: The resolved thinking state ("disabled"/"enabled") when a

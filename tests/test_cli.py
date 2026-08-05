@@ -398,3 +398,73 @@ class TestPriceShellReviewFindings:
         rc, out, err = self._run(["price", "--cached", "10000000",
                                   "--prefix-tokens", "2000"], capsys)
         assert rc == 0 and "!no-cache" in out
+
+
+class TestPathResolution:
+    """resolve() accepts path/to/task.py[:ClassName] — first-class CLI
+    support for instruments living outside the package (the lltk
+    boundary applied to the CLI: research tasks in research repos)."""
+
+    def _write(self, tmp_path, body, name="mytask.py"):
+        f = tmp_path / name
+        f.write_text(
+            "from pydantic import BaseModel\n"
+            "from largeliterarymodels.task import Task\n"
+            "class Sch(BaseModel):\n    x: int\n" + body)
+        return str(f)
+
+    def test_single_class_resolves_with_no_adapter(self, tmp_path):
+        from largeliterarymodels.cli.registry import resolve
+        path = self._write(tmp_path,
+                           "class MyTask(Task):\n"
+                           "    schema = Sch\n"
+                           "    system_prompt = 'sys'\n")
+        cls, adapter = resolve(path)
+        assert cls.__name__ == "MyTask" and adapter is None
+        assert cls().schema is not None
+
+    def test_multiple_classes_require_explicit_name(self, tmp_path):
+        import pytest
+        from largeliterarymodels.cli.registry import resolve
+        path = self._write(tmp_path,
+                           "class TaskA(Task):\n    schema = Sch\n"
+                           "class TaskB(Task):\n    schema = Sch\n")
+        with pytest.raises(SystemExit, match="TaskA"):
+            resolve(path)
+        cls, _ = resolve(f"{path}:TaskB")
+        assert cls.__name__ == "TaskB"
+
+    def test_imported_classes_are_not_candidates(self, tmp_path):
+        """A file importing a Task must not ambiguously 'define' it —
+        only classes created in the file count."""
+        import pytest
+        from largeliterarymodels.cli.registry import resolve
+        path = self._write(
+            tmp_path,
+            "from largeliterarymodels.task import SequentialTask\n"
+            "class Mine(Task):\n    schema = Sch\n")
+        cls, _ = resolve(path)
+        assert cls.__name__ == "Mine", \
+            "imported SequentialTask must not create ambiguity"
+
+    def test_errors_are_specific(self, tmp_path):
+        import pytest
+        from largeliterarymodels.cli.registry import resolve
+        with pytest.raises(SystemExit, match="No such task file"):
+            resolve(str(tmp_path / "absent.py"))
+        empty = self._write(tmp_path, "", name="empty.py")
+        with pytest.raises(SystemExit, match="DEFINED"):
+            resolve(empty)
+        path = self._write(tmp_path, "class C(Task):\n    schema = Sch\n",
+                           name="named.py")
+        with pytest.raises(SystemExit, match="no Task subclass named"):
+            resolve(f"{path}:Wrong")
+        broken = tmp_path / "broken.py"
+        broken.write_text("import nonexistent_module_xyz\n")
+        with pytest.raises(SystemExit, match="Could not import"):
+            resolve(str(broken))
+
+    def test_registered_names_unchanged(self):
+        from largeliterarymodels.cli.registry import resolve
+        cls, adapter = resolve("GenreTask")
+        assert cls.__name__ == "GenreTask" and adapter is not None

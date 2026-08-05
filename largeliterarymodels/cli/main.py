@@ -40,13 +40,16 @@ def cmd_ls(_args) -> int:
 def cmd_show(args) -> int:
     task_cls, adapter = resolve(args.task)
     print(f"task:   {args.task}")
-    print(f"family: {adapter.family}")
+    print(f"family: {adapter.family if adapter else '(file task — no adapter)'}")
     print(f"schema: {task_cls.schema.__name__}")
     print()
     print("--- JSON schema ---")
     print(json.dumps(task_cls.schema.model_json_schema(), indent=2))
     print()
     print("--- fixtures ---")
+    if adapter is None:
+        print("(file tasks have no fixture adapter)")
+        return 0
     try:
         fx = adapter.fixtures()
     except (SystemExit, Exception) as e:  # noqa: BLE001 — adapters raise SystemExit on missing data
@@ -204,6 +207,12 @@ def _run_model(task, prompts, metas, model_id, num_workers):
 
 def cmd_smoke(args) -> int:
     task_cls, adapter = resolve(args.task)
+    if adapter is None:
+        raise SystemExit(
+            f"{args.task}: a task loaded from a file has no fixture "
+            f"adapter, and smoke runs on fixtures. Use `litmod annotate` "
+            f"or `render` with it, or smoke from Python: "
+            f"TaskClass().run(text).")
     tags = [t.strip() for t in args.model.split(',') if t.strip()]
     if not tags:
         raise SystemExit("--model is required")
@@ -247,6 +256,12 @@ def cmd_run(args) -> int:
     import pandas as pd
 
     task_cls, adapter = resolve(args.task)
+    if adapter is None:
+        raise SystemExit(
+            f"{args.task}: a task loaded from a file has no input "
+            f"adapter, and run needs one to load records. Run it from "
+            f"Python (task.map with your own manifest), or register an "
+            f"adapter family.")
     model = resolve_model(args.model)
     print(f"task={args.task} model={model} num_workers={args.num_workers} "
           f"input={args.input}", file=sys.stderr, flush=True)
@@ -465,7 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_ls)
 
     sp = sub.add_parser('show', help='show task schema + fixtures')
-    sp.add_argument('task')
+    sp.add_argument('task', help='registered task name, or '
+                    'path/to/task.py[:ClassName]')
     sp.set_defaults(func=cmd_show)
 
     sp = sub.add_parser(
@@ -484,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         'render',
         help='print the task instrument as one self-contained string')
-    sp.add_argument('task')
+    sp.add_argument('task', help='registered task name, or path/to/task.py[:ClassName]')
     sp.add_argument('--item', default=None,
                     help='item text to append as the item to annotate')
     sp.add_argument('--item-file', default=None,
@@ -527,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_price)
 
     sp = sub.add_parser('smoke', help='run task on fixtures')
-    sp.add_argument('task')
+    sp.add_argument('task', help='registered task name, or path/to/task.py[:ClassName]')
     sp.add_argument('--model', required=True,
                     help='short tag (sonnet, opus, qwen-35b, ...) or '
                          'full ID. Comma-separate multiple models for '
@@ -537,7 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser('annotate',
                         help='serve human annotation web app for a task')
-    sp.add_argument('task')
+    sp.add_argument('task', help='registered task name, or path/to/task.py[:ClassName]')
     sp.add_argument('--annotator', default='default',
                     help='annotator identifier (used as JSONL filename suffix)')
     sp.add_argument('--port', type=int, default=8989)
@@ -576,7 +592,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_cloud)
 
     sp = sub.add_parser('run', help='run task over a manifest CSV')
-    sp.add_argument('task')
+    sp.add_argument('task', help='registered task name, or path/to/task.py[:ClassName]')
     sp.add_argument('--input', required=True,
                     help='path to manifest CSV (adapter decides required cols)')
     sp.add_argument('--model', required=True,

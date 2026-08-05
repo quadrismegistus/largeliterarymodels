@@ -5,7 +5,7 @@ google-genai>=1.0
 # legacy_read + a migration tool. data/stash was migrated to the 1.0
 # layout on 2026-07-07 (34 stashes, 149,288 entries, verified against
 # 0.4 ground truth; old *.lz4+b64 dirs retained as rollback copies).
-hashstash[rec]>=1.0.1
+hashstash[rec]>=1.2.0
 pydantic>=2.0
 json-repair>=0.25
 tqdm>=4.64

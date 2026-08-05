@@ -238,7 +238,7 @@ def openai_request_body(provider, model, messages, temperature=0.7,
 
 def _chat_completion(client, provider, model, messages, temperature, max_tokens,
                      usage_sink=None, dropped_hint=(), usage_filter=None,
-                     **extra):
+                     raw_sink=None, **extra):
     """POST an OpenAI-compatible chat completion, repairing rejected params.
 
     Shared by the OpenAI, DeepSeek, and local-endpoint providers so a rename
@@ -315,6 +315,8 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
             if usage_filter is not None:
                 u = usage_filter(u, response) or u
             usage_sink(u)
+        if raw_sink is not None:
+            raw_sink(serialize_response(response))
         return response
 
     # Chain the API's own error: it is the one artifact this whole design
@@ -325,6 +327,29 @@ def _chat_completion(client, provider, model, messages, temperature, max_tokens,
         f"{model!r} after trying output-length parameter names {sorted(tried)}. "
         f"Last API error: {last_exc}"
     ) from last_exc
+
+
+def serialize_response(response):
+    """Best-effort plain-JSON serialisation of a provider SDK response.
+
+    For the raw-response sidecar: the receipts carry only fields the
+    normalizers knew to extract when they were written, and every
+    provider-drift bug was diagnosed from a raw response that had
+    already been discarded. Best-effort by design — a body that cannot
+    be serialised is recorded as its repr rather than failing anything.
+    """
+    if isinstance(response, (dict, list, str)):
+        return response
+    for attempt in (lambda: response.model_dump(mode="json"),
+                    lambda: response.model_dump(),
+                    lambda: response.to_dict()):
+        try:
+            out = attempt()
+        except Exception:  # noqa: BLE001 — try the next serialiser
+            continue
+        if isinstance(out, (dict, list)):
+            return out
+    return {"unserialisable": repr(response)[:100_000]}
 
 
 # ---------------------------------------------------------------------------
@@ -1298,7 +1323,7 @@ def anthropic_request_params(prompt, model="claude-sonnet-4-6",
 def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
                    temperature=0.7, max_tokens=4096, images=None,
                    timeout=None, cache_ttl=None, usage_sink=None,
-                   thinking="auto", **kwargs):
+                   thinking="auto", raw_sink=None, **kwargs):
     """Call Anthropic's Claude API directly.
 
     Args:
@@ -1339,6 +1364,8 @@ def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
         if dropped:
             u["dropped_params"] = tuple(dropped)
         usage_sink(u)
+    if raw_sink is not None:
+        raw_sink(serialize_response(response))
     return _response_text(response.content, model,
                           stop_reason=getattr(response, "stop_reason", None))
 
@@ -1441,7 +1468,7 @@ def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
 
 def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None,
-                timeout=None, usage_sink=None, **kwargs):
+                timeout=None, usage_sink=None, raw_sink=None, **kwargs):
     """Call OpenAI's API directly.
 
     The gpt-5 tier renamed max_tokens to max_completion_tokens and 400s on
@@ -1460,7 +1487,7 @@ def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
 
     response = _chat_completion(
         client, "openai", model, messages, temperature, max_tokens,
-        usage_sink=usage_sink,
+        usage_sink=usage_sink, raw_sink=raw_sink,
     )
     return response.choices[0].message.content
 
@@ -1468,7 +1495,7 @@ def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
 def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
                   temperature=0.7, max_tokens=4096, images=None,
                   timeout=None, usage_sink=None, thinking="auto",
-                  extra_body=None, **kwargs):
+                  extra_body=None, raw_sink=None, **kwargs):
     """Call DeepSeek's API (OpenAI-compatible, text-only).
 
     Args:
@@ -1553,7 +1580,7 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
     response = _chat_completion(
         client, "deepseek", model, messages, temperature, max_tokens,
         usage_sink=usage_sink, dropped_hint=dropped_hint,
-        usage_filter=_audit_filter,
+        usage_filter=_audit_filter, raw_sink=raw_sink,
         **({"extra_body": body} if body else {}),
         **_api_kwargs(kwargs),
     )
@@ -1604,7 +1631,8 @@ def google_request(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
 
 def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None,
-                timeout=None, usage_sink=None, thinking="auto", **kwargs):
+                timeout=None, usage_sink=None, thinking="auto",
+                raw_sink=None, **kwargs):
     """Call Google's GenAI API directly.
 
     Args:
@@ -1682,6 +1710,8 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
             )
     if usage_sink is not None:
         usage_sink(_usage_google(response))
+    if raw_sink is not None:
+        raw_sink(serialize_response(response))
     text = response.text
     if text is None:
         # A thinking model can spend the whole max_output_tokens budget on
@@ -1750,7 +1780,7 @@ def _resolve_local_base_url(model: str) -> str:
 
 def call_local(prompt, model="llama3.3", system_prompt=None,
                temperature=0.7, max_tokens=4096, images=None,
-               timeout=None, usage_sink=None, **kwargs):
+               timeout=None, usage_sink=None, raw_sink=None, **kwargs):
     """Call a local OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp server).
 
     Routing is prefix-pinned: `lmstudio/<model>` always hits LM Studio (port
@@ -1788,7 +1818,7 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     try:
         response = _chat_completion(
             client, "local", model, messages, temperature, max_tokens,
-            usage_sink=usage_sink, extra_body=extra_body,
+            usage_sink=usage_sink, raw_sink=raw_sink, extra_body=extra_body,
         )
     except Exception as e:
         msg = str(e).lower()

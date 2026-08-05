@@ -97,6 +97,13 @@ class Task:
     # response_model) to data/usage_logs/<task_name>.jsonl. Additive: no
     # stash value or key is touched, old entries simply have no log rows.
     usage_log = False
+    # Opt-in raw-response sidecar (rawlog.RawLog). The stash stores only
+    # the answer text and the receipts only the fields the normalizers
+    # knew to extract — raw_log=True keeps the provider's serialized body,
+    # whole, in data/raw_responses under the SAME key as the annotation
+    # (True for the default root; a path or RawLog instance to relocate).
+    # Additive: off constructs no sink and touches no write path.
+    raw_log = False
 
     # Attributes settable via __init__ kwargs even when the class doesn't
     # declare them (subclasses commonly set `model` as a class attribute,
@@ -117,6 +124,7 @@ class Task:
         self._stash = None
         self._human_stashes = {}
         self._usage = None
+        self._raw_log = None
 
     @property
     def task_name(self):
@@ -188,7 +196,16 @@ class Task:
             # One tracker per Task, shared by every LLM it builds, so counts
             # accumulate across run/map calls instead of resetting per call.
             usage=self.usage,
+            raw_log=self._resolved_raw_log(),
         )
+
+    def _resolved_raw_log(self):
+        """Resolve raw_log once per Task, so every LLM this task builds
+        shares one sidecar handle instead of re-opening the store."""
+        if self._raw_log is None and self.raw_log:
+            from .rawlog import RawLog
+            self._raw_log = RawLog.resolve(self.raw_log)
+        return self._raw_log
 
     def run(self, prompt, model=None, system_prompt=None, examples=None,
             images=None, metadata=None, force=False, **kwargs):

@@ -40,7 +40,7 @@ STASH_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 
 def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
                    max_tokens=DEFAULT_MAX_TOKENS, images=None, usage_sink=None,
-                   **kwargs):
+                   raw_sink=None, **kwargs):
     """Dispatch a prompt to the appropriate provider. Used as the cacheable function."""
     provider_fn = route_provider(model)
     return provider_fn(
@@ -51,6 +51,7 @@ def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPER
         max_tokens=max_tokens,
         images=images,
         usage_sink=usage_sink,
+        raw_sink=raw_sink,
         **kwargs,
     )
 
@@ -846,7 +847,7 @@ class LLM:
 
     def __init__(self, model=DEFAULT_MODEL, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
                  max_tokens=DEFAULT_MAX_TOKENS, stash=None, cache_ttl=None,
-                 usage=None):
+                 usage=None, raw_log=None):
         self.model = model
         self.system_prompt = system_prompt
         self.temperature = temperature
@@ -856,6 +857,20 @@ class LLM:
         self.stash = stash if stash is not None else HashStash(
             STASH_PATH, engine="pairtree", append_mode=True,
         )
+        # Raw-response sidecar (rawlog.RawLog), opt-in: None/False = off.
+        # Off is genuinely off — no sink is constructed, providers skip
+        # serialization, and no sidecar path runs. Not part of any stash
+        # key: recording what came back does not change what came back.
+        from .rawlog import RawLog
+        self.raw_log = RawLog.resolve(raw_log)
+
+    def _raw_sink(self, key, transport):
+        """Sink recording a serialized provider body under `key`, or None
+        when the sidecar is off (None means providers do no raw work)."""
+        if self.raw_log is None:
+            return None
+        return lambda body: self.raw_log.record(
+            key, body, transport=transport, model=self.model)
 
     def _provider_kwargs(self, kwargs):
         """Per-call provider options this instance contributes.
@@ -930,6 +945,7 @@ class LLM:
             temperature=temperature,
             max_tokens=max_tokens,
             images=images,
+            raw_sink=self._raw_sink(key, "sync"),
             **self._provider_kwargs(kwargs),
         )
         self.stash[key] = result
@@ -938,7 +954,7 @@ class LLM:
     def extract(self, prompt, schema, system_prompt=None, examples=None,
                 temperature=None, max_tokens=None, images=None, metadata=None,
                 force=False, retries=1, cache_key=None, prebuilt=False,
-                **kwargs):
+                raw_transport=None, **kwargs):
         """Extract structured data from text using a Pydantic schema.
 
         Args:
@@ -957,6 +973,10 @@ class LLM:
                        auto-generated prompt-based key. Useful for sequential
                        pipelines where the prompt varies but the identity of
                        the work unit is stable (e.g. text_id + passage_seq).
+            raw_transport: Transport label for raw-response sidecar entries
+                       (default "sync"). The batch path passes "sync-probe" /
+                       "sync-fallback" so sidecar envelopes agree with the
+                       usage rows. No effect unless the LLM has raw_log set.
             **kwargs: Additional provider-specific arguments.
 
         Returns:
@@ -1045,6 +1065,7 @@ class LLM:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     images=images,
+                    raw_sink=self._raw_sink(key, raw_transport or "sync"),
                     **self._provider_kwargs(kwargs),
                 )
                 parsed = _parse_json_response(raw)
@@ -1440,6 +1461,7 @@ class LLM:
             partial_field = None
             call_kwargs = dict(kwargs)
             call_kwargs["usage_sink"] = _item_sink(i)
+            call_kwargs["raw_sink"] = self._raw_sink(key, "sync")
             for attempt in range(1 + retries):
                 if breaker.tripped:
                     # Another item already proved this failure is systematic.

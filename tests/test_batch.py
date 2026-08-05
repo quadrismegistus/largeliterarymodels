@@ -66,7 +66,7 @@ class FakeAdapter:
     def is_done(self, batch_id):
         return self.done[batch_id]
 
-    def results(self, batch_id, order=None):
+    def results(self, batch_id, order=None, want_raw=False):
         reqs = dict(self.batches[batch_id])
         replay = order if order is not None else [c for c, _ in
                                                  self.batches[batch_id]]
@@ -75,14 +75,15 @@ class FakeAdapter:
             if cid in self.omit_cids:
                 continue
             if cid in self.fail_cids:
-                yield cid, False, None, None, "errored: boom"
+                yield cid, False, None, None, "errored: boom", None
                 continue
             usage = {"input_tokens": 10, "output_tokens": 5,
                      "cache_read_tokens": 0, "cache_write_tokens": 0,
                      "reasoning_tokens": 0, "reasoning_reported": False,
                      "reasoning_observed": False,
                      "response_model": "served-batch-model"}
-            yield cid, True, self.respond(cid, req), usage, None
+            raw = {"fake_body": cid} if want_raw else None
+            yield cid, True, self.respond(cid, req), usage, None, raw
 
 
 @pytest.fixture

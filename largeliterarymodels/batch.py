@@ -310,22 +310,23 @@ class _AnthropicAdapter:
                 candidates.append((b.id, total))
         return ("candidates", candidates) if candidates else ("absent", None)
 
-    def results(self, batch_id, order=None):
+    def results(self, batch_id, order=None, want_raw=False):
         for r in self.client.messages.batches.results(batch_id):
             kind = r.result.type
             if kind == "succeeded":
                 msg = r.result.message
                 u = P._usage_anthropic(msg)
+                raw = P.serialize_response(msg) if want_raw else None
                 try:
                     text = P._response_text(
                         msg.content, getattr(msg, "model", "?"),
                         stop_reason=getattr(msg, "stop_reason", None))
-                    yield r.custom_id, True, text, u, None
+                    yield r.custom_id, True, text, u, None, raw
                 except ValueError as e:
-                    yield r.custom_id, False, None, u, str(e)
+                    yield r.custom_id, False, None, u, str(e), raw
             else:
                 detail = str(getattr(r.result, "error", "") or "")[:200]
-                yield r.custom_id, False, None, None, f"{kind}: {detail}"
+                yield r.custom_id, False, None, None, f"{kind}: {detail}", None
 
 
 class _OpenAIAdapter:
@@ -393,22 +394,23 @@ class _OpenAIAdapter:
             if line.strip():
                 yield json.loads(line)
 
-    def results(self, batch_id, order=None):
+    def results(self, batch_id, order=None, want_raw=False):
         batch = self.client.batches.retrieve(batch_id)
         for line in self._lines(getattr(batch, "output_file_id", None)):
             body = (line.get("response") or {}).get("body") or {}
             u = _usage_from_openai_dict(body)
+            raw = body if want_raw else None
             choices = body.get("choices") or []
             text = (choices[0].get("message") or {}).get("content") \
                 if choices else None
             if text is not None:
-                yield line["custom_id"], True, text, u, None
+                yield line["custom_id"], True, text, u, None, raw
             else:
-                yield line["custom_id"], False, None, u, "no content"
+                yield line["custom_id"], False, None, u, "no content", raw
         for line in self._lines(getattr(batch, "error_file_id", None)):
             err = json.dumps((line.get("response") or {}).get("body")
                              or line.get("error") or {})[:300]
-            yield line["custom_id"], False, None, None, err
+            yield line["custom_id"], False, None, None, err, None
 
 
 class _GoogleAdapter:
@@ -455,7 +457,7 @@ class _GoogleAdapter:
         return any(t in state for t in
                    ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"))
 
-    def results(self, batch_id, order=None):
+    def results(self, batch_id, order=None, want_raw=False):
         """Google inline responses correlate by SUBMISSION ORDER. The
         order comes from the caller (persisted in the submission sidecar)
         — never re-derived: sorted(cids) is submission order with
@@ -471,14 +473,15 @@ class _GoogleAdapter:
             resp = getattr(item, "response", None)
             if resp is None:
                 err = str(getattr(item, "error", "no response"))[:300]
-                yield cid, False, None, None, err
+                yield cid, False, None, None, err, None
                 continue
             u = P._usage_google(resp)
+            raw = P.serialize_response(resp) if want_raw else None
             text = getattr(resp, "text", None)
             if text is not None:
-                yield cid, True, text, u, None
+                yield cid, True, text, u, None, raw
             else:
-                yield cid, False, None, u, "no text part"
+                yield cid, False, None, u, "no text part", raw
 
 
 def _usage_from_openai_dict(body):
@@ -703,8 +706,9 @@ class BatchHandle:
         n_ok, n_fallback = 0, 0
         results = {}
         first_error = None
-        for cid, ok, text, usage, err in a.results(self.batch_id,
-                                                   order=self.order):
+        want_raw = getattr(llm, "raw_log", None) is not None
+        for cid, ok, text, usage, err, raw in a.results(
+                self.batch_id, order=self.order, want_raw=want_raw):
             key = self.cid_to_key.get(cid)
             if key is None:
                 log.warning("batch %s: result for unknown custom_id %s",
@@ -712,6 +716,9 @@ class BatchHandle:
                 continue
             got.add(cid)
             idx = self.cid_to_index.get(cid)
+            if want_raw and raw is not None:
+                llm.raw_log.record(key, raw, transport="batch",
+                                   model=self.model, provider=self.provider)
             parsed_ok = False
             if ok and text is not None:
                 try:
@@ -760,7 +767,8 @@ class BatchHandle:
                     temperature=key["temperature"],
                     max_tokens=key["max_tokens"],
                     metadata=key.get("metadata"),
-                    retries=retries, usage_sink=fb_sink, **sync_kwargs)
+                    retries=retries, usage_sink=fb_sink,
+                    raw_transport="sync-fallback", **sync_kwargs)
                 if per_item_usage is not None and idx is not None:
                     for u in fb_usage:
                         _record_item(per_item_usage, idx, u,
@@ -986,7 +994,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
             examples=examples, temperature=temperature,
             max_tokens=max_tokens, retries=retries, force=force,
             cache_ttl=cache_ttl, metadata=metadata, usage_sink=probe_sink,
-            **kwargs)
+            raw_transport="sync-probe", **kwargs)
         fresh = fresh[1:]
 
     handles = []

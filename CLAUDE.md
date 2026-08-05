@@ -55,6 +55,11 @@ without `force=True` a repeat run is a cache hit, so identical output across
 two runs shows caching, not determinism. `temperature=0` is not evidence of a
 stable annotation until it has been forced and the versions compared.
 
+Two stash facts that cost money when learned the hard way (lacan seat's field reports):
+
+- **Values are RAW model text, not parsed objects** — deliberately, so a schema or validator change re-parses without re-paying (the 497 pre-validator classify_emotion annotations are the standing example). Raw is model-dependent: haiku fences its JSON in triple-backticks (48/48 measured), sonnet-5 almost never (1/211), deepseek/gpt-4o-mini never. Never read `stash[key]` directly for analysis — `task.results`/`task.df`/`results_history` parse and validate, and `task.parse_and_validate(text)` is the single-item audit path with the same enforcement the run applied.
+- **Metadata is part of the key.** It rides there so `task.df` can surface it (the raw value has no home for it), which makes it administration identity: a resumed run must pass byte-identical `metadata_list` or every item silently re-keys and re-pays at full price while `cache_hit_rate` honestly reports 0%. Same principle as "transport is not part of an administration's identity", pointing the other way — and unchangeable now without orphaning every metadata-bearing key.
+
 ### Administering a task outside the API path
 
 A scheme only one code path can run is committed, not frozen. `Task` can

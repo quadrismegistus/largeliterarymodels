@@ -519,7 +519,17 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
     Args:
         metadata: Optional dict of user-defined metadata (e.g. page_number,
                   source_file). Stored in the key for retrieval via task.df
-                  but does not affect the LLM call.
+                  but does not affect the LLM call. THIS MAKES METADATA
+                  PART OF THE ADMINISTRATION'S IDENTITY, and the failure
+                  mode is silent and costs money: a resumed or repeated
+                  run must pass byte-identical metadata or every item
+                  re-keys and re-pays at full price while cache_hit_rate
+                  honestly reports 0% (lacan seat's field report: 24
+                  items became 48 keys). Deliberate — the stash value is
+                  raw text, so the key is metadata's only durable home —
+                  and unchangeable now without orphaning every
+                  metadata-bearing key, which is the norm for litmod
+                  runs. Treat metadata as identity, not decoration.
         images: Optional list of images. Paths are keyed as-is; bytes and
                 PIL images are keyed by content hash (bytes are not stored).
         thinking: The resolved thinking state ("disabled"/"enabled") when a

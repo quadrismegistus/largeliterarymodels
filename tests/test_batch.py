@@ -670,6 +670,90 @@ class TestReconcile:
                  probe=False)
 
 
+class TestCustomIdIdentity:
+    """The Anthropic reconcile path identifies batches by CONTENT — our
+    deterministic custom_ids — which is only safe because the hashed key
+    covers the FULL request identity. If any request-shaping parameter
+    escaped the hash, rerunning the same items under a changed model or
+    prompt would reuse the old cids and content-matching could attach
+    the new run to the old batch: previous model's output labelled as
+    the new run, no exception anywhere. (Hazard named by the hashstash
+    seat; these tests are the pin.)"""
+
+    def test_every_request_shaping_field_changes_the_cid(self):
+        from largeliterarymodels.llm import _make_key
+        base = dict(prompt="p", model="claude-sonnet-4-6",
+                    system_prompt="built instrument bytes",
+                    temperature=0.0, max_tokens=64,
+                    schema_name="Out", metadata=None, thinking=None)
+        cid = B._custom_id(_make_key(**base))
+        assert cid == B._custom_id(_make_key(**base)), "deterministic"
+        variants = [dict(base, prompt="q"),
+                    dict(base, model="claude-opus-4-7"),
+                    dict(base, system_prompt="different instrument"),
+                    dict(base, temperature=0.7),
+                    dict(base, temperature=None),
+                    dict(base, max_tokens=128),
+                    dict(base, schema_name="Other"),
+                    dict(base, metadata={"text_id": "T1"}),
+                    dict(base, thinking="enabled:budget:1024")]
+        cids = [B._custom_id(_make_key(**v)) for v in variants]
+        assert len({cid, *cids}) == len(variants) + 1, \
+            "a request-shaping field escaped the custom_id hash"
+
+    def test_changed_model_rerun_does_not_attach_to_old_batch(
+            self, ledger, monkeypatch):
+        """Two-run drill: run 1 completes on model A; run 2 on model B
+        with the SAME items dies mid-submit and goes stale. An
+        Anthropic-style content-matching reconcile must NOT find run 1's
+        ended batch (the cids differ, because model is in the key) — it
+        must abandon and resubmit, and run 2's results must be model
+        B's, not a relabelling of run 1's."""
+        stash = FakeStash()
+
+        class ContentMatch(FakeAdapter):
+            """find_sub the way the real Anthropic adapter works: no
+            tag, membership check on ended batches, absent otherwise."""
+            def find_sub(self, sub, cids, since_ts):
+                want = set(cids)
+                for bid, reqs in self.batches.items():
+                    if reqs and reqs[0][0] in want:
+                        return ("found", bid)
+                return ("absent", None)
+
+        fake = ContentMatch(respond=lambda cid, req: json.dumps(
+            {"x": 1 if "sonnet" in req.get("model", "") else 2}))
+        run1 = _run(_llm(stash), fake, ["a", "b"], monkeypatch,
+                    ledger=ledger, probe=False)
+        assert [r.x for r in run1] == [1, 1]
+
+        llm_b = LLM("claude-opus-4-7", temperature=0.0, max_tokens=64,
+                    stash=stash)
+
+        class DiesOnce(ContentMatch):
+            armed = True
+
+            def submit(self, requests, sub=None):
+                if DiesOnce.armed:
+                    DiesOnce.armed = False
+                    raise KeyboardInterrupt("dies mid-submit")
+                return FakeAdapter.submit(self, requests, sub=sub)
+        fake.__class__ = DiesOnce
+        with pytest.raises(KeyboardInterrupt):
+            _run(llm_b, fake, ["a", "b"], monkeypatch, ledger=ledger,
+                 probe=False)
+        with pytest.raises(B.BatchInProgress) as exc:
+            _run(llm_b, fake, ["a", "b"], monkeypatch, ledger=ledger,
+                 probe=False)
+        _age_submission(ledger, _sub_from_exc(exc))
+        run2 = _run(llm_b, fake, ["a", "b"], monkeypatch, ledger=ledger,
+                    probe=False)
+        assert [r.x for r in run2] == [2, 2], \
+            "run 2 must carry model B's output, not run 1's relabelled"
+        assert len(fake.batches) == 2, \
+            "reconcile must abandon and resubmit, not attach across models"
+
+
 class TestLockDesign:
     def test_submit_lock_is_global_not_chunk_shaped(self, ledger):
         """Design pin: the submit lock's identity must not depend on what

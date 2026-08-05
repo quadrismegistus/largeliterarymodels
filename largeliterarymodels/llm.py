@@ -35,7 +35,61 @@ GEMINI_FLASH = "gemini-2.5-flash"
 DEFAULT_MODEL = CLAUDE_SONNET
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 4096
-STASH_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "stash")
+
+
+def _data_dir(env=None, pkg_parent=None):
+    """Root for ALL persistent state — stash, batch ledger, raw sidecars,
+    usage logs, human annotations. Everything derives from STASH_PATH,
+    so this one function decides where a run's money-backed artifacts
+    live. Resolution order:
+
+    1. LITMOD_DATA_DIR — explicit project root, always wins.
+    2. A NON-EMPTY package-relative data/ dir OUTSIDE site-packages —
+       the clone/editable workflow, unchanged: an existing repo's 9 GB
+       of annotation history stays exactly where it is.
+    3. ~/.largeliterarymodels/data — the durable default.
+
+    A package-relative dir inside site-packages is NEVER used, even if
+    it has data: the old derivation was relative to __file__, so a
+    plain pip install silently pointed the stash, the batch ledger and
+    the raw sidecars into the venv — where the run reported success,
+    certify() said complete, and the next --force-reinstall deleted
+    the lot, ledger included (lacan seat's field report). A path that
+    pip owns is not storage.
+    """
+    env = env if env is not None else os.getenv("LITMOD_DATA_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    if pkg_parent is None:
+        pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pkg_data = os.path.join(pkg_parent, "data")
+    parts = set(os.path.normpath(os.path.abspath(pkg_data)).split(os.sep))
+    in_site = bool(parts & {"site-packages", "dist-packages"})
+
+    def _non_empty(p):
+        try:
+            with os.scandir(p) as it:
+                return next(it, None) is not None
+        except OSError:
+            return False
+
+    if not in_site and _non_empty(pkg_data):
+        return pkg_data
+    home = os.path.join(os.path.expanduser("~"),
+                        ".largeliterarymodels", "data")
+    if in_site and _non_empty(pkg_data):
+        log.warning(
+            "largeliterarymodels: found data at %s — INSIDE site-packages, "
+            "where the next reinstall deletes it. Using %s instead. If "
+            "that site-packages data matters (a stash, batch ledger or "
+            "raw sidecar written by an earlier run of this install), copy "
+            "it out NOW, and set LITMOD_DATA_DIR if your real data root "
+            "is elsewhere (e.g. a repo clone's data/ directory).",
+            pkg_data, home)
+    return home
+
+
+STASH_PATH = os.path.join(_data_dir(), "stash")
 
 
 def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,

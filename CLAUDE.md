@@ -395,6 +395,10 @@ once per run at WARNING when it differs — record *that* as the model of record
 Live case: DeepSeek's `deepseek-chat` **and** `deepseek-reasoner` both resolve
 to `deepseek-v4-flash`; pin `deepseek/deepseek-v4-pro` or `-flash` explicitly.
 
+## Data root
+
+ALL persistent state — stash, batch ledger, raw sidecars, usage logs, human annotations — derives from one root, resolved by `llm._data_dir()`: `LITMOD_DATA_DIR` if set; else a *non-empty* package-relative `data/` **outside site-packages** (the clone/editable workflow — an existing repo's history stays put); else `~/.largeliterarymodels/data`. Data inside site-packages is never used, even when present: the pre-fix derivation was `__file__`-relative, so a plain pip install silently pointed the stash *and the ledger* into the venv, where the run reported success, `certify()` said complete, and the next `--force-reinstall` deleted the lot (lacan seat's field report). A path pip owns is not storage. Non-editable installs that want a project's existing data must set `LITMOD_DATA_DIR` to that project's `data/` dir.
+
 ## Running
 
 Always activate the local venv before running Python. Prefix every bash python/pip/litmod command with `source .venv/bin/activate &&` or use `.venv/bin/python` directly.

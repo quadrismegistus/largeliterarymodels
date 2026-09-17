@@ -691,3 +691,31 @@ class TestGoldenKey:
             "metadata": {"id": 7},
             "sample": 2,
         }
+
+
+class TestBothArmsSeeOneItem:
+    """as_task() compiles the questions; state_text compiles the ITEM. Without
+    the second the caller formats the item a second time by hand and the two
+    arms diverge — which is the failure as_task() exists to prevent."""
+
+    def test_state_text_is_the_state_the_survey_sends(self):
+        s = _survey()
+        item = {"female_frame": "She slowly took off her bra",
+                "male_frame": "He slowly took off his bra"}
+        assert json.loads(s.state_text(item)) == s.build_state(item)
+
+    def test_named_fields_survive_so_inspect_still_refers(self):
+        # A question's `inspect` names a state field; flattening to prose
+        # would break the reference the instructions make.
+        s = _survey()
+        txt = s.state_text({"female_frame": "a", "male_frame": "b"})
+        assert "female_frame" in txt and "male_frame" in txt
+
+    def test_prompts_line_up_with_items(self):
+        s = _survey()
+        items = [{"p": 1}, {"p": 2}]
+        assert s.as_task_prompts(items) == [s.state_text(i) for i in items]
+
+    def test_a_bare_string_item_is_named_in_both_arms(self):
+        s = _survey()
+        assert json.loads(s.state_text("hello")) == {"item": "hello"}

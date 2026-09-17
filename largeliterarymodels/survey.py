@@ -102,6 +102,30 @@ class Survey(_Administered):
             return {"item": item}
         return dict(item)
 
+    def state_text(self, item):
+        """The state rendered for a TEXT model — what the `as_task()` arm sees.
+
+        Both arms must see ONE item or the comparison is between two things.
+        A Survey sends `build_state(item)` as JSON and a Task sends a prompt
+        string, so without this the caller formats the item a second time by
+        hand and the two arms diverge in exactly the way as_task() exists to
+        prevent. JSON rather than prose because that is what the Survey arm
+        is given, and because named fields are what a question's `inspect`
+        refers to — flattening them to prose would break the reference the
+        instructions make.
+        """
+        return json.dumps(self.build_state(item), indent=2,
+                          ensure_ascii=False, sort_keys=False)
+
+    def as_task_prompts(self, items):
+        """`items` rendered for the text arm, in order.
+
+            jev = s.map(items)
+            t   = s.as_task(model="deepseek/deepseek-v4-flash")
+            txt = t.map(s.as_task_prompts(items))
+        """
+        return [self.state_text(i) for i in items]
+
     @property
     def has_static_instrument(self):
         return type(self).build_questions is Survey.build_questions \

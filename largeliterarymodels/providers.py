@@ -844,6 +844,8 @@ def route_provider(model):
     model_lower = model.lower()
     if _routes_to_local(model_lower):
         return call_local
+    if _routes_to_typesafe(model_lower):
+        return call_typesafe
     if _routes_to_claude_cli(model_lower):
         return call_claude_cli
     if _routes_to_anthropic(model_lower):
@@ -858,14 +860,15 @@ def route_provider(model):
         raise ValueError(
             f"Cannot determine provider for model '{model}'. "
             f"Model name should contain 'claude', 'gpt', or 'gemini', "
-            f"or use a prefix like 'anthropic/', 'openai/', 'google/', 'deepseek/', 'claude-cli/', or 'local/'."
+            f"or use a prefix like 'anthropic/', 'openai/', 'google/', 'deepseek/', 'claude-cli/', 'typesafe/', or 'local/'."
         )
 
 
 def _strip_prefix(model):
     """Remove provider prefix like 'anthropic/' or 'openai/' from model name."""
     for prefix in ("anthropic/", "openai/", "google/", "deepseek/",
-                   "claude-cli/", "local/", "ollama/", "vllm/", "lmstudio/"):
+                   "claude-cli/", "typesafe/", "local/", "ollama/", "vllm/",
+                   "lmstudio/"):
         if model.lower().startswith(prefix):
             return model[len(prefix):]
     return model
@@ -1340,6 +1343,11 @@ def effective_temperature(model, temperature, thinking="auto"):
     m = model.lower()
     if _routes_to_claude_cli(m):
         return None
+    if _routes_to_typesafe(m):
+        # System One exposes no decoder parameters whatsoever. A key
+        # recording a temperature here would assert a pin the API has no
+        # way to honour.
+        return None
     if _routes_to_anthropic(m) and not _supports_temperature(model):
         return None
     if _routes_to_openai(m) and not _openai_supports_temperature(model):
@@ -1513,6 +1521,11 @@ _SAMPLING_SUPPORT = {
     # parameters wholesale — the same reason effective_temperature returns
     # None there. Nothing to measure.
     "claude_cli": {p: _REJECTS for p in SAMPLING_PARAMS},
+    # System One takes state and questions and nothing else: no temperature,
+    # no nucleus, no penalties, no seed. _REJECTS rather than _UNMEASURED
+    # because the absence is in the request schema, not in our knowledge of
+    # it — there is no measurement anyone could run that would change this.
+    "typesafe": {p: _REJECTS for p in SAMPLING_PARAMS},
 }
 
 
@@ -1589,6 +1602,15 @@ def _sampling_state(route, param, model=None):
     return _SAMPLING_SUPPORT.get(route, {}).get(param, _UNMEASURED)
 
 
+#: Why a _REJECTS route rejects, per route. Not cosmetic: the generic line
+#: says the transport ATE the parameter, which for a route whose request
+#: schema has no such field is a different and misleading claim — it implies
+#: a value was sent and lost rather than never having been expressible.
+_REJECT_REASON = {
+    "typesafe": "the System One API takes no decoder parameters at all",
+}
+
+
 def _dropped_reason(route, param, model):
     state = _sampling_state(route, param, model)
     if state is _ACCEPTS:
@@ -1596,7 +1618,7 @@ def _dropped_reason(route, param, model):
     if state == _DEPRECATED:
         unavailable = _family_table(_SAMPLING_UNAVAILABLE, route, model)
         return unavailable.get(param, "the API reports it deprecated here")
-    return "the transport discards it"
+    return _REJECT_REASON.get(route, "the transport discards it")
 
 
 def unavailable_sampling(model):
@@ -2382,6 +2404,119 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     # with whatever checkpoint is loaded, not always the one requested.
     return response.choices[0].message.content
 
+
+# ---------------------------------------------------------------------------
+# TypeSafe System One (Jev)
+#
+# Not a text model, and the difference is structural rather than a matter of
+# degree. Every other provider here takes a prompt and returns a string that
+# `llm.extract` parses as JSON against a schema. Jev takes STATE plus a dict
+# of typed QUESTIONS and returns typed answers keyed by question id: a
+# probability for a Noul, a label with a distribution for a Choice, a
+# probability-weighted position for a Score. There is no text to parse and no
+# schema in the prompt.
+#
+# So `call_typesafe` exists only to fail loudly. It is reachable from
+# route_provider — which must stay the single dispatcher, because two
+# dispatchers is how a model gets keyed against one provider's constants and
+# sent to another's endpoint, and because provider_route() derives the
+# sampling-table key from it — but calling it on the text path is a caller
+# error, not something to paper over with a rendered-to-text fallback. The
+# real entry point is call_typesafe_survey.
+# ---------------------------------------------------------------------------
+
+#: Model ids that route here. `jev` is the family; the `typesafe/` prefix is
+#: the explicit spelling. Both are matched, and neither is inferred from
+#: anything else — a model name is not evidence of a model's behaviour, which
+#: is this package's recurring bug class.
+_TYPESAFE_PREFIX = "typesafe/"
+_TYPESAFE_FAMILIES = ("jev",)
+
+
+def _routes_to_typesafe(model_lower):
+    return (model_lower.startswith(_TYPESAFE_PREFIX)
+            or any(_family_match(model_lower, tag)
+                   for tag in _TYPESAFE_FAMILIES))
+
+
+class NotATextModel(TypeError):
+    """A System One model was asked for text.
+
+    Raised rather than absorbed: a caller reaching here has a Task where it
+    wants a Survey, and rendering the answers into a JSON string so the text
+    path "works" would produce an instrument nobody wrote and a cache key
+    describing a call that did not happen.
+    """
+
+
+def call_typesafe(prompt, model="jev-latest", system_prompt=None, **kwargs):
+    """Always raises. See the section comment."""
+    raise NotATextModel(
+        f"{model!r} is a TypeSafe System One model: it answers typed "
+        f"questions and never returns text, so it cannot serve an extract "
+        f"call. Use a Survey (typed questions -> typed answers) rather than "
+        f"a Task, or pick a text model for this Task."
+    )
+
+
+def _usage_typesafe(body):
+    """Normalise a System One response body into the shared usage shape.
+
+    No cache tier and no reasoning split exist on this API, and both absences
+    are recorded honestly rather than as zeros that look like measurements:
+    cache_read/cache_write stay 0 because there is no tier to read from (see
+    the `cached: null` row in model_pricing.json, which is what makes the
+    pricing correct), and reasoning_reported stays False because the field is
+    not reported at all — which is a different fact from a reported zero, and
+    the distinction is exactly what UsageTracker.no_reasoning_observed()
+    needs to stay honest across backends.
+    """
+    u = (body or {}).get("usage") or {}
+    return _usage(
+        input_tokens=u.get("input_tokens", 0),
+        output_tokens=u.get("output_tokens", 0),
+        response_model=(body or {}).get("model"),
+    )
+
+
+def call_typesafe_survey(state, questions, model="jev-latest",
+                         usage_sink=None, raw_sink=None, timeout=120.0,
+                         retry=None, **kwargs):
+    """Administer a question set and return the RAW response body.
+
+    Raw, deliberately, and for the same reason the annotation stash stores
+    raw model text: the body is the durable artifact, and normalising on the
+    way in means a later change to how an answer is read costs another call.
+    The Survey layer parses it; `raw_sink` receives the same object.
+
+    `questions` maps question id -> a typed question (the SDK's Noul / Choice
+    / Score, or the plain dict spelling). Ids are not sent to the model.
+    """
+    guard_bare_sampling("typesafe", model, kwargs)
+    swallowed_kwargs("typesafe", model, kwargs)
+
+    from typesafe_sdk import TypeSafeClient
+
+    name = _strip_prefix_typesafe(model)
+    client = _cached_client(
+        ("typesafe", name, timeout),
+        lambda: TypeSafeClient(model=name, timeout=timeout),
+    )
+    response = (client.system_one(state=state, questions=questions, retry=retry)
+                if retry is not None
+                else client.system_one(state=state, questions=questions))
+    body = response.raw_http_response.json()
+
+    _sink_raw(raw_sink, body)
+    if usage_sink:
+        usage_sink(_usage_typesafe(body))
+    _log_resolved_model("typesafe", name, (body or {}).get("model"))
+    return body
+
+
+def _strip_prefix_typesafe(model):
+    return (model[len(_TYPESAFE_PREFIX):]
+            if model.lower().startswith(_TYPESAFE_PREFIX) else model)
 
 def check_api_keys(verbose=False):
     """Check which provider API keys are available in the environment."""

@@ -34,7 +34,7 @@ from pathlib import Path
 PRICING_FILE = Path(__file__).parent / "model_pricing.json"
 M = 1_000_000
 
-_PROVIDERS = ("anthropic", "openai", "deepseek", "google")
+_PROVIDERS = ("anthropic", "openai", "deepseek", "google", "typesafe")
 
 _pricing = None
 
@@ -90,7 +90,7 @@ def resolve(model, on=None):
 
     name = model
     for prefix in ("anthropic/", "openai/", "deepseek/", "google/",
-                   "claude-cli/"):
+                   "claude-cli/", "typesafe/"):
         # claude-cli/ included: MajorGenreTask's default model string is
         # claude-cli/sonnet, and pricing its runs must not raise.
         if name.lower().startswith(prefix):

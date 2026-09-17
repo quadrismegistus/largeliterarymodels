@@ -374,10 +374,164 @@ class Survey(_Administered):
             rows.append(row)
         return pd.DataFrame(rows)
 
+    # ---- crossing to a text model ---------------------------------------
+
+    def as_task(self, item=None, model=None, name=None):
+        """Compile this question set into a `Task` a text model can answer.
+
+        The direction that works. Questions are the smaller language: every
+        Noul is a bool, every Choice a Literal, every Score an ordered int,
+        and the instructions and criteria become the field descriptions. The
+        reverse compile — schema to questions — does not, which is why this
+        class does not offer it.
+
+        The use case is cross-provider replication of ONE instrument: run the
+        same questions on System One and on Sonnet and compare. Doing that by
+        hand means writing the instrument twice and hoping, which is how two
+        arms of a comparison end up measuring two things.
+
+        WHAT IS LOST, AND IT IS THE POINT OF THE CLASS. A text model returns
+        a bool where a Noul returns a probability. The compiled Task cannot
+        express `noul: 0.62`, so the continuous measure — the thing that
+        bought a CI three times tighter — does not survive the crossing. Use
+        this to get a comparison arm, not to replace the Survey.
+
+        Question ids become field ALIASES, so the JSON the model is asked for
+        is keyed exactly as the Survey's answers are, and
+        `result.model_dump(by_alias=True)` lines the two arms up directly.
+        Ids that are not Python identifiers (`word::scene`) get a sanitised
+        field name and keep the id as the alias.
+        """
+        import re
+
+        from pydantic import ConfigDict, Field, create_model
+
+        from .task import Task
+
+        qs = self.questions if self.has_static_instrument \
+            else self.build_questions(item)
+        if qs is None:
+            raise ValueError(
+                f"{type(self).__name__}.as_task() needs a question set: pass "
+                f"item= so build_questions() can produce one.")
+
+        fields, seen = {}, {}
+        for qid, q in qs.items():
+            fname = re.sub(r"\W", "_", qid)
+            if not fname or fname[0].isdigit():
+                fname = f"q_{fname}"
+            if fname in seen:
+                raise ValueError(
+                    f"question ids {seen[fname]!r} and {qid!r} both sanitise "
+                    f"to the field name {fname!r}. Rename one: a compiled "
+                    f"Task cannot keep them apart, and silently merging two "
+                    f"questions is worse than refusing."
+                )
+            seen[fname] = qid
+            fields[fname] = _compile_question(qid, q, Field)
+
+        Compiled = create_model(
+            name or f"{type(self).__name__}Annotation",
+            __config__=ConfigDict(populate_by_name=True),
+            **fields,
+        )
+
+        survey = self
+
+        class _CompiledTask(Task):
+            schema = Compiled
+            system_prompt = _COMPILED_SYSTEM_PROMPT
+            examples = ()
+
+        _CompiledTask.name = name or f"{survey.task_name}_as_task"
+        if model:
+            _CompiledTask.model = model
+        _CompiledTask.__doc__ = (
+            f"{survey.task_name!r} compiled from typed questions. Field "
+            f"aliases are the question ids; model_dump(by_alias=True) lines "
+            f"this up with Survey answers."
+        )
+        return _CompiledTask()
+
     def __repr__(self):
         n = len(self.questions) if self.has_static_instrument else "per-item"
         return (f"<{type(self).__name__} name={self.task_name!r} "
                 f"model={self.model!r} questions={n}>")
+
+
+_COMPILED_SYSTEM_PROMPT = (
+    "You are answering a fixed set of independent questions about the item "
+    "you are given.\n\n"
+    "Answer each question ON ITS OWN against the item. The questions do not "
+    "depend on one another and an answer to one is not evidence for "
+    "another.\n\n"
+    "Boolean fields are yes/no judgements: answer true only where the "
+    "described condition holds.\n\n"
+    "Integer fields are positions on an ordered scale whose levels are "
+    "described in the field's description, counting from 0. Pick the level "
+    "whose description fits the item best.\n\n"
+    "Where a field description names what a true and a false answer mean, or "
+    "what each option covers and does not cover, treat those as the "
+    "definition and not as a hint."
+)
+
+
+def _describe(spec, indent=""):
+    """Render an instruction or criterion into prompt prose.
+
+    Structured specs are conventions rather than a schema (see questions.py),
+    so this renders whatever keys are present instead of looking for known
+    ones — a convention this function did not anticipate must still reach the
+    model rather than being dropped on the way.
+    """
+    if spec is None:
+        return ""
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, (list, tuple)):
+        return "; ".join(_describe(x) for x in spec)
+    if isinstance(spec, dict):
+        return " ".join(f"{k}: {_describe(v)}" for k, v in spec.items() if v)
+    return str(spec)
+
+
+def _compile_question(qid, q, Field):
+    """One question -> a (type, FieldInfo) pair for create_model."""
+    from typing import Literal
+
+    from .questions import Choice, Noul, Score
+
+    if isinstance(q, Noul):
+        desc = _describe(q.instructions)
+        if q.criteria:
+            for k in ("true", "false"):
+                if k in q.criteria:
+                    desc += f"\n{k.upper()} when {_describe(q.criteria[k])}"
+        return (bool, Field(default=False, alias=qid, description=desc))
+
+    if isinstance(q, Choice):
+        opts = tuple(q.criteria)
+        desc = _describe(q.instructions)
+        for opt, spec in q.criteria.items():
+            rendered = _describe(spec)
+            desc += f"\n{opt}" + (f" = {rendered}" if rendered else "")
+        return (Literal[opts], Field(default=opts[0], alias=qid,
+                                     description=desc))
+
+    if isinstance(q, Score):
+        n = len(q.criteria)
+        desc = _describe(q.instructions) + f"\nAn integer 0-{n - 1}:"
+        for i, lv in enumerate(q.criteria):
+            desc += f"\n{i} = {_describe(lv)}"
+        return (int, Field(default=0, ge=0, le=n - 1, alias=qid,
+                           description=desc))
+
+    raise ValueError(
+        f"question {qid!r} is a raw dict, which as_task() cannot compile: "
+        f"the escape hatch carries fields these types do not model, so "
+        f"there is no schema field to make from it. Express it as a Noul, "
+        f"Choice or Score to cross to a text model."
+    )
 
 
 class _UsageShim:

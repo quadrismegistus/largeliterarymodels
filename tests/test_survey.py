@@ -313,3 +313,113 @@ class TestReadBack:
 class TestRepr:
     def test_names_the_instrument_size(self, fake_provider):
         assert "questions=3" in repr(_survey())
+
+
+class TestAsTask:
+    def _s(self):
+        class S(Survey):
+            name = "_cross"
+            questions = {
+                "abstract": Noul(instructions="Is it abstract?",
+                                 criteria={"true": {"what": "qualities"},
+                                           "false": {"what": "objects"}}),
+                "mode": Choice(instructions="Mode?",
+                               criteria={"narrative": "recounts events",
+                                         "didactic": None}),
+                "degree": Score(instructions="How abstract?",
+                                criteria=["concrete", "mixed", "abstract"]),
+            }
+        return S()
+
+    def test_types_compile(self):
+        t = self._s().as_task()
+        f = t.schema.model_fields
+        assert f["abstract"].annotation is bool
+        assert f["degree"].annotation is int
+        assert set(getattr(f["mode"].annotation, "__args__", ())) == {
+            "narrative", "didactic"}
+
+    def test_score_bounds_come_from_the_level_count(self):
+        t = self._s().as_task()
+        meta = str(t.schema.model_fields["degree"].metadata)
+        assert "0" in meta and "2" in meta
+        with pytest.raises(Exception):
+            t.schema.model_validate({"abstract": True, "mode": "narrative",
+                                     "degree": 3})
+
+    def test_question_ids_are_the_aliases_the_model_is_asked_for(self):
+        # So the two arms of a comparison line up without a translation step.
+        t = self._s().as_task()
+        assert set(t.schema.model_json_schema()["properties"]) == {
+            "abstract", "mode", "degree"}
+
+    def test_criteria_reach_the_field_description(self):
+        t = self._s().as_task()
+        d = t.schema.model_fields["abstract"].description
+        assert "TRUE when" in d and "FALSE when" in d and "qualities" in d
+
+    def test_score_levels_are_numbered_in_the_description(self):
+        d = self._s().as_task().schema.model_fields["degree"].description
+        assert "0 = concrete" in d and "2 = abstract" in d
+
+    def test_instrument_text_is_a_real_prompt(self):
+        t = self._s().as_task()
+        assert "independent questions" in t.instrument_text()
+        assert t.instrument_sha256()
+
+    def test_model_override(self):
+        assert self._s().as_task(model="claude-sonnet-5").model \
+            == "claude-sonnet-5"
+
+    def test_per_item_questions_need_an_item(self):
+        class PerItem(Survey):
+            name = "_pi"
+
+            def build_questions(self, item):
+                return {w: Noul(instructions=f"Is {w} charged?")
+                        for w in item["words"]}
+        s = PerItem()
+        with pytest.raises((TypeError, ValueError, KeyError)):
+            s.as_task()
+        t = s.as_task(item={"words": ["beat", "kiss"]})
+        assert set(t.schema.model_json_schema()["properties"]) == {
+            "beat", "kiss"}
+
+    def test_non_identifier_ids_are_sanitised_but_keep_their_alias(self):
+        class Colons(Survey):
+            name = "_colons"
+            questions = {"beat::scene": Score(instructions="x",
+                                              criteria=["a", "b"]),
+                         "beat::kind": Choice(instructions="y",
+                                              criteria={"NONE": None,
+                                                        "VIOLENT": None})}
+        t = Colons().as_task()
+        assert list(t.schema.model_fields) == ["beat__scene", "beat__kind"]
+        obj = t.schema.model_validate({"beat::scene": 1,
+                                       "beat::kind": "VIOLENT"})
+        assert obj.model_dump(by_alias=True) == {"beat::scene": 1,
+                                                 "beat::kind": "VIOLENT"}
+
+    def test_alias_collision_refused_rather_than_merged(self):
+        class Bad(Survey):
+            name = "_bad"
+            questions = {"a::b": Noul(instructions="x"),
+                         "a__b": Noul(instructions="y")}
+        with pytest.raises(ValueError, match="both sanitise"):
+            Bad().as_task()
+
+    def test_raw_dict_questions_refuse_to_compile(self):
+        class Raw(Survey):
+            name = "_raw"
+            questions = {"q": {"type": "noul", "instructions": "x",
+                               "weight": 2}}
+        with pytest.raises(ValueError, match="raw dict"):
+            Raw().as_task()
+
+    def test_the_crossing_loses_the_probability_and_says_so(self):
+        # The documented cost: a text model returns a bool where a Noul
+        # returns a probability. If this ever stops being true the docstring
+        # is wrong and someone should notice here.
+        t = self._s().as_task()
+        assert t.schema.model_fields["abstract"].annotation is bool
+        assert "WHAT IS LOST" in Survey.as_task.__doc__

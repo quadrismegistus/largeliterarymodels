@@ -632,6 +632,32 @@ class _Breaker:
         )
 
 
+def _resolve_breaker(fail_fast):
+    """fail_fast setting -> a _Breaker. Shared by the extract and survey paths.
+
+    The three spellings that used to mean something else are pinned here:
+    `fail_fast=0` reads as OFF under the falsy convention (False and None both
+    disable) rather than as the tightest possible floor, junk raises instead of
+    silently meaning "5" or "off", and an int gates BOTH abort conditions —
+    floor alone would let the 20%-rate condition fire at 30 outcomes and
+    silently override a caller's fail_fast=50.
+    """
+    if fail_fast is None or fail_fast is False:
+        return _Breaker(enabled=False)
+    if fail_fast is True:
+        return _Breaker()
+    if isinstance(fail_fast, dict):
+        return _Breaker(**fail_fast)
+    if isinstance(fail_fast, int):
+        if fail_fast == 0:
+            return _Breaker(enabled=False)
+        return _Breaker(floor=fail_fast, min_outcomes=max(30, fail_fast))
+    raise TypeError(
+        f"fail_fast={fail_fast!r}: pass a dict of _Breaker settings, "
+        f"an int floor, True for defaults, or False to disable."
+    )
+
+
 def _image_cache_id(img):
     """Content-derived cache identifier for one image input.
 
@@ -739,6 +765,51 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
         key["thinking"] = thinking
     for param, value in (sampling or {}).items():
         key[param] = value
+    if sample is not None:
+        key["sample"] = sample
+    return key
+
+
+def _make_survey_key(state, model, questions, metadata=None, sample=None):
+    """Build the HashStash key for one Survey administration.
+
+    Deliberately the same SHAPE as _make_key and deliberately a different set
+    of fields, because a Survey administers different things:
+
+        state       the item, as the canonical JSON actually sent — the
+                    counterpart of `prompt`.
+        questions   the canonical question set, as administered BYTES rather
+                    than a digest. Same choice _make_key makes for
+                    system_prompt and for the same reason: a wording change
+                    to one question is an edit to the questionnaire, so it
+                    must re-key, and carrying the bytes lets a census group
+                    by sha256(key["questions"]) against
+                    Survey.instrument_sha256() without a field-set
+                    archaeology pass.
+        metadata    identity, not decoration — see _make_key. A resumed run
+                    must pass byte-identical metadata or every item re-keys
+                    and re-pays while cache_hit_rate honestly reports 0%.
+        sample      replicate index, omitted when None.
+
+    What is ABSENT is the point. No temperature, no max_tokens, no thinking,
+    no sampling: System One accepts none of them, so a key carrying any would
+    assert a pin the API has no way to honour. The rule is the same one the
+    sampling schema follows — a field present in a key means that value
+    governed the call, and there is nothing here to govern it with.
+
+    No `schema` field either. On the extract path `schema` is a name-only
+    discriminator that works because the real identity rides in the
+    instrument bytes; here the questions ARE the instrument and carry their
+    own identity, so a second weaker discriminator would only be something
+    to mistake for one.
+    """
+    key = {
+        "state": state,
+        "model": model,
+        "questions": questions,
+    }
+    if metadata:
+        key["metadata"] = metadata
     if sample is not None:
         key["sample"] = sample
     return key
@@ -1732,31 +1803,7 @@ class LLM:
                 "raw": (raw or "")[:1000],
             }
 
-        if fail_fast is None or fail_fast is False:
-            breaker = _Breaker(enabled=False)
-        elif fail_fast is True:
-            breaker = _Breaker()
-        elif isinstance(fail_fast, dict):
-            breaker = _Breaker(**fail_fast)
-        elif isinstance(fail_fast, int):
-            if fail_fast == 0:
-                # 0 reads as "off" under the falsy convention (False and
-                # None both disable); as a floor it would mean abort on the
-                # FIRST failed item — near-tightest, from the spelling of
-                # loosest. Honour the convention.
-                breaker = _Breaker(enabled=False)
-            else:
-                # An int is a loosening/tightening of WHEN aborting is
-                # allowed, so it must gate both conditions: floor alone
-                # would let the 20%-rate condition fire at 30 outcomes and
-                # silently override a caller's fail_fast=50.
-                breaker = _Breaker(floor=fail_fast,
-                                   min_outcomes=max(30, fail_fast))
-        else:
-            raise TypeError(
-                f"fail_fast={fail_fast!r}: pass a dict of _Breaker settings, "
-                f"an int floor, True for defaults, or False to disable."
-            )
+        breaker = _resolve_breaker(fail_fast)
 
         # Batch-scoped tracker beside the Task-lifetime one. The finally
         # block's summary and cache warning describe THIS batch: the

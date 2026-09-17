@@ -1,5 +1,10 @@
 """Typed answers — what a Survey gets back, and how not to throw it away.
 
+Named `NoulAnswer`/`ChoiceAnswer`/`ScoreAnswer` rather than `Noul`/`Choice`/
+`Score`: the question types in questions.py own those names, and a module
+where `Noul` means one thing at the top of a file and another at the bottom
+is a shadowing bug waiting to be written. Same split the SDK makes.
+
 The whole reason to administer typed questions rather than a schema prompt
 is that the answers are CONTINUOUS: a Noul is a probability, a Score is a
 probability-weighted position that can land between levels, a Choice carries
@@ -28,7 +33,7 @@ class AnswerError(ValueError):
 
 
 @dataclass(frozen=True)
-class Noul:
+class NoulAnswer:
     """P(the question is true). One number; there is no separate confidence.
 
     A value near 0.5 means yes and no are near-equally likely. It does NOT
@@ -47,7 +52,7 @@ class Noul:
 
 
 @dataclass(frozen=True)
-class Choice:
+class ChoiceAnswer:
     """The selected option, with the distribution that produced it.
 
     `confidence` summarises how concentrated the distribution is. It is not
@@ -82,7 +87,7 @@ class Choice:
 
 
 @dataclass(frozen=True)
-class Score:
+class ScoreAnswer:
     """A position on the ordered levels, which may fall between two of them.
 
     `score` is in level positions, counting from 0, so an n-level question
@@ -122,7 +127,7 @@ class Score:
 
 
 @dataclass(frozen=True)
-class Unknown:
+class UnknownAnswer:
     """An answer kind this version does not model, kept whole.
 
     The SDK logs a warning and skips these. Skipping is how a provider's new
@@ -151,22 +156,22 @@ def _parser(kind):
 
 @_parser("noul")
 def _parse_noul(qid, a):
-    return Noul(qid=qid, p=float(a["noul"]))
+    return NoulAnswer(qid=qid, p=float(a["noul"]))
 
 
 @_parser("choice")
 def _parse_choice(qid, a):
-    return Choice(qid=qid, choice=a["choice"],
-                  confidence=a.get("confidence"),
-                  probabilities=dict(a.get("probabilities") or {}))
+    return ChoiceAnswer(qid=qid, choice=a["choice"],
+                        confidence=a.get("confidence"),
+                        probabilities=dict(a.get("probabilities") or {}))
 
 
 @_parser("score")
 def _parse_score(qid, a):
-    return Score(qid=qid, score=float(a["score"]),
-                 confidence=a.get("confidence"),
-                 legend=dict(a.get("legend") or {}),
-                 probabilities=dict(a.get("probabilities") or {}))
+    return ScoreAnswer(qid=qid, score=float(a["score"]),
+                       confidence=a.get("confidence"),
+                       legend=dict(a.get("legend") or {}),
+                       probabilities=dict(a.get("probabilities") or {}))
 
 
 class Answers(Mapping):
@@ -215,7 +220,8 @@ class Answers(Mapping):
     @property
     def unknown(self):
         """Ids whose answer kind this version does not model."""
-        return tuple(q for q, a in self._a.items() if isinstance(a, Unknown))
+        return tuple(q for q, a in self._a.items()
+                     if isinstance(a, UnknownAnswer))
 
     def value(self, qid):
         """The answer's natural value: probability, label, or position."""
@@ -226,7 +232,7 @@ class Answers(Mapping):
         coercing a Choice's confidence or a Score's position into a number
         that would silently mean something different."""
         a = self[qid]
-        if not isinstance(a, Noul):
+        if not isinstance(a, NoulAnswer):
             raise AnswerError(
                 f"{qid!r} is a {type(a).__name__}, not a Noul; .p() is the "
                 f"yes-probability accessor. Use .value() or the typed object."
@@ -262,7 +268,7 @@ def parse(body, asked=None):
         kind = (a or {}).get("type")
         fn = _PARSERS.get(kind)
         if fn is None:
-            out[qid] = Unknown(qid=qid, body=dict(a or {}))
+            out[qid] = UnknownAnswer(qid=qid, body=dict(a or {}))
             continue
         try:
             out[qid] = fn(qid, a)

@@ -21,9 +21,9 @@ BODY = {
 class TestParse:
     def test_types(self):
         a = A.parse(BODY)
-        assert isinstance(a["abstract"], A.Noul)
-        assert isinstance(a["mode"], A.Choice)
-        assert isinstance(a["degree"], A.Score)
+        assert isinstance(a["abstract"], A.NoulAnswer)
+        assert isinstance(a["mode"], A.ChoiceAnswer)
+        assert isinstance(a["degree"], A.ScoreAnswer)
 
     def test_carries_provenance(self):
         a = A.parse(BODY)
@@ -60,7 +60,7 @@ class TestUnknownKinds:
         # The SDK skips these. Skipping is how a provider's new field goes
         # unnoticed until the run that needed it is already paid for.
         a = A.parse(self.BODY)
-        assert isinstance(a["q"], A.Unknown)
+        assert isinstance(a["q"], A.UnknownAnswer)
         assert a["q"].body == {"type": "quantile", "q50": 3, "q90": 7}
 
     def test_reported(self):
@@ -83,7 +83,7 @@ class TestNoThresholdByDefault:
     def test_there_is_no_bool_accessor(self):
         n = A.parse(BODY)["abstract"]
         assert not hasattr(n, "bool")
-        assert not hasattr(n, "__bool__") or isinstance(n, A.Noul)
+        assert not hasattr(n, "__bool__") or isinstance(n, A.NoulAnswer)
 
     def test_at_requires_an_explicit_cut(self):
         n = A.parse(BODY)["abstract"]

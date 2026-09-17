@@ -575,23 +575,23 @@ def reconcile(sub, ledger=None, adapter=None, timeout=None):
 
 
 def _build_request(model, prompt, full_system, temperature, max_tokens,
-                   thinking, cache_ttl):
+                   thinking, cache_ttl, sampling=None):
     """(request, dropped) via the SAME builders the sync path calls."""
     m = model.lower()
     if P._routes_to_anthropic(m):
         return P.anthropic_request_params(
             prompt, model=model, system_prompt=full_system,
             temperature=temperature, max_tokens=max_tokens,
-            cache_ttl=cache_ttl, thinking=thinking)
+            cache_ttl=cache_ttl, thinking=thinking, sampling=sampling)
     if P._routes_to_google(m):
-        gm, contents, config, _setting = P.google_request(
+        gm, contents, config, _setting, dropped = P.google_request(
             prompt, model=model, system_prompt=full_system,
             temperature=temperature, max_tokens=max_tokens,
-            thinking=thinking)
-        return {"model": gm, "contents": contents, "config": config}, ()
+            thinking=thinking, sampling=sampling)
+        return {"model": gm, "contents": contents, "config": config}, dropped
     return P.openai_request_body(
         "openai", model, P.openai_messages(prompt, full_system),
-        temperature=temperature, max_tokens=max_tokens)
+        temperature=temperature, max_tokens=max_tokens, sampling=sampling)
 
 
 def _record_item(per_item_usage, idx, usage, transport):
@@ -901,8 +901,15 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
     full_system, _ = _build_extract_prompt(
         "", schema, system_prompt=system_prompt, examples=examples)
     s_name = _schema_name(schema)
-    eff_temp, thinking_fp = _sampling_fingerprint(model, temperature, kwargs)
-    legacy = _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp)
+    # Decoder params come off the LLM, like temperature and max_tokens: the
+    # batch transport is not part of an administration's identity, so a
+    # pinned run must key identically whichever way it was sent. An
+    # unmeasured family raises HERE, before 50,000 requests are built.
+    sampling = llm.sampling
+    eff_temp, thinking_fp, sampling_fp = _sampling_fingerprint(
+        model, temperature, kwargs, sampling)
+    legacy = _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp,
+                                sampling_fp)
 
     if P._routes_to_anthropic(model.lower()) and cache_ttl is None \
             and full_system:
@@ -920,7 +927,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
         metadata = metadata_list[i] if metadata_list else None
         key = _make_key(prompt, model, full_system, eff_temp, max_tokens,
                         schema_name=s_name, metadata=metadata,
-                        thinking=thinking_fp)
+                        thinking=thinking_fp, sampling=sampling_fp)
         legacy_key = None if legacy is None else _make_key(
             prompt, model, full_system, legacy["temperature"], max_tokens,
             schema_name=s_name, metadata=metadata)
@@ -1039,7 +1046,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
             req, dropped = _build_request(model, prompt, full_system,
                                           temperature, max_tokens,
                                           kwargs.get("thinking", "auto"),
-                                          cache_ttl)
+                                          cache_ttl, sampling)
             dropped_all = dropped or dropped_all
             built.append((i, cid, prompt, key, req))
         # Chunk by count AND bytes.

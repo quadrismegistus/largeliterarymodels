@@ -7,8 +7,9 @@ import os
 from hashstash import HashStash
 from .llm import (
     LLM, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, STASH_PATH,
-    UsageTracker, _build_extract_prompt, _diagnose_partial_response,
-    _parse_json_response, _retry_prompt, _validate_parsed, _unwrap_schema,
+    UsageTracker, append_usage_log, _build_extract_prompt,
+    _diagnose_partial_response, _parse_json_response, _retry_prompt,
+    _validate_parsed, _unwrap_schema,
 )
 
 log = logging.getLogger(__name__)
@@ -84,6 +85,13 @@ class Task:
     retries = 1
     temperature = DEFAULT_TEMPERATURE
     max_tokens = DEFAULT_MAX_TOKENS
+    # Decoder parameters beyond temperature, e.g. {"top_p": 0.9}. Part of
+    # the administration and therefore part of the cache key, flat, one
+    # field per parameter, and absent from the key when unset — so a task
+    # that pins nothing keys exactly as it did before this existed. Pinning
+    # one on a model family nobody has measured raises rather than guessing;
+    # see providers.effective_sampling for why neither guess is safe.
+    sampling = None
     # Prompt-cache lifetime for the instrument: None = 5-minute default,
     # "1h" for long or resumed runs. The 1-hour write costs 2x base input vs
     # 1.25x, so it pays back only across three or more reads — and a "1h"
@@ -117,7 +125,8 @@ class Task:
                 warnings.warn(
                     f"{type(self).__name__}({k}=...): unknown attribute — "
                     f"possible typo? Known: name, schema, system_prompt, "
-                    f"examples, retries, temperature, max_tokens, model.",
+                    f"examples, retries, temperature, max_tokens, sampling, "
+                    f"model.",
                     stacklevel=2,
                 )
             setattr(self, k, v)
@@ -197,6 +206,7 @@ class Task:
             # accumulate across run/map calls instead of resetting per call.
             usage=self.usage,
             raw_log=self._resolved_raw_log(),
+            sampling=self.sampling,
         )
 
     def _resolved_raw_log(self):
@@ -436,56 +446,13 @@ class Task:
     def _append_usage_log(self, llm, per_item, metadata_list, errors=None):
         """Append this batch's usage receipts as one JSONL record.
 
-        The stash stores only response text, so token counts (and any
-        post-hoc price estimate) are otherwise unrecoverable once the
-        process exits — Registration P's pricing worked only because that
-        producer kept its own artifact. One record per batch: timestamp,
-        model, the batch report, and per-item rows keyed by index with
-        metadata attached where given. Fully-cached batches log a report
-        of zeros — a receipt that nothing was billed is still a receipt.
+        The record format lives in llm.append_usage_log, where the calls are
+        made: a Task-only writer is why a run driven straight off LLM.map
+        kept no receipts at all. This supplies the file stem (the task name)
+        and delegates.
         """
-        import time
-
-        log_dir = os.path.join(os.path.dirname(STASH_PATH), "usage_logs")
-        os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, f"{self.task_name}.jsonl")
-        items = []
-        for i, entry in sorted((per_item or {}).items()):
-            row = dict(entry)
-            if metadata_list and i < len(metadata_list) and metadata_list[i]:
-                row["metadata"] = metadata_list[i]
-            if errors and i in errors:
-                # Spend on an item that produced no annotation is still
-                # spend, but a per-annotation cost table must not read it
-                # as an annotation's price.
-                row["failed"] = True
-            items.append(row)
-        # Batch totals from the per-item rows, not the Task-lifetime
-        # tracker: a record claiming to describe THIS batch must not carry
-        # every previous batch's tokens inside it.
-        token_keys = ("calls", "input_tokens", "output_tokens",
-                      "cache_read_tokens", "cache_write_tokens",
-                      "reasoning_tokens")
-        batch = {k: sum(e.get(k, 0) for e in items) for k in token_keys}
-        served = {}
-        for e in items:
-            rm = e.get("response_model")
-            # Rows that made no call (de-duplicated twins) carry a copied
-            # response_model for provenance, but counting them made
-            # response_models sum to 3 beside calls: 2 in the same dict.
-            if rm and e.get("calls", 0) > 0:
-                served[rm] = served.get(rm, 0) + 1
-        batch["response_models"] = served
-        record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "task": self.task_name,
-            "model": llm.model,
-            "batch": batch,
-            "items": items,
-        }
-        with open(path, "a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-        log.info("usage_log: appended %d item rows to %s", len(items), path)
+        append_usage_log(self.task_name, llm.model, per_item, metadata_list,
+                         errors, stash_path=STASH_PATH)
 
     # ------------------------------------------------------------------
     # Instrument serialisation
@@ -563,15 +530,52 @@ class Task:
         omits — what a methods note needs so "the same instrument" and "the
         same administration" stay distinct claims. Pin the model explicitly
         when the run overrides the task default.
+
+        Carries two things about decoder parameters that a cache key
+        deliberately does not. `sampling` is what this task pins.
+        `vendor_sampling_defaults` is what an UNPINNED field was measured to
+        run at — empty for most models, because for three of four vendors
+        that number is not knowable by any instrument we have, and empty
+        means unmeasured rather than 1.0. It is not in the key because a
+        vendor default can change under us and every old key would then be
+        asserting a number nobody re-measured; it is here because a methods
+        note that omits it is claiming less than it knows. The live case is
+        the Opus line at top_p=0.99 — an unpinned Opus corpus is a
+        nucleus-truncated corpus, and no vendor documentation says so.
         """
         import pydantic
+        from .providers import (effective_temperature,
+                                known_sampling_defaults,
+                                unavailable_sampling)
+        resolved = model or getattr(self, "model", None) or DEFAULT_MODEL
         return {
             "task": self.task_name,
             "schema": _schema_repr(self.schema),
             "instrument_sha256": self.instrument_sha256(),
-            "model": model or getattr(self, "model", None) or DEFAULT_MODEL,
+            "model": resolved,
+            # REQUESTED, which is not the same as applied. Sonnet 5,
+            # Opus 5/4.8/4.7, Fable and the claude-cli transport all take a
+            # temperature and do not use it, so a methods note written off
+            # `temperature` alone can say "administered at temperature 0" of
+            # a run that was never temperature-controlled.
             "temperature": self.temperature,
+            # What actually governed: None where the family rejects or
+            # ignores it. The two fields differ exactly where a claim would
+            # have been false, which is the only place a receipt earns its
+            # keep. Note the split WITHIN a vendor — haiku-4-5 honours a
+            # temperature that sonnet-5 and opus-5 discard — so "the
+            # Anthropic arm was temperature-pinned" can be true of one model
+            # and false of the next in the same corpus.
+            "temperature_effective": effective_temperature(
+                resolved, self.temperature),
             "max_tokens": self.max_tokens,
+            "sampling": dict(self.sampling) if self.sampling else None,
+            "vendor_sampling_defaults": known_sampling_defaults(resolved),
+            # Fields this model would not have let a caller pin anyway.
+            # A methods note about an unset field is stronger for saying
+            # "and it could not have been set", and silence here reads as
+            # "nobody tried" when the truth is "it was not available".
+            "sampling_unavailable": unavailable_sampling(resolved),
             "retries": self.retries,
             # The digest embeds model_json_schema() output, which can change
             # across pydantic versions with no change to the scheme — this

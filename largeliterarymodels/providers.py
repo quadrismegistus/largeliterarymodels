@@ -138,10 +138,20 @@ def _unsupported_param(exc, name):
     false do-not-call-this-temperature-controlled audit record, and never
     repairing the parameter actually at fault.
     """
-    return re.search(
-        r"unsupported parameter[^']*'%s'" % re.escape(name),
-        str(exc), re.IGNORECASE,
-    ) is not None
+    text = str(exc)
+    if re.search(r"unsupported parameter[^']*'%s'" % re.escape(name),
+                 text, re.IGNORECASE):
+        return True
+    # A second phrasing, same meaning, different words. gpt-5-nano refuses a
+    # pinned temperature with "Unsupported VALUE: 'temperature' does not
+    # support 0.0 with this model. Only the default (1) value is supported."
+    # Matching only on "parameter" meant the repair loop never learned it and
+    # every call failed outright (measured 2026-08-31: 6/6 calls dead).
+    # Anchored the same way — the name must be the FIRST quoted token — so an
+    # error that goes on to list other parameters is not read as rejecting
+    # them too.
+    return re.search(r"unsupported value[^']*'%s'" % re.escape(name),
+                     text, re.IGNORECASE) is not None
 
 
 def _healed_token_param(exc, current):
@@ -162,12 +172,59 @@ def _healed_token_param(exc, current):
 # an Anthropic prompt-cache concept that LLM._provider_kwargs injects into
 # every call, and an OpenAI-compatible endpoint 400s on it.
 _NON_API_KWARGS = frozenset({"cache_ttl", "thinking", "schema", "schema_name",
-                             "raw_transport"})
+                             "raw_transport", "sampling"})
 
 
 def _api_kwargs(kwargs):
     """Caller kwargs minus the framework-internal ones."""
     return {k: v for k, v in kwargs.items() if k not in _NON_API_KWARGS}
+
+
+def guard_bare_sampling(provider, model, kwargs):
+    """Refuse a decoder parameter passed as a bare provider kwarg.
+
+    On the DeepSeek route **kwargs are forwarded verbatim, so `top_p=0.9`
+    passed that way WOULD reach the API — and would not reach the stash key,
+    which is the poisoning half of the same bug: two differently-sampled
+    runs under one cell, silently. `sampling={"top_p": 0.9}` is the door,
+    because that is the one the key is built from.
+    """
+    bare = sorted(set(kwargs) & set(SAMPLING_PARAMS))
+    if bare:
+        raise ValueError(
+            f"{provider}: pass decoder parameters as sampling="
+            f"{{{', '.join('%r: ...' % b for b in bare)}}}, not as bare "
+            f"keyword arguments. A bare kwarg is either discarded silently "
+            f"or sent without entering the cache key, and both failures are "
+            f"invisible in the output."
+        )
+
+
+_WARNED_SWALLOWED = set()
+
+
+def swallowed_kwargs(provider, model, kwargs):
+    """Names of caller kwargs this route accepts and then DISCARDS.
+
+    Reports each loudly and returns them for the usage record, so they show
+    up in `task.usage.summary_line()` as DROPPED PARAMS and raise under
+    LITMOD_STRICT_PARAMS.
+
+    Every call_* declares **kwargs. Until 2026-08 four of the five then
+    dropped them on the floor: only call_deepseek forwarded, so one caller's
+    `top_p=0.9` pinned DeepSeek and silently did nothing on Anthropic,
+    OpenAI, Google and local — same request, same cache key, different
+    sampling, no error anywhere. Sampling parameters now have a real route
+    (see effective_sampling); anything ELSE still goes nowhere, and this is
+    what makes going nowhere audible.
+    """
+    extra = sorted(set(kwargs) - _NON_API_KWARGS)
+    for name in extra:
+        _report_dropped_param(
+            provider, model, name, kwargs[name], _WARNED_SWALLOWED,
+            reason="this provider does not forward unrecognised parameters",
+        )
+    return tuple(extra)
 
 
 def openai_messages(prompt, system_prompt=None, images=None):
@@ -207,7 +264,7 @@ def _openai_attempt_kwargs(param, send_temperature, temperature, max_tokens,
 
 
 def openai_request_body(provider, model, messages, temperature=0.7,
-                        max_tokens=4096, **extra):
+                        max_tokens=4096, sampling=None, **extra):
     """A complete chat-completions body for one BATCH request line.
 
     Consults the same repair memos the sync path learns from — which is
@@ -221,17 +278,22 @@ def openai_request_body(provider, model, messages, temperature=0.7,
     call — the batch builder must not reintroduce, 50,000 requests at a
     time, the silent drop that machinery exists to forbid.
     """
+    guard_bare_sampling(provider, model, extra)
+    # Same filter as the sync path, from the FULL model string — one
+    # resolver, so a batch of 50,000 cannot be sampled differently from the
+    # probe that preceded it.
+    governing, sampling_dropped = effective_sampling(model, sampling)
     memo = (provider, _strip_prefix(model))
     send_temperature = memo not in _NO_TEMPERATURE
-    dropped = ()
+    dropped = sampling_dropped
     if not send_temperature and temperature is not None:
         _report_dropped_param(provider, _strip_prefix(model), "temperature",
                               temperature, _WARNED_NO_TEMPERATURE)
-        dropped = ("temperature",)
+        dropped = dropped + ("temperature",)
     body = _openai_attempt_kwargs(
         _TOKEN_PARAM.get(memo, "max_tokens"),
         send_temperature,
-        temperature, max_tokens, extra,
+        temperature, max_tokens, dict(extra, **governing),
     )
     body["model"] = _strip_prefix(model)
     body["messages"] = messages
@@ -759,6 +821,18 @@ def _routes_to_deepseek(model_lower):
                  or model_lower in _DEEPSEEK_API_MODELS))
 
 
+def _routes_to_openai(model_lower):
+    # Mirrors route_provider's own test, extracted so callers that need to
+    # know the route (effective_temperature) cannot drift from the
+    # dispatcher. Order matters: local/ and deepseek/ prefixes win first,
+    # exactly as in route_provider.
+    return (not _routes_to_local(model_lower)
+            and not _routes_to_deepseek(model_lower)
+            and ("gpt" in model_lower or "o1" in model_lower
+                 or "o3" in model_lower
+                 or model_lower.startswith("openai/")))
+
+
 def _routes_to_google(model_lower):
     return (not _routes_to_local(model_lower)
             and ("gemini" in model_lower
@@ -832,8 +906,37 @@ def _load_image_bytes(image):
 # opus-5 both 400 with an explicit thinking={"type": "disabled"} —
 # "`temperature` is deprecated for this model." The constant is a fact
 # about the model family, not about the thinking default.
+# A DENYLIST, and the asymmetry matters when reading it: a family listed
+# here is MEASURED to reject temperature; a family absent is only "not known
+# to reject", which is not the same as "accepts", and neither is the same as
+# "applies". Nothing in this tuple licenses a claim that an unlisted model
+# was temperature-controlled — for that, probe it
+# (`litmod probe-sampling --param temperature`), because accepted-and-ignored
+# is the failure this package has already paid for once on DeepSeek.
+# Measured 2026-08-21 by rejection scan (lacan seat): opus-5 and sonnet-5
+# reject; haiku-4-5 does not reject, and whether it APPLIES was still open at
+# the time of writing.
 _NO_TEMPERATURE_MODELS = ("opus-4-7", "opus-4-8", "opus-5", "sonnet-5",
                           "fable", "mythos")
+
+# Same fact, OpenAI route. Static, because the dynamic _NO_TEMPERATURE memo
+# is per-process and deliberately cannot reach the cache key: without a
+# static entry a gpt-5-nano run would record `temperature: 0.0` in its key
+# while the model sampled at its default of 1. That is the false-pin failure
+# effective_temperature exists to prevent, arriving through the one route
+# the constant did not cover.
+# Measured 2026-08-31 on gpt-5-nano: "Unsupported value: 'temperature' does
+# not support 0.0 with this model. Only the default (1) value is supported."
+# Listed by the id actually probed. Whether the rest of the gpt-5 tier
+# behaves the same is UNMEASURED — deciding that from the name is this
+# package's recurring bug class.
+_OPENAI_NO_TEMPERATURE_MODELS = ("gpt-5-nano",)
+
+
+def _openai_supports_temperature(model):
+    m = _strip_prefix(model).lower()
+    return not any(_family_match(m, tag)
+                   for tag in _OPENAI_NO_TEMPERATURE_MODELS)
 
 _WARNED_NO_TEMPERATURE = set()
 
@@ -1239,6 +1342,8 @@ def effective_temperature(model, temperature, thinking="auto"):
         return None
     if _routes_to_anthropic(m) and not _supports_temperature(model):
         return None
+    if _routes_to_openai(m) and not _openai_supports_temperature(model):
+        return None
     if _routes_to_deepseek(m) and thinking_fingerprint(model, thinking) != "disabled":
         # Anything short of an explicit disable leaves DeepSeek thinking —
         # including thinking=None (send nothing, take the default, which
@@ -1248,6 +1353,364 @@ def effective_temperature(model, temperature, thinking="auto"):
         return None
     return temperature
 
+
+# ---------------------------------------------------------------------------
+# Decoder parameters beyond temperature
+#
+# top_p and its neighbours were not parameters of this package at all until
+# 2026-08. That was not neutrality. **kwargs reached call_deepseek and were
+# forwarded verbatim (_api_kwargs), while call_anthropic, call_openai,
+# call_google and call_local each declared **kwargs and silently DISCARDED
+# them. So a caller who "pinned" top_p across four vendors pinned exactly
+# one, with no error, no warning, and byte-identical cache keys either way —
+# a per-vendor covariate manufactured by our own passthrough asymmetry, and
+# a false methods claim in the durable artifact had anyone written it up.
+# (lacan seat, 2026-08-21, after 6,600 passages across four vendors ran
+# unpinned; the axis under measurement was surprisal, which nucleus
+# truncation moves.)
+#
+# These are real parameters now, and the key records them under the rule the
+# temperature and thinking fields already follow: THE KEY RECORDS WHAT
+# GOVERNED THE CALL AND OMITS THE FIELD WHEN NOTHING WAS SENT. A value
+# present in a key means that value governed. Absent means unpinned — the
+# vendor chose, and which value it chose on the day is a fact the key cannot
+# carry and must not pretend to.
+#
+# That rule forces a third state, and it is the common one. On a family
+# where nobody has MEASURED whether a value governs, neither default is
+# safe:
+#
+#   * assume it governs, and the key carries a pin that may never have
+#     applied — the false methods claim effective_temperature exists to
+#     prevent;
+#   * assume it does not, and two behaviourally different runs share one
+#     cell — the poisoning thinking_fingerprint exists to prevent.
+#
+# The schema cannot pick either under ignorance, so it REFUSES: pinning a
+# decoder parameter on an unmeasured family raises SamplingUnmeasured.
+# Resolving a family means adding a constant here with its measurement date
+# and a reproduction recipe — reviewable, versioned, the same shape as
+# _NO_TEMPERATURE_MODELS — and deliberately NOT an environment flag, because
+# key identity must not depend on ambient configuration that nothing
+# records.
+#
+# The table is nearly empty because the ground is worse than "undocumented"
+# (vendor-doc survey, lacan seat, 2026-08-21): DeepSeek documents a default
+# of 1; OpenAI publishes no prose default, only example payloads echoing
+# 1.0, possibly contingent on reasoning_effort; Google states the default
+# VARIES BY MODEL and is retrievable only through an authenticated getModel
+# call, while its 3.x guide deprecates the sampling parameters outright;
+# Anthropic publishes no top_p default for any model, and the Opus line
+# rejects non-default values — a fixed number that is both unchangeable and
+# undisclosed. "top_p was 1.0" is a claim the documentation supports for one
+# vendor of four.
+#
+# How to resolve a cell, since acceptance is not the question that matters:
+# a 200 response is not evidence a value governed (DeepSeek's thinking mode
+# accepts and ignores all four). Measure SUPPORT SIZE, not distributional
+# distance. Truncation's signature is that outputs become impossible, not
+# merely rarer, so on a flat-continuation prompt ("Pick a random integer
+# between 1 and 100; reply with the number only") count DISTINCT outputs
+# over n samples at the pinned value against n at 1.0. Types, not densities:
+# a distance test at n=100 has almost no power against a default of 0.95,
+# and its null reads as "the parameter did nothing" — a false no-op in the
+# one direction that is unrecoverable, because it says the corpus was fine.
+# Hold temperature fixed and above zero in both arms or the support
+# collapses for a reason that is not top_p. Do not run it on a schema
+# prompt: JSON-constrained output is low-entropy by construction and shows a
+# ceiling effect as a no-op.
+# ---------------------------------------------------------------------------
+
+#: Decoder parameters this package will pass through and key on.
+SAMPLING_PARAMS = ("top_p", "top_k", "frequency_penalty",
+                   "presence_penalty", "seed")
+
+_ACCEPTS = "accepts"
+_REJECTS = "rejects"
+_UNMEASURED = "unmeasured"
+# The API reports the parameter DEPRECATED for this model. Treated as
+# not-governing: dropped, reported, and kept out of the key.
+#
+# This state replaces one that briefly existed here called
+# _ACCEPTS_DEFAULT_ONLY, and the correction is worth recording because the
+# evidence never changed — only what we read into it. A rejection scan on
+# claude-opus-5 found exactly one accepted value, 0.99, with 1.0, 0.999,
+# 0.95, 0.9 and a negative control all refused. That pattern was read as
+# "accepts iff equals the default", making 0.99 the vendor's undisclosed
+# default. Then someone read the 400 text instead of truncating it:
+#
+#     "`top_p` is deprecated for this model."
+#
+# Not an equality test. A surviving legacy value, a no-op, and a default all
+# produce the identical acceptance pattern, and a deprecated parameter is if
+# anything MORE likely to be accepted because it does nothing. So what
+# governs top_p on this family is undisclosed, and the number 0.99 licenses
+# no claim at all. Do not send it: an accepted-and-ignored value in a cache
+# key is the exact false pin this whole schema exists to prevent.
+_DEPRECATED = "deprecated"
+
+#: (route, family-substring) -> {param: state}. Consulted BEFORE the
+#: route-wide table, because a measurement on one model generation is a fact
+#: about that generation — assuming otherwise is this package's recurring
+#: bug class. The Anthropic route proved it within one vendor's current
+#: lineup: three models, three regimes, on the same day.
+#:
+#: litmod probe-sampling --model M --param top_p --rejection-scan --yes
+#: (lacan seat, 2026-08-21, 6 calls each)
+_SAMPLING_FAMILIES = {
+    # only 0.99 accepted; every other value and the control refused with
+    # "`top_p` is deprecated for this model."
+    ("anthropic", "opus-5"): {"top_p": _DEPRECATED},
+    ("anthropic", "sonnet-5"): {"top_p": _DEPRECATED},
+    # refuses the PARAMETER: all six values including the control, one
+    # error shape.
+    ("anthropic", "haiku-4-5"): {"top_p": _REJECTS},
+}
+
+#: (route, family-substring) -> {param: measured default}. Deliberately
+#: EMPTY: no vendor default for any decoder parameter has been established
+#: by measurement. Empty here means unmeasured, never 1.0 — the distinction
+#: the design turns on, and the one a reader collapses.
+#:
+#: It briefly held ("anthropic", "opus-5"): {"top_p": 0.99}. See _DEPRECATED
+#: for why that was withdrawn. A number that survives a deprecation is not a
+#: default, and this table must hold only numbers an instrument produced.
+#:
+#: Never written into cache keys even when populated: a vendor default can
+#: change under us, and every old key would then assert a number nobody
+#: re-measured. It rides in administration_record() instead, so a methods
+#: note can state what an UNPINNED field ran at.
+_SAMPLING_DEFAULTS = {}
+
+#: (route, family-substring) -> {param: why it cannot be pinned}. What a
+#: methods note should say about a field nobody set, on a family where
+#: setting it would not have worked either.
+_SAMPLING_UNAVAILABLE = {
+    ("anthropic", "opus-5"): {
+        "top_p": "deprecated for this model; the API accepts only 0.99 and "
+                 "refuses every other value, which is equally consistent "
+                 "with a surviving legacy value, a no-op, or the default — "
+                 "what governed is undisclosed"},
+    ("anthropic", "sonnet-5"): {
+        "top_p": "deprecated for this model; see claude-opus-5"},
+    ("anthropic", "haiku-4-5"): {
+        "top_p": "rejected outright (the parameter, not the value)"},
+}
+
+# route -> {param: state}. Anything absent is _UNMEASURED and raises.
+_SAMPLING_SUPPORT = {
+    # Documented by DeepSeek, not yet probed here. Their thinking-mode page
+    # names exactly these as accepted-and-ignored while thinking is on,
+    # which is a statement that they are honoured while it is off; the
+    # ignored-under-thinking half is handled in effective_sampling rather
+    # than in this table, because it depends on the call, not the family.
+    "deepseek": {
+        "top_p": _ACCEPTS,
+        "frequency_penalty": _ACCEPTS,
+        "presence_penalty": _ACCEPTS,
+    },
+    # The CLI transport flattens the request and discards sampling
+    # parameters wholesale — the same reason effective_temperature returns
+    # None there. Nothing to measure.
+    "claude_cli": {p: _REJECTS for p in SAMPLING_PARAMS},
+}
+
+
+# Routes whose stack applies a decoder parameter WITHOUT being asked, so
+# that pinning any other parameter there produces a key describing a call
+# that did not happen. Pinning on such a route requires pinning the
+# companion explicitly (0 or None disables it where the backend supports
+# that) — a partially-pinned decoder reads as a fully-pinned one, and on
+# these routes it is materially wrong rather than merely incomplete.
+#
+# Seeded from an adjacent measurement rather than from ours, and the
+# distinction matters: the lacan seat measured transformers 5.4.0 applying
+# an effective top_k=50 when the field is ABSENT, while
+# GenerationConfig().top_k, the checkpoint's generation_config and the
+# merged model.generation_config.top_k all report None (SmolLM2-360M-
+# Instruct, 2026-08-21; CPU and MPS alike; 200 draws reached max rank 47
+# with top_k unset against 7090 with top_k=0, and multinomial draws from
+# the same distribution put 4.85% outside the 0.95 nucleus against
+# generate's 0-0.3%). That is the HF generate() path, which this package
+# does not use — `local/` speaks HTTP to llama.cpp, vLLM, LM Studio or
+# Ollama, each with its own defaults (llama.cpp has historically applied
+# top_k=40 and top_p=0.95 unasked). So the NUMBER is not ours; the CLASS
+# is, and it is worse for us because there are four backends behind one
+# prefix. Until someone probes the actual servers, the conservative rule
+# stands.
+#
+# The cost of not having this rule, concretely: with an unrequested
+# top_k=50 in force, nucleus sizes of 436/223/53 tokens at top_p
+# 0.95/0.9/0.7 all collapse to the same top-50 set, so a four-arm sweep
+# varies nothing and returns a flat line that reads as "truncation has no
+# effect".
+_SAMPLING_COMPANIONS = {
+    "local": ("top_k",
+              "the local backends apply their own top_k unasked, and every "
+              "config surface can report None while it is in force, so a "
+              "run pinning only top_p is top_k-truncated and keyed as "
+              "though it were not"),
+}
+
+
+class SamplingUnmeasured(ValueError):
+    """A decoder parameter was pinned on a family nobody has probed.
+
+    Not pedantry: the two available guesses fail in opposite directions and
+    both are silent (see the section comment). The fix is a measurement, and
+    the measurement belongs in _SAMPLING_SUPPORT with its date.
+    """
+
+
+def provider_route(model):
+    """Canonical route name for `model` — the key into _SAMPLING_SUPPORT.
+
+    Mirrors route_provider's dispatch order rather than re-deriving it: two
+    dispatchers is how a model ends up keyed against one provider's
+    constants and sent to another's endpoint.
+    """
+    return route_provider(model).__name__.replace("call_", "")
+
+
+def _family_table(table, route, model):
+    """The per-family entry for `model` on `route`, or {}."""
+    m = model.lower()
+    for (r, tag), entry in table.items():
+        if r == route and _family_match(m, tag):
+            return entry
+    return {}
+
+
+def _sampling_state(route, param, model=None):
+    if model is not None:
+        fam = _family_table(_SAMPLING_FAMILIES, route, model)
+        if param in fam:
+            return fam[param]
+    return _SAMPLING_SUPPORT.get(route, {}).get(param, _UNMEASURED)
+
+
+def _dropped_reason(route, param, model):
+    state = _sampling_state(route, param, model)
+    if state is _ACCEPTS:
+        return "thinking mode accepts and ignores it"
+    if state == _DEPRECATED:
+        unavailable = _family_table(_SAMPLING_UNAVAILABLE, route, model)
+        return unavailable.get(param, "the API reports it deprecated here")
+    return "the transport discards it"
+
+
+def unavailable_sampling(model):
+    """{param: why} for decoder fields this model will not let a caller pin.
+
+    For a methods note about a field nobody set: on these families setting
+    it would not have worked either, and saying so is stronger than silence.
+    """
+    try:
+        route = provider_route(model)
+    except ValueError:
+        return {}
+    return dict(_family_table(_SAMPLING_UNAVAILABLE, route, model))
+
+
+def known_sampling_default(model, param):
+    """The MEASURED vendor default for `param` on `model`, or None.
+
+    None means nobody has measured it, not that it is 1.0 — for three of
+    four vendors the number is still not knowable by any instrument we
+    have. Never consulted for cache keys; see _SAMPLING_DEFAULTS.
+    """
+    return _family_table(_SAMPLING_DEFAULTS, provider_route(model),
+                         model).get(param)
+
+
+def known_sampling_defaults(model):
+    """Every measured vendor default for `model`, for a methods note."""
+    try:
+        route = provider_route(model)
+    except ValueError:
+        return {}
+    return dict(_family_table(_SAMPLING_DEFAULTS, route, model))
+
+
+def effective_sampling(model, sampling, thinking="auto",
+                       allow_unmeasured=False):
+    """(governing, dropped) for a call's decoder parameters.
+
+    governing: {param: value} that will actually apply — these go into the
+        request AND into the stash key, flat, one field each.
+    dropped: params requested that will not take effect. Reported through
+        _report_dropped_param (so LITMOD_STRICT_PARAMS escalates) and
+        recorded in usage, exactly as a rejected temperature is.
+
+    Raises SamplingUnmeasured for any pinned parameter whose behaviour on
+    this family has not been measured. Static knowledge only, like
+    effective_temperature: a rejection discovered mid-run must never change
+    keys between one call and the next.
+
+    allow_unmeasured=True sends an unmeasured parameter anyway. It exists
+    for exactly one caller — the probe that MEASURES a family (see
+    cli.sampling_probe) — and that caller writes no cache key, which is what
+    makes it safe: the refusal protects the durable artifact, and a probe
+    produces no durable artifact. Never set it on an annotation path.
+    """
+    if not sampling:
+        return {}, ()
+    route = provider_route(model)
+    companion = _SAMPLING_COMPANIONS.get(route)
+    if companion and companion[0] not in sampling:
+        raise SamplingUnmeasured(
+            f"{route}: pinning a decoder parameter here also requires "
+            f"pinning {companion[0]!r} explicitly — {companion[1]}. Pass "
+            f"sampling={{..., {companion[0]!r}: 0}} to disable it, or an "
+            f"explicit value to pin it."
+        )
+    governing, dropped, unmeasured = {}, [], []
+    for param in SAMPLING_PARAMS:
+        value = sampling.get(param)
+        if value is None:
+            continue
+        state = _sampling_state(route, param, model)
+        if state == _DEPRECATED:
+            dropped.append(param)
+            continue
+        if state is _UNMEASURED:
+            if not allow_unmeasured:
+                unmeasured.append(param)
+                continue
+            governing[param] = value
+            continue
+        if state is _REJECTS:
+            dropped.append(param)
+            continue
+        # Accepted by the family — but DeepSeek's thinking mode takes these
+        # four and ignores them silently, per its own docs, which is the
+        # door _report_dropped_param could not watch until the thinking
+        # fingerprint gave it one.
+        if (_routes_to_deepseek(model.lower())
+                and thinking_fingerprint(model, thinking) != "disabled"):
+            dropped.append(param)
+            continue
+        governing[param] = value
+    if unmeasured:
+        raise SamplingUnmeasured(
+            f"{route}: whether {model!r} honours "
+            f"{', '.join(repr(p) for p in unmeasured)} has not been measured, "
+            f"so this package will not guess. Recording the value in the "
+            f"stash key would assert a pin that may never have applied; "
+            f"omitting it would let two differently-sampled runs share a "
+            f"cache cell. Measure it (see providers._SAMPLING_SUPPORT for "
+            f"the support-size recipe) and add the constant with its date."
+        )
+    for param in dropped:
+        _report_dropped_param(
+            provider_route(model), model, param, sampling[param],
+            _WARNED_NO_SAMPLING,
+            reason=_dropped_reason(route, param, model),
+        )
+    return governing, tuple(dropped)
+
+
+_WARNED_NO_SAMPLING = set()
 
 def _response_text(content, model, stop_reason=None):
     """Concatenate every text block from an Anthropic response, in order.
@@ -1287,7 +1750,8 @@ def _response_text(content, model, stop_reason=None):
 def anthropic_request_params(prompt, model="claude-sonnet-4-6",
                              system_prompt=None, temperature=0.7,
                              max_tokens=4096, images=None, cache_ttl=None,
-                             thinking="auto"):
+                             thinking="auto", sampling=None,
+                             allow_unmeasured=False):
     """(api_kwargs, dropped_params) — the EXACT request the sync path sends.
 
     One constructor for both transports: the sync path calls this and then
@@ -1302,6 +1766,13 @@ def anthropic_request_params(prompt, model="claude-sonnet-4-6",
     requests with a pin that will not apply should fail before money
     moves, not after — and the cache-floor warning fires once per model.
     """
+    # Resolved from the FULL model string, before the prefix is stripped:
+    # provider_route dispatches on the prefix, and a stripped local id
+    # routes nowhere. Filtering here rather than in llm.py means a direct
+    # provider caller and the batch builder get the same protection the
+    # cached path gets — one filter, so sync and batch cannot drift.
+    governing, sampling_dropped = effective_sampling(
+        model, sampling, thinking, allow_unmeasured)
     model = _strip_prefix(model)
 
     # Build content blocks
@@ -1327,7 +1798,8 @@ def anthropic_request_params(prompt, model="claude-sonnet-4-6",
         messages=[{"role": "user", "content": content}],
     )
     # Newer model families reject sampling params entirely; skip when unsupported.
-    dropped = []
+    dropped = list(sampling_dropped)
+    api_kwargs.update(governing)
     if temperature is not None and _supports_temperature(model):
         api_kwargs["temperature"] = temperature
     elif temperature is not None:
@@ -1359,7 +1831,8 @@ def anthropic_request_params(prompt, model="claude-sonnet-4-6",
 def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
                    temperature=0.7, max_tokens=4096, images=None,
                    timeout=None, cache_ttl=None, usage_sink=None,
-                   thinking="auto", raw_sink=None, **kwargs):
+                   thinking="auto", raw_sink=None, sampling=None,
+                   allow_unmeasured=False, **kwargs):
     """Call Anthropic's Claude API directly.
 
     Args:
@@ -1376,6 +1849,9 @@ def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
             back across three or more reads.
         usage_sink: Optional callable receiving a normalised usage dict.
     """
+    # Argument validation before any side effect: a caller error must not
+    # need credentials to surface.
+    guard_bare_sampling("anthropic", model, kwargs)
     from anthropic import Anthropic
 
     api_key = _get_key("ANTHROPIC_API_KEY")
@@ -1384,13 +1860,15 @@ def call_anthropic(prompt, model="claude-sonnet-4-6", system_prompt=None,
         lambda: Anthropic(api_key=api_key) if timeout is None
         else Anthropic(api_key=api_key, timeout=timeout),
     )
+    swallowed = swallowed_kwargs("anthropic", model, kwargs)
     api_kwargs, dropped = anthropic_request_params(
         prompt, model=model, system_prompt=system_prompt,
         temperature=temperature, max_tokens=max_tokens, images=images,
-        cache_ttl=cache_ttl, thinking=thinking,
+        cache_ttl=cache_ttl, thinking=thinking, sampling=sampling,
+        allow_unmeasured=allow_unmeasured,
     )
     model = api_kwargs["model"]
-    dropped = list(dropped)
+    dropped = list(dropped) + list(swallowed)
 
     response = client.messages.create(**api_kwargs)
     # Rolling aliases (claude-sonnet-4-6) resolve to dated snapshots; log which.
@@ -1503,12 +1981,14 @@ def call_claude_cli(prompt, model="claude-cli/opus", system_prompt=None,
 
 def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None,
-                timeout=None, usage_sink=None, raw_sink=None, **kwargs):
+                timeout=None, usage_sink=None, raw_sink=None, sampling=None,
+                allow_unmeasured=False, **kwargs):
     """Call OpenAI's API directly.
 
     The gpt-5 tier renamed max_tokens to max_completion_tokens and 400s on
     the old name; _chat_completion repairs that from the error message.
     """
+    guard_bare_sampling("openai", model, kwargs)
     from openai import OpenAI
 
     api_key = _get_key("OPENAI_API_KEY")
@@ -1517,12 +1997,17 @@ def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
         lambda: OpenAI(api_key=api_key) if timeout is None
         else OpenAI(api_key=api_key, timeout=timeout),
     )
+    # Before the strip: provider_route dispatches on the full string.
+    governing, sampling_dropped = effective_sampling(
+        model, sampling, allow_unmeasured=allow_unmeasured)
+    dropped_hint = sampling_dropped + swallowed_kwargs("openai", model, kwargs)
     model = _strip_prefix(model)
     messages = openai_messages(prompt, system_prompt, images)
 
     response = _chat_completion(
         client, "openai", model, messages, temperature, max_tokens,
         usage_sink=usage_sink, raw_sink=raw_sink,
+        dropped_hint=dropped_hint, **governing,
     )
     return response.choices[0].message.content
 
@@ -1530,7 +2015,8 @@ def call_openai(prompt, model="gpt-5.4-mini", system_prompt=None,
 def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
                   temperature=0.7, max_tokens=4096, images=None,
                   timeout=None, usage_sink=None, thinking="auto",
-                  extra_body=None, raw_sink=None, **kwargs):
+                  extra_body=None, raw_sink=None, sampling=None,
+                  allow_unmeasured=False, **kwargs):
     """Call DeepSeek's API (OpenAI-compatible, text-only).
 
     Args:
@@ -1550,12 +2036,20 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
     `temperature`; this records that as a dropped parameter rather than
     letting a sampling claim stand on a parameter that had no effect.
     """
+    guard_bare_sampling("deepseek", model, kwargs)
     from openai import OpenAI
 
     if images:
         raise ValueError(
             "DeepSeek's chat API is text-only; images are not supported."
         )
+
+    # Before the strip, and before the thinking decision below, because
+    # thinking mode accepts these four and ignores them exactly as it does
+    # temperature — effective_sampling resolves that from the same
+    # thinking_fingerprint the cache key is built from.
+    governing, sampling_dropped = effective_sampling(
+        model, sampling, thinking, allow_unmeasured)
 
     api_key = _get_key("DEEPSEEK_API_KEY")
     client = _cached_client(
@@ -1589,7 +2083,7 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
     # here, from what we are about to send, and record it.
     sent = body.get("thinking")
     reasons = not (isinstance(sent, dict) and sent.get("type") == "disabled")
-    dropped_hint = ()
+    dropped_hint = sampling_dropped
     requested_temperature = temperature
     if reasons and temperature is not None:
         _report_dropped_param(
@@ -1598,7 +2092,7 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
             reason="thinking mode accepts sampling params and ignores them, "
                    "without erroring — so nothing else would have caught this",
         )
-        dropped_hint = ("temperature",)
+        dropped_hint = dropped_hint + ("temperature",)
         temperature = None
 
     # The audit runs as a usage_filter so its findings land IN the usage
@@ -1617,6 +2111,7 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
         usage_sink=usage_sink, dropped_hint=dropped_hint,
         usage_filter=_audit_filter, raw_sink=raw_sink,
         **({"extra_body": body} if body else {}),
+        **governing,
         **_api_kwargs(kwargs),
     )
     if usage_sink is None and not reasons:
@@ -1631,19 +2126,23 @@ def call_deepseek(prompt, model="deepseek/deepseek-v4-pro", system_prompt=None,
 
 def google_request(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                    temperature=0.7, max_tokens=4096, thinking="auto",
-                   images=None):
-    """(model, contents, GenerateContentConfig, thinking_setting) — the
-    EXACT request the sync path sends, shared with the batch path so the
+                   images=None, sampling=None, allow_unmeasured=False):
+    """(model, contents, GenerateContentConfig, thinking_setting, dropped) —
+    the EXACT request the sync path sends, shared with the batch path so the
     two transports cannot drift. The thinking_setting rides along because
     the caller's post-response audit (budget-0 accepted-and-ignored) and
     the loud-rejection wrap both key off what was actually sent.
     """
     from google.genai import types
 
+    # Before the strip: provider_route dispatches on the full string.
+    governing, dropped = effective_sampling(
+        model, sampling, thinking, allow_unmeasured)
     model = _strip_prefix(model)
     config = types.GenerateContentConfig(
         temperature=temperature,
         max_output_tokens=max_tokens,
+        **governing,
     )
     if system_prompt:
         config.system_instruction = system_prompt
@@ -1661,13 +2160,14 @@ def google_request(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
         contents = parts
     else:
         contents = prompt
-    return model, contents, config, setting
+    return model, contents, config, setting, dropped
 
 
 def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
                 temperature=0.7, max_tokens=4096, images=None,
                 timeout=None, usage_sink=None, thinking="auto",
-                raw_sink=None, **kwargs):
+                raw_sink=None, sampling=None, allow_unmeasured=False,
+                **kwargs):
     """Call Google's GenAI API directly.
 
     Args:
@@ -1679,6 +2179,7 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
             Pass None for the API default, an int for an explicit budget,
             or the cross-provider 'disabled'/'enabled' spellings.
     """
+    guard_bare_sampling("google", model, kwargs)
     from google import genai
     from google.genai import types
 
@@ -1696,11 +2197,14 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
         )
 
     client = _cached_client(("google", api_key, timeout), _make_google_client)
-    model, contents, config, setting = google_request(
+    dropped = list(swallowed_kwargs("google", model, kwargs))
+    model, contents, config, setting, sampling_dropped = google_request(
         prompt, model=model, system_prompt=system_prompt,
         temperature=temperature, max_tokens=max_tokens, thinking=thinking,
-        images=images,
+        images=images, sampling=sampling,
+        allow_unmeasured=allow_unmeasured,
     )
+    dropped.extend(sampling_dropped)
 
     try:
         response = client.models.generate_content(
@@ -1745,7 +2249,10 @@ def call_google(prompt, model="gemini-3.1-pro-preview", system_prompt=None,
             )
     _sink_raw(raw_sink, response)
     if usage_sink is not None:
-        usage_sink(_usage_google(response))
+        u = _usage_google(response)
+        if dropped:
+            u["dropped_params"] = tuple(dropped)
+        usage_sink(u)
     text = response.text
     if text is None:
         # A thinking model can spend the whole max_output_tokens budget on
@@ -1814,7 +2321,8 @@ def _resolve_local_base_url(model: str) -> str:
 
 def call_local(prompt, model="llama3.3", system_prompt=None,
                temperature=0.7, max_tokens=4096, images=None,
-               timeout=None, usage_sink=None, raw_sink=None, **kwargs):
+               timeout=None, usage_sink=None, raw_sink=None, sampling=None,
+               allow_unmeasured=False, **kwargs):
     """Call a local OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp server).
 
     Routing is prefix-pinned: `lmstudio/<model>` always hits LM Studio (port
@@ -1831,6 +2339,7 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
     (validation passes, dev iteration, cost-free experimentation) rather than
     a drop-in replacement for GenreTask / TranslationTask / PassageTask.
     """
+    guard_bare_sampling("local", model, kwargs)
     from openai import OpenAI
 
     base_url = _resolve_local_base_url(model)
@@ -1839,6 +2348,10 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
         lambda: OpenAI(api_key="local", base_url=base_url) if timeout is None
         else OpenAI(api_key="local", base_url=base_url, timeout=timeout),
     )
+    # Before the strip: a stripped local id ("qwen3.5-35b") routes nowhere.
+    governing, sampling_dropped = effective_sampling(
+        model, sampling, allow_unmeasured=allow_unmeasured)
+    dropped_hint = sampling_dropped + swallowed_kwargs("local", model, kwargs)
     model = _strip_prefix(model)
     messages = openai_messages(prompt, system_prompt, images)
 
@@ -1853,6 +2366,7 @@ def call_local(prompt, model="llama3.3", system_prompt=None,
         response = _chat_completion(
             client, "local", model, messages, temperature, max_tokens,
             usage_sink=usage_sink, raw_sink=raw_sink, extra_body=extra_body,
+            dropped_hint=dropped_hint, **governing,
         )
     except Exception as e:
         msg = str(e).lower()

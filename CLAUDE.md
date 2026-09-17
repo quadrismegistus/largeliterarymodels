@@ -127,6 +127,73 @@ clean bill. Providers also log the server-resolved model id once per run;
 record *that* (or `per_item_usage[i]['response_model']`) as the model of
 record.
 
+## Decoder parameters — top_p and its neighbours
+
+`top_p` was not a parameter of this package until 2026-08, and the absence was not neutrality. `**kwargs` reached `call_deepseek` and were forwarded verbatim; `call_anthropic`, `call_openai`, `call_google` and `call_local` each declared `**kwargs` and silently discarded them. **A caller who "pinned" `top_p` across four vendors pinned exactly one**, with no error, no warning, and byte-identical cache keys either way — a per-vendor covariate manufactured by our own passthrough asymmetry (lacan seat, after 6,600 passages across four vendors ran unpinned on a surprisal axis that nucleus truncation moves).
+
+```python
+task = MyTask(sampling={"top_p": 0.9})          # or LLM(..., sampling={...})
+llm.extract(text, Schema, sampling={"top_p": 0.9})
+```
+
+One door (`sampling=`), not five keyword arguments — and a bare `top_p=` kwarg now **raises** on every route, because that spelling either vanishes or is sent without entering the key.
+
+**The key records what governed the call and omits the field when nothing was sent.** A value present in a key means that value governed; absent means unpinned — the vendor chose, and which value it chose that day is a fact the key cannot carry and must not pretend to. Written flat, one field per parameter (`top_p: 0.9`, not a nested blob), so "which fields were pinned" is readable off the key itself, which is the claim a methods note has to make. Every pre-2026-08 key is byte-stable, and adding a sixth parameter later orphans nothing.
+
+**Pinning on an unmeasured family raises `SamplingUnmeasured`.** Neither guess is safe: assume it governs and the key carries a pin that may never have applied (the false claim `effective_temperature` exists to prevent); assume it does not and two differently-sampled runs share one cell (the poisoning `thinking_fingerprint` exists to prevent). So the third state is a refusal. Resolving a family means adding a constant to `providers._SAMPLING_SUPPORT` with its measurement date and recipe — reviewable and versioned, deliberately **not** an env flag, because key identity must not depend on ambient configuration that nothing records.
+
+**Measured 2026-08-21** (`litmod probe-sampling --param top_p --rejection-scan`, six calls per model, lacan seat):
+
+| model | result |
+|---|---|
+| `claude-opus-5` | only 0.99 accepted; everything else, control included, refused **"`top_p` is deprecated for this model."** |
+| `claude-sonnet-5` | same |
+| `claude-haiku-4-5` | refuses the **parameter** — all six values, one error shape |
+| `deepseek-v4-flash`, `gpt-5.4-nano`, `gemini-3.5-flash-lite` | SETTABLE — every value accepted, control included |
+
+**Three models in one vendor's current lineup, three regimes.** A family claim from one member would have been right about Sonnet by luck and wrong about Haiku — which is why `_SAMPLING_FAMILIES` keys on `(route, family-substring)` and `claude-opus-4-8` still raises.
+
+**A correction worth keeping, because the evidence never changed — only the reading.** The Opus pattern was first recorded as "accepts iff equals the undisclosed default", making 0.99 Anthropic's unpublished `top_p` default, and `_SAMPLING_DEFAULTS` briefly held it. Then someone read the 400 text instead of truncating it: `top_p` is *deprecated* there, not validated against a default. A surviving legacy value, a no-op and a default produce identical acceptance evidence — and a parameter that does nothing has no reason to reject anything, so the no-op reading is if anything likelier. **What governed `top_p` on those runs is undisclosed, and 0.99 licenses no claim.** The state is `_DEPRECATED`: never sent, reported in `dropped_params` with the reason, kept out of the key. An accepted-and-ignored value in a cache key is the exact false pin the schema exists to prevent.
+
+Two things changed in the tool as a result. The verdict is now `ONLY_VALUE_ACCEPTED` rather than `DEFAULT_FOUND` — named for what was observed, since the old name was true about the API and false about the world — and it prints **no constant**, deferring to the refusal text. And refusal text is printed **verbatim, never truncated**: the sentence that overturned the verdict sat past a 120-character cut, on screen the whole time. Pinned by test.
+
+**`_SAMPLING_DEFAULTS` is empty**, and empty means *unmeasured* — not 1.0. No vendor default for any decoder parameter has been established by measurement. It never enters a cache key even when populated (a vendor default can change under us, and every old key would then assert a number nobody re-measured); it rides in `task.administration_record()` beside `sampling_unavailable`, which says what a model would not have let a caller pin anyway.
+
+**SETTABLE is not `_ACCEPTS`.** Accepting the absurd control proves the parameter is settable and says nothing about whether it *governs* — DeepSeek's thinking mode accepts all four and ignores them. Those three get no constant; a future corpus can pin them explicitly, but an already-collected one cannot recover what it ran at.
+
+**`temperature` is a denylist, and the asymmetry bites.** A family in `_NO_TEMPERATURE_MODELS` is *measured* to reject; a family absent is only "not known to reject", which is neither "accepts" nor "applies". `litmod probe-sampling --param temperature` now measures it — the one question the support test answers with power to spare, since 0.0 against 1.0 is an enormous effect where `top_p` 0.95 against 1.0 is a sliver. `administration_record()` carries `temperature` (requested) beside `temperature_effective` (what governed), and they differ exactly where a claim would be false. Note the split *within* a vendor: `haiku-4-5` honours a temperature that `sonnet-5` and `opus-5` discard, so "the Anthropic arm was temperature-pinned" can be true of one model and false of the next in the same corpus.
+
+**Per-family, not per-route.** `_SAMPLING_FAMILIES` and `_SAMPLING_DEFAULTS` key on `(route, family-substring)` and are consulted before the route-wide table, because a measurement on one model generation is a fact about that generation — generalising it is this package's recurring bug class, and `claude-sonnet-5` still raises while `claude-opus-5` does not.
+
+`_SAMPLING_DEFAULTS` never enters a cache key (a vendor default can change under us, and every old key would then assert a number nobody re-measured). It rides in `task.administration_record()` as `vendor_sampling_defaults`, so a methods note can state what an *unpinned* field actually ran at. **Empty there means unmeasured, not 1.0.**
+
+Otherwise the table has DeepSeek (`top_p`, `frequency_penalty`, `presence_penalty`, from their docs) and claude-cli (rejects everything, like temperature). **OpenAI, Google, local and the non-Opus Anthropic families all raise until someone probes them.** The vendor-doc ground is worse than "undocumented": DeepSeek documents a default of 1; OpenAI publishes no prose default, only example payloads echoing 1.0, possibly contingent on `reasoning_effort`; Google states the default *varies by model* and is retrievable only via an authenticated `getModel`, while the 3.x guide deprecates the sampling params outright; Anthropic publishes no `top_p` default for any model, and the Opus line rejects non-default values — a fixed number that is both unchangeable and undisclosed. "top_p was 1.0" is a claim the documentation supports for one vendor of four.
+
+**How to resolve a cell — a 200 is not evidence.** DeepSeek's thinking mode accepts all four and ignores them (handled: they land in `dropped_params` instead of the key). Measure **support size**, not distributional distance: truncation's signature is that outputs become *impossible*, not merely rarer. On a flat-continuation prompt ("Pick a random integer between 1 and 100; reply with the number only"), count *distinct* outputs at the pinned value against n at 1.0 — types, not densities, because a distance test at n=100 has almost no power against a default of 0.95 and its null reads as "the parameter did nothing", a false no-op in the one direction that is unrecoverable. Hold temperature fixed and above zero in both arms, and never run it on a schema prompt: JSON-constrained output is low-entropy by construction and shows a ceiling effect as a no-op.
+
+**A route that truncates unasked cannot be partially pinned.** `providers._SAMPLING_COMPANIONS` names parameters a stack applies whether or not you set them; pinning anything on such a route requires pinning the companion explicitly. Currently just `local` → `top_k`. The measurement that motivates it is adjacent rather than ours, and the difference matters: transformers 5.4.0 applies an effective `top_k=50` when the field is *absent* while `GenerationConfig().top_k`, the checkpoint's own config and the merged `model.generation_config.top_k` **all report None** (lacan seat, SmolLM2-360M-Instruct, 2026-08-21, CPU and MPS alike: 200 draws reached max rank 47 unset against 7090 at `top_k=0`). That is the HF `generate()` path, which we do not use — `local/` speaks HTTP to llama.cpp, vLLM, LM Studio or Ollama, each with its own defaults (llama.cpp has historically applied `top_k=40` and `top_p=0.95` unasked). The number is not ours; the class is, and four backends behind one prefix is worse. **"The config says None" is not evidence a parameter is unset** — which is precisely the inference this package exists to refuse. Cost of not having the rule: with an unrequested `top_k=50` in force, nucleus sizes of 436/223/53 at `top_p` 0.95/0.9/0.7 all collapse to the same top-50 set, so a four-arm sweep varies nothing and returns a flat line reading as "truncation has no effect".
+
+```bash
+litmod probe-sampling --model deepseek/deepseek-v4-pro --param top_p --n 20
+```
+
+Runs an UNSET arm plus one arm per value, counts distinct outputs, and prints the constant to paste into `_SAMPLING_SUPPORT`. It writes no keys and touches no stash — that is what makes its `allow_unmeasured=True` safe, and that flag has exactly this one caller. It also reports whether the **instrument** was validated, which is the part that keeps a null honest: a no-move at `top_p=0.95` is uninformative alone, because 0.95 removes a sliver of tail mass that n draws mostly miss. The low arms are the positive control — if 0.7 collapses support, the test has demonstrated sensitivity and the 0.95 null becomes a *bound* on the effect; if no arm moves at all, nothing was measured and the tool says so rather than reporting "ignored". Known limit: for a hosted model the sharper statistic (rate of draws outside a reference nucleus, a 5%-vs-0% test) needs the model's own distribution, so it works locally and not through an API.
+
+**`--rejection-scan` maps which values a family will accept, in under ten calls.** Cheap enough to run before spending n on any restrictive family. It carries a **negative control** (an in-range value that is certainly nobody's default), because the interesting premise — that an API accepts a value *iff* it equals the default, making acceptance an equality test against an unpublished number — is itself testable and fails silently in two directions. Four outcomes:
+
+- `ONLY_VALUE_ACCEPTED` — one value accepted, control refused. **Consistent with accepts-iff-default AND with a surviving legacy value or a no-op under a deprecated parameter, and the acceptance pattern cannot tell them apart.** So it prints no constant and defers to the refusal text, which usually can. This verdict was originally called `DEFAULT_FOUND` and that name shipped a false reading of a true observation; see the correction below.
+- `NOT_SETTABLE` — everything refused with one error shape, control included → `_REJECTS`.
+- `SETTABLE` — the control was accepted too, so the equality premise is false; fall back to the support test. Without this branch a permissive family returns the first candidate as a "default", and 1.0 leads the list.
+- `INCONCLUSIVE` — refusals differ in shape; read them.
+
+**Refusal text is printed verbatim and never truncated**, because the sentence that decides between those readings lives in the message, and clipping it at 120 characters is how a withdrawn constant got written in the first place.
+
+**Replicates: `sample=i`.** n samples of one prompt were n identical calls and therefore one cache cell — the second through nth collapsed into cache hits and the run reported one observation as n. `sample=` is a replicate index that keys each one separately. Its own field rather than a metadata entry, so it cannot collide with real metadata, and omitted when None. Not named `n=`: OpenAI's API already has an `n` meaning one call returning n completions, which is a different thing.
+
+**`calls == 0` is now two distinguishable states.** Everything cached, or everything failed — the usage sink only fires on success, so the tracker could not tell them apart and a missing `ANTHROPIC_API_KEY` read as a 100% cache hit rate. `UsageTracker` counts `failed_calls` and `failure_types` (attempts, not items) at the single dispatch point in `_call_provider`, and `summary_line()` says which state a zero-call run is in.
+
+**`usage_log` works off `LLM`, not just `Task`.** `LLM(usage_log="run_name")` writes the same per-batch JSONL record `Task` writes, from `llm.append_usage_log` — one writer, because a Task-only sink is why a production run driven straight off `LLM.map` kept no durable record of a single token. In-process `llm.usage.report()` was always live; that is what makes the gap easy to miss.
+
 ## Cost controls worth knowing
 
 Measured 2026-07-30, `claude-sonnet-5`, PassageFormTask instrument (6,863 tokens):

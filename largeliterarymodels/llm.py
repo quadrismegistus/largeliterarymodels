@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashstash import HashStash
 from tqdm import tqdm
 from .providers import (route_provider, _load_image_bytes,
-                        cache_minimum_tokens, effective_temperature,
-                        thinking_fingerprint)
+                        cache_minimum_tokens, effective_sampling,
+                        effective_temperature, thinking_fingerprint)
 
 log = logging.getLogger(__name__)
 
@@ -92,22 +92,125 @@ def _data_dir(env=None, pkg_parent=None):
 STASH_PATH = os.path.join(_data_dir(), "stash")
 
 
+def _record_item_usage(per_item_usage, i, usage):
+    """Attribute one call's tokens to item `i`, accumulating over retries.
+
+    Retries add further calls for the same item, so entries accumulate
+    rather than overwrite — output_tokens for an item is its total billed
+    output, which is what a cost or length analysis wants.
+    """
+    entry = per_item_usage.setdefault(i, {
+        "index": i, "calls": 0, "input_tokens": 0,
+        "output_tokens": 0, "cache_read_tokens": 0,
+        "cache_write_tokens": 0, "reasoning_tokens": 0,
+        "response_model": None,
+    })
+    entry["calls"] += 1
+    for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+              "cache_write_tokens", "reasoning_tokens"):
+        entry[k] += usage.get(k, 0)
+    # Per-annotation provenance: which model answered for THIS item. A
+    # run-level counter cannot attribute a mid-run alias flip to particular
+    # annotations, which is the whole question a provenance record exists to
+    # answer. Retries: the last attempt that REPORTED a served id wins — the
+    # kept text is the last attempt's, and an attempt whose response carried
+    # no usage object must not blank an id an earlier one saw.
+    if usage.get("response_model"):
+        entry["response_model"] = usage["response_model"]
+
+
+def append_usage_log(name, model, per_item, metadata_list=None,
+                     errors=None, stash_path=None):
+    """Append one batch's usage receipts as a JSONL record; return its path.
+
+    Lives on the LLM layer rather than on Task because that is the layer
+    that makes the calls. A production run driven straight off LLM.map
+    recorded NO durable usage at all and the omission surfaced only when
+    someone needed the token counts weeks later (lacan seat, 2026-08-21) —
+    the in-process tracker was live the whole time, which is exactly what
+    makes the gap easy to miss: `llm.usage.report()` answers, right up until
+    the process exits.
+
+    One record per batch: timestamp, name, model, batch totals, and per-item
+    rows keyed by index with metadata attached where given. Fully-cached
+    batches log a report of zeros — a receipt that nothing was billed is
+    still a receipt.
+    """
+    import time
+
+    # The caller supplies the root it is actually using: Task passes its own
+    # module-level STASH_PATH, which is what a test relocates.
+    log_dir = os.path.join(
+        os.path.dirname(stash_path if stash_path is not None else STASH_PATH),
+        "usage_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"{name}.jsonl")
+    items = []
+    for i, entry in sorted((per_item or {}).items()):
+        row = dict(entry)
+        if metadata_list and i < len(metadata_list) and metadata_list[i]:
+            row["metadata"] = metadata_list[i]
+        if errors and i in errors:
+            # Spend on an item that produced no annotation is still spend,
+            # but a per-annotation cost table must not read it as an
+            # annotation's price.
+            row["failed"] = True
+        items.append(row)
+    # Batch totals from the per-item rows, not a lifetime tracker: a record
+    # claiming to describe THIS batch must not carry every previous batch's
+    # tokens inside it.
+    token_keys = ("calls", "input_tokens", "output_tokens",
+                  "cache_read_tokens", "cache_write_tokens",
+                  "reasoning_tokens")
+    batch = {k: sum(e.get(k, 0) for e in items) for k in token_keys}
+    served = {}
+    for e in items:
+        rm = e.get("response_model")
+        # Rows that made no call (de-duplicated twins) carry a copied
+        # response_model for provenance, but counting them made
+        # response_models sum to 3 beside calls: 2 in the same dict.
+        if rm and e.get("calls", 0) > 0:
+            served[rm] = served.get(rm, 0) + 1
+    batch["response_models"] = served
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "task": name,
+        "model": model,
+        "batch": batch,
+        "items": items,
+    }
+    with open(path, "a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+    log.info("usage_log: appended %d item rows to %s", len(items), path)
+    return path
+
+
 def _call_provider(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
                    max_tokens=DEFAULT_MAX_TOKENS, images=None, usage_sink=None,
-                   raw_sink=None, **kwargs):
-    """Dispatch a prompt to the appropriate provider. Used as the cacheable function."""
+                   raw_sink=None, failure_sink=None, **kwargs):
+    """Dispatch a prompt to the appropriate provider. Used as the cacheable function.
+
+    failure_sink counts calls that raise. It lives HERE, at the one dispatch
+    point, rather than at each of the four call sites that catch: a sink
+    wired per call site is a sink that gets forgotten at the fifth.
+    """
     provider_fn = route_provider(model)
-    return provider_fn(
-        prompt=prompt,
-        model=model,
-        system_prompt=system_prompt,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        images=images,
-        usage_sink=usage_sink,
-        raw_sink=raw_sink,
-        **kwargs,
-    )
+    try:
+        return provider_fn(
+            prompt=prompt,
+            model=model,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            images=images,
+            usage_sink=usage_sink,
+            raw_sink=raw_sink,
+            **kwargs,
+        )
+    except Exception as e:
+        if failure_sink is not None:
+            failure_sink(e)
+        raise
 
 
 class UsageTracker:
@@ -169,6 +272,17 @@ class UsageTracker:
         # run keeps a checkable record of the omission rather than only a log
         # line someone had to be suspicious enough to read.
         self.dropped_params = {}
+        # Provider calls that RAISED, and what they raised. Without this,
+        # calls == 0 has two causes that are not interchangeable —
+        # everything served from cache, or everything failed — and the
+        # tracker cannot tell them apart, because the usage sink only fires
+        # on success. A missing API key read as a 100% cache hit rate in the
+        # field (lacan seat, 2026-08-21) and nothing in the receipt
+        # contradicted it. Attempts, not items: a retried item contributes
+        # one per billed attempt, which is what "call" means everywhere else
+        # in this tracker.
+        self.failed_calls = 0
+        self.failure_types = {}
 
     def record(self, usage):
         with self._lock:
@@ -201,6 +315,13 @@ class UsageTracker:
                     self.response_models.get(served, 0) + 1
             for param in usage.get("dropped_params", ()):
                 self.dropped_params[param] = self.dropped_params.get(param, 0) + 1
+
+    def record_failure(self, exc):
+        """Count a provider call that raised. Never itself raises."""
+        name = type(exc).__name__ if exc is not None else "Exception"
+        with self._lock:
+            self.failed_calls += 1
+            self.failure_types[name] = self.failure_types.get(name, 0) + 1
 
     @property
     def prompt_tokens(self):
@@ -235,6 +356,8 @@ class UsageTracker:
                 "by_transport": {t: dict(v)
                                  for t, v in self.by_transport.items()},
                 "dropped_params": dict(self.dropped_params),
+                "failed_calls": self.failed_calls,
+                "failure_types": dict(self.failure_types),
             }
 
     def summary_line(self):
@@ -259,6 +382,18 @@ class UsageTracker:
             dropped = ", ".join(f"{k} x{v}" for k, v in
                                 sorted(r["dropped_params"].items()))
             line += f"  DROPPED PARAMS: {dropped}"
+        if r["failed_calls"]:
+            kinds = ", ".join(f"{k} x{v}" for k, v in
+                              sorted(r["failure_types"].items()))
+            line += f"  FAILED CALLS: {r['failed_calls']} ({kinds})"
+        if r["calls"] == 0:
+            # The whole point of counting failures: zero successful calls is
+            # a triumph or a total outage, and the token columns look
+            # identical either way.
+            line += ("  — NO SUCCESSFUL CALLS: every attempt failed"
+                     if r["failed_calls"] else
+                     "  — no API calls: nothing was sent (a cache-only run, "
+                     "or an empty batch)")
         return line
 
     def no_reasoning_observed(self):
@@ -513,7 +648,7 @@ def _image_cache_id(img):
 
 def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
               max_tokens=DEFAULT_MAX_TOKENS, schema_name=None, images=None,
-              metadata=None, thinking=None):
+              metadata=None, thinking=None, sampling=None, sample=None):
     """Build the dict used as a HashStash key.
 
     Args:
@@ -560,6 +695,27 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
                   is part of their identity — thinking-on and thinking-off
                   output must never share a key, or a rerun hands back one
                   as the other with nothing in the record saying so.
+        sampling: {param: value} for the decoder parameters that will
+                  GOVERN this call — providers.effective_sampling's first
+                  return, never the caller's raw request. Written FLAT, one
+                  field per parameter, and omitted entirely when nothing was
+                  pinned. Flat rather than a nested blob so that "which
+                  fields were pinned" is readable off the key itself, which
+                  is the claim a methods note has to make; omitted-when-
+                  unset so every pre-2026-08 key stays byte-stable and so
+                  adding a sixth parameter later orphans nothing.
+                  Field present in a key means that value governed the
+                  call. Field absent means unpinned — the vendor chose, and
+                  which value it chose that day is not something the key can
+                  carry, so it does not pretend to.
+        sample:   Replicate index for repeated sampling of ONE item, or
+                  None. n samples of the same prompt are n identical calls
+                  and therefore one cache cell — the second through nth
+                  collapse into a cache hit and the run silently reports one
+                  observation as n. This makes each replicate its own
+                  administration. Its own field rather than a metadata entry
+                  so it cannot collide with real metadata, and omitted when
+                  None so nothing existing re-keys.
     """
     key = {
         "prompt": prompt,
@@ -581,24 +737,37 @@ def _make_key(prompt, model, system_prompt=None, temperature=DEFAULT_TEMPERATURE
         key["metadata"] = metadata
     if thinking is not None:
         key["thinking"] = thinking
+    for param, value in (sampling or {}).items():
+        key[param] = value
+    if sample is not None:
+        key["sample"] = sample
     return key
 
 
-def _sampling_fingerprint(model, temperature, kwargs):
-    """(effective_temperature, thinking_fingerprint) for a call's stash key.
+def _sampling_fingerprint(model, temperature, kwargs, sampling=None):
+    """(effective_temperature, thinking_fingerprint, governing_sampling).
 
     Resolved from static provider knowledge only — a rejection discovered
     dynamically mid-run must not change keys between one call and the next.
+    The third element is the decoder parameters that will actually apply;
+    it agrees with what the request builders send because both come from
+    providers.effective_sampling, which is a pure function of the model
+    string. Raises SamplingUnmeasured if a parameter is pinned on a family
+    nobody has probed — before any money moves, and on the batch path
+    before 50,000 requests are built.
     """
     thinking = kwargs.get("thinking", "auto")
+    governing, _dropped = effective_sampling(model, sampling, thinking)
     return (effective_temperature(model, temperature, thinking),
-            thinking_fingerprint(model, thinking))
+            thinking_fingerprint(model, thinking),
+            governing)
 
 
 _WARNED_LEGACY_READS = set()
 
 
-def _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp):
+def _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp,
+                       sampling_fp=None, sample=None):
     """The old-schema key fields to ALSO try on a read miss, or None.
 
     The provenance key schema (effective temperature, thinking state) orphans
@@ -625,6 +794,12 @@ def _legacy_key_kwargs(model, temperature, eff_temp, thinking_fp):
     provably safe and nowhere else.
     """
     if thinking_fp is not None or eff_temp == temperature:
+        return None
+    if sampling_fp or sample is not None:
+        # No pre-schema entry can be a match: old code sent no decoder
+        # parameter and had no notion of a replicate index, so a hit here
+        # would serve differently-sampled output under a pinned key —
+        # the poisoning the legacy fallback is carefully scoped to avoid.
         return None
     return {"temperature": temperature}
 
@@ -653,7 +828,8 @@ def _stash_read(stash, key, legacy_key, model):
     return False, None
 
 
-def _custom_key(cache_key, model, schema_name=None):
+def _custom_key(cache_key, model, schema_name=None, sampling=None,
+                sample=None):
     """A caller-supplied stash key, completed with the coder's identity.
 
     A cache_key names the WORK UNIT (text_id, chunk, ...); without the model
@@ -667,6 +843,13 @@ def _custom_key(cache_key, model, schema_name=None):
     key.setdefault("model", model)
     if schema_name:
         key.setdefault("schema", schema_name)
+    # setdefault for the same reason as model: a caller who already keys on
+    # these owns them. Absent-when-unpinned holds here too, so a custom key
+    # that pins nothing is byte-identical to what it was before this schema.
+    for param, value in (sampling or {}).items():
+        key.setdefault(param, value)
+    if sample is not None:
+        key.setdefault("sample", sample)
     return key
 
 
@@ -932,11 +1115,23 @@ class LLM:
 
     def __init__(self, model=DEFAULT_MODEL, system_prompt=None, temperature=DEFAULT_TEMPERATURE,
                  max_tokens=DEFAULT_MAX_TOKENS, stash=None, cache_ttl=None,
-                 usage=None, raw_log=None):
+                 usage=None, raw_log=None, sampling=None, usage_log=None):
         self.model = model
         self.system_prompt = system_prompt
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Decoder parameters beyond temperature: {"top_p": 0.9, ...}. One
+        # door rather than five keyword arguments, because the set grows and
+        # every member follows the same key rule. Pinning one on a family
+        # nobody has probed raises rather than guessing — see
+        # providers.effective_sampling.
+        self.sampling = dict(sampling) if sampling else None
+        # Durable per-batch usage receipts (see append_usage_log). True uses
+        # "llm" as the file stem; pass a string to name the run. Task sets
+        # its own and does its own flushing, so a Task-driven LLM leaves
+        # this None and nothing is written twice.
+        self.usage_log = ("llm" if usage_log is True
+                          else usage_log or None)
         self.cache_ttl = cache_ttl
         self.usage = usage if usage is not None else UsageTracker()
         self.stash = stash if stash is not None else HashStash(
@@ -959,17 +1154,29 @@ class LLM:
             key, body, transport=transport, model=self.model,
             provider=provider, attempt=attempt)
 
-    def _provider_kwargs(self, kwargs):
+    def _provider_kwargs(self, kwargs, sampling=None):
         """Per-call provider options this instance contributes.
 
         cache_ttl and usage_sink are instance-level and deliberately not part
         of the stash key: neither changes the response text.
+
+        `sampling` is passed RAW, not pre-filtered: the request builders run
+        providers.effective_sampling themselves, which is what makes a
+        dropped parameter get reported once, at the place that knows it was
+        dropped, on both the sync and the batch path.
         """
         out = dict(kwargs)
         out.setdefault("usage_sink", self.usage.record)
+        out.setdefault("failure_sink", self.usage.record_failure)
         if self.cache_ttl is not None:
             out.setdefault("cache_ttl", self.cache_ttl)
+        if sampling:
+            out.setdefault("sampling", sampling)
         return out
+
+    def _resolve_sampling(self, sampling):
+        """Per-call decoder params, falling back to the instance default."""
+        return sampling if sampling is not None else self.sampling
 
     def _resolve(self, system_prompt=None, temperature=None, max_tokens=None):
         """Resolve per-call overrides against instance defaults."""
@@ -981,7 +1188,7 @@ class LLM:
 
     def generate(self, prompt, system_prompt=None, temperature=None,
                  max_tokens=None, images=None, metadata=None, force=False,
-                 cache_key=None, **kwargs):
+                 cache_key=None, sampling=None, sample=None, **kwargs):
         """Generate text from the LLM, with caching.
 
         Args:
@@ -1001,20 +1208,23 @@ class LLM:
         system_prompt, temperature, max_tokens = self._resolve(
             system_prompt, temperature, max_tokens,
         )
-        eff_temp, thinking_fp = _sampling_fingerprint(
-            self.model, temperature, kwargs)
+        sampling = self._resolve_sampling(sampling)
+        eff_temp, thinking_fp, sampling_fp = _sampling_fingerprint(
+            self.model, temperature, kwargs, sampling)
         legacy_key = None
         if cache_key is not None:
             # No legacy fallback for custom keys: a bare pre-schema custom
             # key could hold ANY model's annotation — that ambiguity is the
             # defect, not an inert field.
-            key = _custom_key(cache_key, self.model)
+            key = _custom_key(cache_key, self.model, sampling=sampling_fp,
+                              sample=sample)
         else:
             key = _make_key(prompt, self.model, system_prompt, eff_temp,
                             max_tokens, images=images, metadata=metadata,
-                            thinking=thinking_fp)
+                            thinking=thinking_fp, sampling=sampling_fp,
+                            sample=sample)
             legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
-                                        thinking_fp)
+                                        thinking_fp, sampling_fp, sample)
             if legacy is not None:
                 legacy_key = _make_key(prompt, self.model, system_prompt,
                                        legacy["temperature"], max_tokens,
@@ -1025,7 +1235,7 @@ class LLM:
             if hit:
                 return value
 
-        call_kwargs = self._provider_kwargs(kwargs)
+        call_kwargs = self._provider_kwargs(kwargs, sampling)
         call_kwargs.setdefault("raw_sink", self._raw_sink(key, "sync"))
         result = _call_provider(
             prompt=prompt,
@@ -1042,7 +1252,7 @@ class LLM:
     def extract(self, prompt, schema, system_prompt=None, examples=None,
                 temperature=None, max_tokens=None, images=None, metadata=None,
                 force=False, retries=1, cache_key=None, prebuilt=False,
-                raw_transport=None, **kwargs):
+                raw_transport=None, sampling=None, sample=None, **kwargs):
         """Extract structured data from text using a Pydantic schema.
 
         Args:
@@ -1086,17 +1296,20 @@ class LLM:
                 prompt, schema, system_prompt=system_prompt, examples=examples,
             )
         s_name = _schema_name(schema)
-        eff_temp, thinking_fp = _sampling_fingerprint(
-            self.model, temperature, kwargs)
+        sampling = self._resolve_sampling(sampling)
+        eff_temp, thinking_fp, sampling_fp = _sampling_fingerprint(
+            self.model, temperature, kwargs, sampling)
         legacy_key = None
         if cache_key is not None:
-            key = _custom_key(cache_key, self.model, schema_name=s_name)
+            key = _custom_key(cache_key, self.model, schema_name=s_name,
+                              sampling=sampling_fp, sample=sample)
         else:
             key = _make_key(user_prompt, self.model, full_system, eff_temp,
                             max_tokens, schema_name=s_name, images=images,
-                            metadata=metadata, thinking=thinking_fp)
+                            metadata=metadata, thinking=thinking_fp,
+                            sampling=sampling_fp, sample=sample)
             legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
-                                        thinking_fp)
+                                        thinking_fp, sampling_fp, sample)
             if legacy is not None:
                 legacy_key = _make_key(user_prompt, self.model, full_system,
                                        legacy["temperature"], max_tokens,
@@ -1145,7 +1358,7 @@ class LLM:
             # value of the X field" — a complaint about JSON that this
             # attempt never produced.
             parsed = None
-            call_kwargs = self._provider_kwargs(kwargs)
+            call_kwargs = self._provider_kwargs(kwargs, sampling)
             call_kwargs.setdefault(
                 "raw_sink",
                 self._raw_sink(key, raw_transport or "sync",
@@ -1193,7 +1406,8 @@ class LLM:
 
     def map(self, prompts, system_prompt=None, temperature=None,
             max_tokens=None, images_list=None, metadata_list=None,
-            num_workers=4, force=False, errors=None, **kwargs):
+            num_workers=4, force=False, errors=None, sampling=None,
+            sample=None, per_item_usage=None, **kwargs):
         """Generate text for multiple prompts, with caching and parallelism.
 
         Args:
@@ -1221,16 +1435,27 @@ class LLM:
         results = [None] * len(prompts)
         to_compute = []
 
-        eff_temp, thinking_fp = _sampling_fingerprint(
-            self.model, temperature, kwargs)
+        # With usage_log on, per-item rows are always collected: the receipt
+        # is the point. This is the path a production run took straight off
+        # LLM.map, with no durable record of a single token.
+        log_items = {} if self.usage_log else None
+        if log_items is not None and per_item_usage is None:
+            per_item_usage = log_items
+        elif log_items is not None:
+            log_items = per_item_usage
+
+        sampling = self._resolve_sampling(sampling)
+        eff_temp, thinking_fp, sampling_fp = _sampling_fingerprint(
+            self.model, temperature, kwargs, sampling)
         legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
-                                    thinking_fp)
+                                    thinking_fp, sampling_fp, sample)
         for i, prompt in enumerate(prompts):
             images = images_list[i] if images_list else None
             metadata = metadata_list[i] if metadata_list else None
             key = _make_key(prompt, self.model, system_prompt, eff_temp,
                             max_tokens, images=images, metadata=metadata,
-                            thinking=thinking_fp)
+                            thinking=thinking_fp, sampling=sampling_fp,
+                            sample=sample)
             legacy_key = None if legacy is None else _make_key(
                 prompt, self.model, system_prompt, legacy["temperature"],
                 max_tokens, images=images, metadata=metadata)
@@ -1253,9 +1478,19 @@ class LLM:
         if not to_compute:
             return results
 
+        def _item_sink(i):
+            def sink(usage):
+                self.usage.record(usage)
+                if per_item_usage is not None:
+                    _record_item_usage(per_item_usage, i, usage)
+            return sink
+
         def _do_one(item):
             i, prompt, key, images = item
-            call_kwargs = self._provider_kwargs(kwargs)
+            item_kwargs = dict(kwargs)
+            if per_item_usage is not None:
+                item_kwargs["usage_sink"] = _item_sink(i)
+            call_kwargs = self._provider_kwargs(item_kwargs, sampling)
             call_kwargs.setdefault("raw_sink", self._raw_sink(key, "sync"))
             try:
                 result = _call_provider(
@@ -1296,6 +1531,13 @@ class LLM:
             # counters are final.
             if self.raw_log is not None:
                 self.raw_log.flush_receipt()
+            if self.usage_log:
+                try:
+                    append_usage_log(self.usage_log, self.model, log_items,
+                                     metadata_list, errors)
+                except Exception as e:  # noqa: BLE001
+                    log.error("usage_log: failed to append receipt (%s: %s)",
+                              type(e).__name__, e)
 
         return results
 
@@ -1304,7 +1546,7 @@ class LLM:
                      metadata_list=None, num_workers=4,
                      force=False, retries=1, verbose=False, errors=None,
                      fail_fast=5, warm_cache=True, per_item_usage=None,
-                     **kwargs):
+                     sampling=None, sample=None, **kwargs):
         """Extract structured data from multiple prompts, yielding as each completes.
 
         Yields (index, result) tuples in completion order — cached items first,
@@ -1414,16 +1656,18 @@ class LLM:
         seen_keys = {}   # frozen key -> first index submitted
         dup_of = {}      # first index -> [duplicate indices awaiting its result]
 
-        eff_temp, thinking_fp = _sampling_fingerprint(
-            self.model, temperature, kwargs)
+        sampling = self._resolve_sampling(sampling)
+        eff_temp, thinking_fp, sampling_fp = _sampling_fingerprint(
+            self.model, temperature, kwargs, sampling)
         legacy = _legacy_key_kwargs(self.model, temperature, eff_temp,
-                                    thinking_fp)
+                                    thinking_fp, sampling_fp, sample)
         for i, prompt in enumerate(prompts):
             images = images_list[i] if images_list else None
             metadata = metadata_list[i] if metadata_list else None
             key = _make_key(prompt, self.model, full_system, eff_temp,
                             max_tokens, schema_name=s_name, images=images,
-                            metadata=metadata, thinking=thinking_fp)
+                            metadata=metadata, thinking=thinking_fp,
+                            sampling=sampling_fp, sample=sample)
             legacy_key = None if legacy is None else _make_key(
                 prompt, self.model, full_system, legacy["temperature"],
                 max_tokens, schema_name=s_name, images=images,
@@ -1521,6 +1765,15 @@ class LLM:
         # and the logged hit rate averaged every batch since construction.
         batch_usage = UsageTracker()
 
+        # With usage_log on, per-item rows are ALWAYS collected — the
+        # receipt is the point — and merged back into the caller's dict if
+        # it passed one.
+        log_items = {} if self.usage_log else None
+        if log_items is not None and per_item_usage is None:
+            per_item_usage = log_items
+        elif log_items is not None:
+            log_items = per_item_usage
+
         def _item_sink(i):
             """Usage sink that attributes one call's tokens to item `i`.
 
@@ -1531,27 +1784,8 @@ class LLM:
             def sink(usage):
                 self.usage.record(usage)
                 batch_usage.record(usage)
-                if per_item_usage is None:
-                    return
-                entry = per_item_usage.setdefault(i, {
-                    "index": i, "calls": 0, "input_tokens": 0,
-                    "output_tokens": 0, "cache_read_tokens": 0,
-                    "cache_write_tokens": 0, "reasoning_tokens": 0,
-                    "response_model": None,
-                })
-                entry["calls"] += 1
-                for k in ("input_tokens", "output_tokens", "cache_read_tokens",
-                          "cache_write_tokens", "reasoning_tokens"):
-                    entry[k] += usage.get(k, 0)
-                # Per-annotation provenance: which model answered for THIS
-                # item. A run-level counter cannot attribute a mid-run alias
-                # flip to particular annotations, which is the whole question
-                # a provenance record exists to answer. Retries: the last
-                # attempt that REPORTED a served id wins — the kept text is
-                # the last attempt's, and an attempt whose response carried
-                # no usage object must not blank an id an earlier one saw.
-                if usage.get("response_model"):
-                    entry["response_model"] = usage["response_model"]
+                if per_item_usage is not None:
+                    _record_item_usage(per_item_usage, i, usage)
             return sink
 
         def _do_one(item):
@@ -1593,7 +1827,7 @@ class LLM:
                         temperature=temperature,
                         max_tokens=max_tokens,
                         images=images,
-                        **self._provider_kwargs(call_kwargs),
+                        **self._provider_kwargs(call_kwargs, sampling),
                     )
                     parsed = _parse_json_response(raw)
                     result = _validate_parsed(parsed, schema)
@@ -1720,6 +1954,15 @@ class LLM:
                 warning = batch_usage.cache_warning(self.model)
                 if warning:
                     log.warning("extract_imap: %s", warning)
+            if self.usage_log:
+                # A receipt-write failure must never fail the run it
+                # documents — same discipline as the raw sidecar.
+                try:
+                    append_usage_log(self.usage_log, self.model, log_items,
+                                     metadata_list, errors)
+                except Exception as e:  # noqa: BLE001
+                    log.error("usage_log: failed to append receipt (%s: %s)",
+                              type(e).__name__, e)
 
     def extract_map(self, prompts, schema, system_prompt=None, examples=None,
                     temperature=None, max_tokens=None, images_list=None,

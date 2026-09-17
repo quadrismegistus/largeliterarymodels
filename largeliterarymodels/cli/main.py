@@ -4,6 +4,7 @@ Subcommands:
     litmod ls
     litmod show     <TaskName>
     litmod doctor   [--provider anthropic,openai,...] [--cheap-only]
+    litmod probe-sampling --model M [--param top_p] [--n N] [--yes]
     litmod render   <TaskName> [--item TEXT | --item-file F | --fixture]
     litmod smoke    <TaskName> --model M[,M2,...]
     litmod run      <TaskName> --input CSV --model M [--output CSV]
@@ -60,6 +61,11 @@ def cmd_show(args) -> int:
                    for k, v in r.items()}
         print(f"  {preview}")
     return 0
+
+
+def _cmd_probe_sampling(args) -> int:
+    from .sampling_probe import cmd_probe_sampling
+    return cmd_probe_sampling(args)
 
 
 def _cmd_doctor(args) -> int:
@@ -496,6 +502,40 @@ def build_parser() -> argparse.ArgumentParser:
                     help='also probe the local endpoint (must be running)')
     sp.add_argument('--timeout', type=float, default=120.0)
     sp.set_defaults(func=_cmd_doctor)
+
+    sp = sub.add_parser(
+        'probe-sampling',
+        help='measure whether a decoder parameter GOVERNS on a model, and '
+             'print the constant to add')
+    sp.add_argument('--model', required=True)
+    sp.add_argument('--param', default='top_p',
+                    help='top_p (default), top_k, frequency_penalty, '
+                         'presence_penalty, seed')
+    sp.add_argument('--values', default=None,
+                    help='comma-separated arms (default 1.0,0.95,0.9,0.7); '
+                         'an UNSET arm always runs first, and it is the one '
+                         'that says what an unpinned corpus ran at')
+    sp.add_argument('--n', type=int, default=20,
+                    help='samples per arm (default 20)')
+    sp.add_argument('--prompt', default=None,
+                    help='override the flat-continuation prompt; must NOT '
+                         'be schema-constrained — low-entropy output shows '
+                         'a ceiling effect that reads as a no-op')
+    sp.add_argument('--temperature', type=float, default=1.0,
+                    help='held fixed across arms, and above zero, or the '
+                         'support collapses for a reason that is not this '
+                         'parameter (default 1.0)')
+    sp.add_argument('--max-tokens', type=int, default=8, dest='max_tokens')
+    sp.add_argument('--rejection-scan', action='store_true',
+                    dest='rejection_scan',
+                    help='read an UNDISCLOSED default off a family that '
+                         'rejects non-default values (Anthropic Opus): '
+                         'acceptance is then an equality test, answerable '
+                         'in under ten calls with a negative control. Try '
+                         'this before spending n on any restrictive family')
+    sp.add_argument('--yes', action='store_true',
+                    help='skip the spend confirmation')
+    sp.set_defaults(func=_cmd_probe_sampling)
 
     sp = sub.add_parser(
         'render',

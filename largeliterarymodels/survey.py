@@ -102,6 +102,15 @@ class Survey(_Administered):
             return {"item": item}
         return dict(item)
 
+    def _render_state(self, state):
+        """The ONE renderer. Both the cache key and the text arm's prompt go
+        through it, so `key["state"]` and `as_task_prompts()` are byte-identical
+        and a cross-arm check is string equality rather than a structural
+        comparison. Two renderers of the same thing drift; that is the same
+        rule render_instrument follows by delegating to _build_extract_prompt
+        instead of re-rendering the parts."""
+        return json.dumps(state, indent=2, ensure_ascii=False, sort_keys=False)
+
     def state_text(self, item):
         """The state rendered for a TEXT model — what the `as_task()` arm sees.
 
@@ -114,8 +123,7 @@ class Survey(_Administered):
         refers to — flattening them to prose would break the reference the
         instructions make.
         """
-        return json.dumps(self.build_state(item), indent=2,
-                          ensure_ascii=False, sort_keys=False)
+        return self._render_state(self.build_state(item))
 
     def as_task_prompts(self, items):
         """`items` rendered for the text arm, in order.
@@ -188,7 +196,10 @@ class Survey(_Administered):
         """(state_json, questions_wire, questions_json, key) for one item."""
         state = self.build_state(item)
         wire = to_wire(self.build_questions(item))
-        state_json = json.dumps(state, ensure_ascii=False, sort_keys=False)
+        # The same bytes the text arm is given, so the two arms' records can
+        # be compared directly rather than structurally. build_state is called
+        # once: an override that is not pure must not be run twice per item.
+        state_json = self._render_state(state)
         questions_json = json.dumps(wire, indent=2, ensure_ascii=False,
                                     sort_keys=False)
         key = _make_survey_key(state_json, model or self.model, questions_json,

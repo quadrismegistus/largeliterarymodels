@@ -671,14 +671,19 @@ class TestUsageLogReceipt:
 
 class TestGoldenKey:
     """The exact key bytes, pinned. A refactor that changes them re-keys every
-    corpus ever collected with this class, silently and at full price."""
+    corpus ever collected with this class, silently and at full price.
+
+    Changed once, deliberately, before any corpus existed: `state` is now the
+    indented render that the text arm is also given, so a cross-arm check is
+    string equality. That change is why this test exists — it failed, which is
+    the pin doing its job."""
 
     def test_key_is_exactly_this(self):
         s = _survey("golden")
         _, _, key = s._prepare({"passage": "Ye who listen"},
                                metadata={"id": 7}, sample=2)
         assert key == {
-            "state": '{"passage": "Ye who listen"}',
+            "state": '{\n  "passage": "Ye who listen"\n}',
             "model": "jev-latest",
             "questions": json.dumps(
                 {"abstract": {"type": "noul",
@@ -719,3 +724,30 @@ class TestBothArmsSeeOneItem:
     def test_a_bare_string_item_is_named_in_both_arms(self):
         s = _survey()
         assert json.loads(s.state_text("hello")) == {"item": "hello"}
+
+
+class TestOneRenderer:
+    """key["state"] and the text arm's prompt must be the SAME BYTES, so the
+    cross-arm check is string equality. Two renderers of one thing drift."""
+
+    def test_key_state_is_byte_identical_to_the_text_arm_prompt(self):
+        s = _survey()
+        item = {"female_frame": "She slowly took off her bra",
+                "male_frame": "He slowly took off his bra"}
+        _, _, key = s._prepare(item)
+        assert key["state"] == s.state_text(item)
+        assert key["state"] == s.as_task_prompts([item])[0]
+
+    def test_build_state_is_called_once_per_item(self):
+        # An override that hits a database or mutates must not run twice.
+        calls = []
+
+        class S(Survey):
+            name = "_once"
+            questions = Q
+
+            def build_state(self, item):
+                calls.append(item)
+                return {"passage": item}
+        S()._prepare("x")
+        assert len(calls) == 1

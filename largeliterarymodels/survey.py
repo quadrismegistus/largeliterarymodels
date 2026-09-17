@@ -270,7 +270,12 @@ class Survey(_Administered):
             last_error = None
             for attempt in range(1 + self.retries):
                 if breaker.tripped:
-                    raise breaker.error(model)
+                    # Another item already proved this failure systematic.
+                    # NOT an item failure: no error entry and no attempt
+                    # recorded, because counting pre-empted items as failures
+                    # is how one abort made len(errors) report the batch size
+                    # rather than the number of items that actually ran.
+                    return i, None
                 breaker.record_attempt()
                 try:
                     raw_sink = None
@@ -300,18 +305,16 @@ class Survey(_Administered):
         executor = ThreadPoolExecutor(max_workers=num_workers)
         try:
             futures = {executor.submit(_do_one, t): t for t in pending}
-            aborted = None
             for fut in as_completed(futures):
-                try:
-                    i, result = fut.result()
-                except BatchAborted as e:
-                    aborted = e
-                    continue
+                i, result = fut.result()
                 if verbose:
                     log.info("[%d] %s", i, "ok" if result is not None else "FAILED")
                 yield i, result
-            if aborted is not None:
-                raise aborted
+            if breaker.tripped:
+                # Raised after draining, so completed work has been yielded
+                # and stashed: a rerun resumes rather than restarting. errors
+                # carries only the items that actually ran and failed.
+                raise BatchAborted(breaker.error(model), errors=errors)
         finally:
             executor.shutdown(wait=False)
             if verbose:
@@ -344,6 +347,37 @@ class Survey(_Administered):
                 yield key, parse_answers(body)
             except Exception:  # noqa: BLE001 — a bad row must not stop the walk
                 continue
+
+    @property
+    def results_history(self):
+        """Iterate (key_dict, [Answers, ...]) — every retained version per key.
+
+        The stash is append-mode, so a key re-run with force=True holds one
+        entry per run, oldest first; `results` and `df` show only the latest.
+        Without this the versions a forced rerun paid for are on disk and
+        unreadable.
+
+        The use case is the model's own variance. Note it is the ONLY way to
+        measure that here: a Survey cannot be pinned with temperature=0
+        because System One accepts no decoder parameters at all, so
+        "identical output across two runs" is a statement about the cache
+        until the versions have been forced and compared.
+        """
+        for key in self.stash.keys():
+            try:
+                bodies = self.stash.get_all(key)
+            except (AttributeError, TypeError):
+                bodies = [self.stash[key]]
+            if not isinstance(bodies, list):
+                bodies = [bodies]
+            versions = []
+            for body in bodies:
+                try:
+                    versions.append(parse_answers(body))
+                except Exception:  # noqa: BLE001 — a bad version must not
+                    continue       # hide the good ones beside it
+            if versions:
+                yield key, versions
 
     @property
     def df(self):

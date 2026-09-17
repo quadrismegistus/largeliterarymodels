@@ -423,3 +423,271 @@ class TestAsTask:
         t = self._s().as_task()
         assert t.schema.model_fields["abstract"].annotation is bool
         assert "WHAT IS LOST" in Survey.as_task.__doc__
+
+
+class TestFailFastTrips:
+    """The abort path, which was broken and untested: breaker.error() returns
+    a MESSAGE, so `raise breaker.error(model)` raised TypeError instead of
+    aborting. Nothing in the suite noticed until fail_fast was made to fire."""
+
+    def _s(self, monkeypatch, fails=True):
+        import largeliterarymodels.providers as P
+        n = {"calls": 0}
+
+        def call(state, questions, **kw):
+            n["calls"] += 1
+            if fails:
+                raise RuntimeError("systematic")
+            return _body()
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+        return _survey(retries=0), n
+
+    def test_aborts_with_batch_aborted_not_typeerror(self, monkeypatch):
+        from largeliterarymodels.llm import BatchAborted
+        s, _ = self._s(monkeypatch)
+        with pytest.raises(BatchAborted, match="Aborting batch"):
+            s.map([{"p": i} for i in range(40)], num_workers=1, fail_fast=5)
+
+    def test_errors_counts_items_that_ran_not_the_batch_size(self, monkeypatch):
+        # Pre-empted items are not item failures. Counting them is how one
+        # abort made len(errors) report the whole batch.
+        from largeliterarymodels.llm import BatchAborted
+        s, _ = self._s(monkeypatch)
+        errs = {}
+        with pytest.raises(BatchAborted):
+            s.map([{"p": i} for i in range(40)], num_workers=1, errors=errs,
+                  fail_fast=5)
+        assert 0 < len(errs) < 40
+
+    def test_message_states_the_inference(self, monkeypatch):
+        from largeliterarymodels.llm import BatchAborted
+        s, _ = self._s(monkeypatch)
+        with pytest.raises(BatchAborted) as e:
+            s.map([{"p": i} for i in range(40)], num_workers=1, fail_fast=5)
+        assert "rerun resumes" in str(e.value)
+        assert "fail_fast=False" in str(e.value), "must say how to override"
+
+    def test_a_healthy_batch_does_not_abort(self, monkeypatch):
+        s, n = self._s(monkeypatch, fails=False)
+        out = s.map([{"p": i} for i in range(40)], num_workers=1, fail_fast=5)
+        assert len(out) == 40 and all(a is not None for a in out)
+
+    def test_disabled_grinds_through(self, monkeypatch):
+        s, n = self._s(monkeypatch)
+        errs = {}
+        out = s.map([{"p": i} for i in range(12)], num_workers=1,
+                    errors=errs, fail_fast=False)
+        assert out == [None] * 12 and len(errs) == 12
+
+
+class TestAppendMode:
+    """A forced rerun appends; without results_history those versions are on
+    disk and unreadable. Needs the real pairtree stash — the memory engine
+    silently does not append, which makes it useless for this."""
+
+    def _s(self, tmp_path, monkeypatch, bodies):
+        import largeliterarymodels.administered as adm_mod
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
+        seq = iter(bodies)
+
+        def call(state, questions, **kw):
+            return next(seq)
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = Q
+        S.name = "_append"
+        return S()
+
+    def test_versions_are_retained_oldest_first(self, tmp_path, monkeypatch):
+        s = self._s(tmp_path, monkeypatch, [_body(0.1), _body(0.2), _body(0.3)])
+        s.run({"p": 1})
+        s.run({"p": 1}, force=True)
+        s.run({"p": 1}, force=True)
+        [(_, versions)] = list(s.results_history)
+        assert [v.p("abstract") for v in versions] == [0.1, 0.2, 0.3]
+
+    def test_results_shows_only_the_latest(self, tmp_path, monkeypatch):
+        s = self._s(tmp_path, monkeypatch, [_body(0.1), _body(0.9)])
+        s.run({"p": 1})
+        s.run({"p": 1}, force=True)
+        [(_, latest)] = list(s.results)
+        assert latest.p("abstract") == 0.9
+
+    def test_unforced_rerun_is_one_version(self, tmp_path, monkeypatch):
+        # The claim this guards: identical output across two ordinary runs
+        # demonstrates CACHING, not stability. And a Survey cannot be pinned
+        # with temperature=0 at all, so forcing is the only way to measure
+        # the model's own variance here.
+        s = self._s(tmp_path, monkeypatch, [_body(0.1), _body(0.9)])
+        s.run({"p": 1})
+        s.run({"p": 1})
+        [(_, versions)] = list(s.results_history)
+        assert len(versions) == 1
+
+
+class TestRawSidecar:
+    def _wire(self, tmp_path, monkeypatch, **kw):
+        import largeliterarymodels.administered as adm_mod
+        import largeliterarymodels.providers as P
+        from largeliterarymodels.rawlog import RawLog
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
+
+        def call(state, questions, model="jev-latest", usage_sink=None,
+                 raw_sink=None, **kwargs):
+            body = _body()
+            if raw_sink:
+                raw_sink(body)
+            return body
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = Q
+        S.name = "_sidecar"
+        return S(raw_log=RawLog(root=str(tmp_path / "raw")), **kw)
+
+    def test_body_lands_under_the_annotation_key(self, tmp_path, monkeypatch):
+        s = self._wire(tmp_path, monkeypatch)
+        s.run({"passage": "x"})
+        [key] = list(s.stash.keys())
+        got = s.raw_sidecar.get(key)
+        assert got is not None, "raw <-> annotation join must be a lookup"
+
+    def test_map_path_is_wired_too(self, tmp_path, monkeypatch):
+        # run() and imap() build the sink separately; a passthrough deleted
+        # in one of them leaves the other green.
+        s = self._wire(tmp_path, monkeypatch)
+        s.map([{"passage": "a"}, {"passage": "b"}], num_workers=1)
+        assert len(list(s.raw_sidecar.keys())) == 2
+
+    def test_certify_sources_its_denominator_from_the_stash(self, tmp_path,
+                                                            monkeypatch):
+        s = self._wire(tmp_path, monkeypatch)
+        s.map([{"passage": "a"}, {"passage": "b"}], num_workers=1)
+        assert s.certify_raw()["complete"] is True
+
+    def test_off_is_genuinely_off(self, tmp_path, monkeypatch):
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash2"))
+
+        class S(Survey):
+            questions = Q
+        S.name = "_nosidecar"
+        s = S()
+        assert s.raw_sidecar is None
+        with pytest.raises(ValueError, match="nothing to.*certify"):
+            s.certify_raw()
+
+    def test_annotation_stash_is_byte_identical_either_way(self, tmp_path,
+                                                           monkeypatch):
+        # Additive means additive: the sidecar must not touch the write path
+        # it documents.
+        on = self._wire(tmp_path, monkeypatch)
+        on.run({"passage": "x"})
+        [(k_on, v_on)] = list(on.stash.items())
+
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash_off"))
+
+        class S(Survey):
+            questions = Q
+        S.name = "_sidecar"
+        off = S()
+        off.run({"passage": "x"})
+        [(k_off, v_off)] = list(off.stash.items())
+        assert k_on == k_off and v_on == v_off
+
+
+class TestUsageLogReceipt:
+    def _s(self, tmp_path, monkeypatch):
+        import largeliterarymodels.administered as adm_mod
+        import largeliterarymodels.providers as P
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
+
+        def call(state, questions, model="jev-latest", usage_sink=None,
+                 raw_sink=None, **kw):
+            if usage_sink:
+                usage_sink({"input_tokens": 100, "output_tokens": 10,
+                            "cache_read_tokens": 0, "cache_write_tokens": 0,
+                            "reasoning_tokens": 0, "reasoning_reported": False,
+                            "reasoning_observed": False,
+                            "response_model": "jev-1.13.0"})
+            return _body()
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = Q
+            usage_log = True
+        S.name = "survey_usage_probe"
+        return S(), tmp_path / "usage_logs" / "survey_usage_probe.jsonl"
+
+    def test_one_record_per_batch(self, tmp_path, monkeypatch):
+        s, path = self._s(tmp_path, monkeypatch)
+        s.map([{"p": 1}, {"p": 2}], num_workers=1)
+        rec = json.loads(path.read_text())
+        assert rec["model"] == "jev-latest"
+        assert rec["task"] == "survey_usage_probe"
+        assert len(rec["items"]) == 2
+        assert rec["batch"]["calls"] == 2
+        assert rec["batch"]["input_tokens"] == 200
+        assert rec["items"][0]["response_model"] == "jev-1.13.0", \
+            "the id the server served, not the alias asked for"
+
+    def test_record_is_priceable(self, tmp_path, monkeypatch):
+        # The point of the sidecar: a later process prices the run from the
+        # log alone, and for this provider that means the cached: null row.
+        from largeliterarymodels import costs
+        s, path = self._s(tmp_path, monkeypatch)
+        s.map([{"p": 1}, {"p": 2}], num_workers=1)
+        rec = json.loads(path.read_text())
+        priced = costs.price_report(rec["model"], rec["batch"])
+        # That the record RESOLVES and prices is the claim here; the
+        # arithmetic is pinned against two real invoices in
+        # test_typesafe_provider rather than restated.
+        assert priced["provider"] == "typesafe"
+        assert priced["warnings"] == []
+        # The cached:null path: every input token billed fresh, nothing
+        # discounted, and no output line because output is free.
+        assert set(priced["lines"]) == {"fresh_input"}
+
+    def test_imap_writes_one_too(self, tmp_path, monkeypatch):
+        s, path = self._s(tmp_path, monkeypatch)
+        list(s.imap([{"p": 1}], num_workers=1))
+        assert path.exists()
+
+    def test_shim_goes_through_the_shared_writer(self, tmp_path, monkeypatch):
+        # One writer for Task and Survey both. Two record formats is how a
+        # pricing script learns to parse only one of them.
+        import largeliterarymodels.administered as adm_mod
+        seen = []
+        monkeypatch.setattr(adm_mod, "append_usage_log",
+                            lambda *a, **kw: seen.append(a))
+        s, _ = self._s(tmp_path, monkeypatch)
+        s.map([{"p": 1}], num_workers=1)
+        assert seen and seen[0][0] == "survey_usage_probe"
+        assert seen[0][1] == "jev-latest"
+
+
+class TestGoldenKey:
+    """The exact key bytes, pinned. A refactor that changes them re-keys every
+    corpus ever collected with this class, silently and at full price."""
+
+    def test_key_is_exactly_this(self):
+        s = _survey("golden")
+        _, _, key = s._prepare({"passage": "Ye who listen"},
+                               metadata={"id": 7}, sample=2)
+        assert key == {
+            "state": '{"passage": "Ye who listen"}',
+            "model": "jev-latest",
+            "questions": json.dumps(
+                {"abstract": {"type": "noul",
+                              "instructions": "Is the vocabulary abstract?"},
+                 "mode": {"type": "choice", "instructions": "Mode?",
+                          "criteria": {"narrative": None, "didactic": None}},
+                 "degree": {"type": "score", "instructions": "How abstract?",
+                            "criteria": ["concrete", "mixed", "abstract"]}},
+                indent=2, ensure_ascii=False, sort_keys=False),
+            "metadata": {"id": 7},
+            "sample": 2,
+        }

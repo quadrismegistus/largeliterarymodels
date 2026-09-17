@@ -1411,7 +1411,8 @@ class TestUsageLogSidecar:
 
     def _task(self, tmp_path, monkeypatch, **kw):
         import largeliterarymodels.task as task_mod
-        monkeypatch.setattr(task_mod, "STASH_PATH",
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH",
                             str(tmp_path / "stash"))
 
         class T(Task):
@@ -1486,7 +1487,8 @@ class TestUsageLogSidecar:
     def test_off_by_default_writes_nothing(self, mock_call, tmp_path,
                                            monkeypatch):
         import largeliterarymodels.task as task_mod
-        monkeypatch.setattr(task_mod, "STASH_PATH", str(tmp_path / "stash"))
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
         mock_call.return_value = '{"sentiment": "positive", "confidence": 0.9}'
 
         class T(Task):
@@ -1503,7 +1505,8 @@ class TestUsageLogSidecar:
 class TestUsageLogReviewFindings:
     def _task(self, tmp_path, monkeypatch):
         import largeliterarymodels.task as task_mod
-        monkeypatch.setattr(task_mod, "STASH_PATH", str(tmp_path / "stash"))
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
 
         class T(Task):
             schema = Sentiment

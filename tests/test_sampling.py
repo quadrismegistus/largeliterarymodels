@@ -263,8 +263,12 @@ class TestUsageLogOnTheLLMPath:
         """One writer. Two record formats is how a pricing script learns to
         parse only one of them."""
         import largeliterarymodels.task as task_mod
+        import largeliterarymodels.administered as adm_mod
         seen = []
-        monkeypatch.setattr(task_mod, "append_usage_log",
+        # Patched where the lookup happens: Task's receipt writer lives on
+        # the shared _Administered base, so both Task and Survey go through
+        # this one call. That is the "one writer" this test is about.
+        monkeypatch.setattr(adm_mod, "append_usage_log",
                             lambda *a, **kw: seen.append((a, kw)))
 
         class T(task_mod.Task):

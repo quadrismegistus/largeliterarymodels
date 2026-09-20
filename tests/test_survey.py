@@ -751,3 +751,135 @@ class TestOneRenderer:
                 return {"passage": item}
         S()._prepare("x")
         assert len(calls) == 1
+
+
+class TestIncompleteResponses:
+    """An unanswered question was neither a result nor an error: the partial
+    body was stashed, `errors` stayed empty, and because the stash is durable
+    the gap was then served as complete on every later read, free, forever.
+    A defect that costs nothing to re-read is worse than one that costs a
+    call."""
+
+    def _s(self, monkeypatch, answered=3, asked=5, retries=1):
+        import largeliterarymodels.providers as P
+        n = {"calls": 0}
+
+        def call(state, questions, model="jev-latest", usage_sink=None,
+                 raw_sink=None, **kw):
+            n["calls"] += 1
+            if raw_sink:
+                raw_sink({"answers": {}})
+            return {"model": "m", "usage": {},
+                    "answers": {q: {"type": "noul", "noul": 0.5}
+                                for q in list(questions)[:answered]}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {f"q{i}": Noul(instructions=f"Is {i} charged?")
+                         for i in range(asked)}
+        S.name = "_incomplete"
+        S.retries = retries
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        return s, n
+
+    def test_it_is_retried_not_returned(self, monkeypatch):
+        s, n = self._s(monkeypatch, retries=2)
+        out = s.map([{"p": 1}], num_workers=1)
+        assert out[0] is None
+        assert n["calls"] == 3, "1 + retries, not a single silent acceptance"
+
+    def test_the_partial_body_is_not_stashed(self, monkeypatch):
+        # The durable half of the bug: a cached partial answer is served as
+        # complete forever and costs nothing to re-read.
+        s, _ = self._s(monkeypatch)
+        s.map([{"p": 1}], num_workers=1)
+        assert list(s.stash.keys()) == []
+
+    def test_a_resumed_run_does_not_serve_a_gap_as_complete(self, monkeypatch):
+        s, n = self._s(monkeypatch)
+        s.map([{"p": 1}], num_workers=1)
+        before = n["calls"]
+        s.map([{"p": 1}], num_workers=1)
+        assert n["calls"] > before, "nothing warm to serve"
+
+    def test_the_error_names_which_questions_were_dropped(self, monkeypatch):
+        # The analogue of _diagnose_partial_response naming the field: a
+        # caller must not have to diff the question set by hand.
+        s, _ = self._s(monkeypatch)
+        errs = {}
+        s.map([{"p": 1}], num_workers=1, errors=errs)
+        assert errs[0]["missing"] == ("q3", "q4")
+        assert "2 of 5" in errs[0]["error"]
+
+    def test_run_raises_rather_than_returning_a_gap(self, monkeypatch):
+        from largeliterarymodels.answers import IncompleteAnswers
+        s, _ = self._s(monkeypatch)
+        with pytest.raises(IncompleteAnswers, match="unanswered"):
+            s.run({"p": 1})
+        assert list(s.stash.keys()) == []
+
+    def test_a_complete_response_is_unaffected(self, monkeypatch):
+        s, n = self._s(monkeypatch, answered=5, asked=5)
+        out = s.map([{"p": 1}], num_workers=1)
+        assert out[0] is not None and n["calls"] == 1
+        assert len(list(s.stash.keys())) == 1
+
+    def test_retry_that_succeeds_is_a_success(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        n = {"calls": 0}
+
+        def call(state, questions, **kw):
+            n["calls"] += 1
+            keep = list(questions) if n["calls"] > 1 else list(questions)[:2]
+            return {"model": "m", "usage": {},
+                    "answers": {q: {"type": "noul", "noul": 0.5}
+                                for q in keep}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {f"q{i}": Noul(instructions="x") for i in range(4)}
+        S.name = "_recovers"
+        S.retries = 1
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        errs = {}
+        out = s.map([{"p": 1}], num_workers=1, errors=errs)
+        assert out[0] is not None and errs == {}
+        assert len(list(s.stash.keys())) == 1
+
+    def test_unknown_kinds_do_not_trigger_a_retry(self, monkeypatch):
+        # They were ANSWERED; the provider will return the same kind next
+        # time, so retrying spends money to receive it again.
+        import largeliterarymodels.providers as P
+        n = {"calls": 0}
+
+        def call(state, questions, **kw):
+            n["calls"] += 1
+            return {"model": "m", "usage": {},
+                    "answers": {q: {"type": "quantile", "q50": 3}
+                                for q in questions}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"q0": Noul(instructions="x")}
+        S.name = "_unknown"
+        S.retries = 2
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        out = s.map([{"p": 1}], num_workers=1)
+        assert n["calls"] == 1
+        assert out[0].unknown == ("q0",)
+
+    def test_the_sidecar_still_keeps_the_defective_body(self, tmp_path,
+                                                        monkeypatch):
+        # Right layering: the raw sink fires BEFORE the completeness check, so
+        # the body that caused the defect survives for diagnosis while the
+        # annotation store keeps only complete administrations.
+        from largeliterarymodels.rawlog import RawLog
+        s, _ = self._s(monkeypatch)
+        s.raw_log = RawLog(root=str(tmp_path / "raw"))
+        s._raw_log = None
+        s.map([{"p": 1}], num_workers=1)
+        assert len(list(s.raw_sidecar.keys())) >= 1
+        assert list(s.stash.keys()) == []

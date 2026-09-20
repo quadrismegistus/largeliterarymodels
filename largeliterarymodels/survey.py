@@ -52,6 +52,7 @@ import json
 import logging
 
 from .administered import _Administered
+from .answers import IncompleteAnswers
 from .answers import parse as parse_answers
 from .llm import (
     BatchAborted, UsageTracker, _make_survey_key, _record_item_usage,
@@ -206,6 +207,29 @@ class Survey(_Administered):
                                metadata=metadata, sample=sample)
         return state, wire, key
 
+    @staticmethod
+    def _complete(answers, wire):
+        """Raise unless every question asked came back answered.
+
+        An incomplete response is a RETRYABLE defect, not a result. Before
+        this it was neither: the body was stashed, `errors` stayed empty, and
+        because the stash is the durable artifact the gap was then served as
+        a complete answer on every later read, for free, forever. A defect
+        that costs nothing to re-read is worse than one that costs a call.
+
+        Not stashing the partial body loses nothing that matters: the raw
+        sidecar fires before this check, so where it is on the defective body
+        is kept for diagnosis while the annotation store keeps only complete
+        administrations.
+
+        `unknown` is deliberately NOT a trigger. An answer kind this version
+        does not model was still answered, and the provider will return the
+        same kind next time — retrying spends money to receive it again.
+        """
+        if answers.missing:
+            raise IncompleteAnswers(answers.missing, len(wire), len(answers))
+        return answers
+
     def run(self, item, model=None, metadata=None, sample=None, force=False,
             **kwargs):
         """Administer the question set to one item; return `Answers`."""
@@ -225,11 +249,19 @@ class Survey(_Administered):
             raw_sink = lambda body: sidecar.record(  # noqa: E731
                 key, body, transport="sync", model=model, provider="typesafe")
 
-        body = providers.call_typesafe_survey(
-            state=state, questions=wire, model=model,
-            usage_sink=self.usage.record, raw_sink=raw_sink, **kwargs)
-        self.stash[key] = body
-        return parse_answers(body, asked=wire)
+        last = None
+        for _ in range(1 + self.retries):
+            try:
+                body = providers.call_typesafe_survey(
+                    state=state, questions=wire, model=model,
+                    usage_sink=self.usage.record, raw_sink=raw_sink, **kwargs)
+                answers = self._complete(parse_answers(body, asked=wire), wire)
+            except Exception as e:  # noqa: BLE001 — retried, then re-raised
+                last = e
+                continue
+            self.stash[key] = body
+            return answers
+        raise last
 
     def imap(self, items, model=None, metadata_list=None, num_workers=None,
              force=False, verbose=False, errors=None, per_item_usage=None,
@@ -321,9 +353,11 @@ class Survey(_Administered):
                     body = providers.call_typesafe_survey(
                         state=state, questions=wire, model=model,
                         usage_sink=_sink(i), raw_sink=raw_sink, **kwargs)
+                    answers = self._complete(
+                        parse_answers(body, asked=wire), wire)
                     self.stash[key] = body
                     breaker.record_success()
-                    return i, parse_answers(body, asked=wire)
+                    return i, answers
                 except Exception as e:  # noqa: BLE001 — recorded per item
                     last_error = e
             breaker.record_failure(last_error)
@@ -335,6 +369,10 @@ class Survey(_Administered):
                     "attempts": 1 + self.retries,
                     "metadata": metadata_list[i] if metadata_list else None,
                 }
+                if isinstance(last_error, IncompleteAnswers):
+                    # Name them, so the caller can see WHICH questions the
+                    # provider dropped rather than that something went wrong.
+                    errors[i]["missing"] = last_error.missing
             return i, None
 
         executor = ThreadPoolExecutor(max_workers=num_workers)

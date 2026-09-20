@@ -32,6 +32,26 @@ class AnswerError(ValueError):
     """The response did not answer what was asked."""
 
 
+class IncompleteAnswers(AnswerError):
+    """Questions were asked and came back unanswered.
+
+    Its own class because it is RETRYABLE and the generic parse failure is
+    not. It also carries `missing`, so a retry can say which questions were
+    dropped rather than complaining about a response that parsed fine — the
+    same reason _diagnose_partial_response names the offending field on the
+    extract path instead of issuing a generic reprompt.
+    """
+
+    def __init__(self, missing, asked, answered):
+        self.missing = tuple(missing)
+        self.asked, self.answered = asked, answered
+        super().__init__(
+            f"{len(self.missing)} of {asked} questions came back unanswered: "
+            f"{', '.join(self.missing[:8])}"
+            f"{'…' if len(self.missing) > 8 else ''}"
+        )
+
+
 @dataclass(frozen=True)
 class NoulAnswer:
     """P(the question is true). One number; there is no separate confidence.

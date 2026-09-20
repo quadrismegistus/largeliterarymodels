@@ -88,6 +88,54 @@ carries both halves. Byte-identity holds for extract-path tasks only:
 refuse rather than fabricate, and the `claude-cli/` transport flattens the
 system prompt into the user turn.
 
+### Rejecting an answer the schema cannot reject
+
+A `model_validator(mode="after")` that raises IS a rejection hook: both retry
+loops catch it and re-ask. This worked for a long time and was undocumented,
+which is most of why it went unused (malign-logits seat, 2026-09-20).
+
+```python
+class Groups(BaseModel):
+    words_b: list[str]
+
+    @model_validator(mode="after")
+    def _only_group_b(self, info):
+        shown_in_a = (info.context or {}).get("group_a", ())
+        if bad := [w for w in self.words_b if w in shown_in_a]:
+            raise ValueError(f"the word {bad[0]} appears in words_b but was "
+                             f"shown in GROUP A")
+        return self
+
+task.map(prompts, validation_context_list=[{"group_a": a} for a in columns])
+```
+
+`validation_context` (extract/`run`) and `validation_context_list`
+(imap/map, parallel to `metadata_list`) reach `info.context`. Rules that
+depend on the ITEM rather than on the response — which column a word was
+shown in, what the source document contained — need it; nothing else can
+express them.
+
+**It never enters a cache key.** It governs whether an answer is ACCEPTED,
+not what was administered, and the item it derives from is already in the key
+as the prompt. **Warm hits re-validate under it**, so a cached answer the
+item's own rule rejects is recomputed rather than served — a cache hit looks
+like a pass, so without this the first run to cache a rejected row serves it
+free forever.
+
+**The reprompt names the defect.** Where the JSON parsed and a validator
+rejected it, the retry quotes the validation message and says the format was
+fine. The old generic complaint asserted the response "was not valid JSON",
+which is false in that case, and a model told its format is wrong reformats
+instead of fixing the defect. Consequence worth knowing: the informative
+attempt gets exactly one shot — attempt 1 is the plain prompt, attempt 2
+carries the complaint, attempt 3 would be byte-identical and cannot differ at
+temperature 0, so the loop stops. Raise `retries` if one shot is not enough,
+but see it fail *with the named complaint in hand* first.
+
+`Survey.validate(item, answers)` is the same idea on the Survey path, where
+there is no schema to hang a validator on.
+
+
 Task catalog:
 - **Base tasks**: GenreTask, GenreTaskLite, FryeTask, CharacterTask, CharacterIntroTask, TranslationTask, BibliographyTask, OCRCleanTask
 - **Sequential tasks**: PassageContentTask, PassageFormTask, SocialNetworkTask
@@ -171,6 +219,37 @@ WARNs, because it cannot break a parse by construction. Exit 1 on any FAIL
 clean bill. Providers also log the server-resolved model id once per run;
 record *that* (or `per_item_usage[i]['response_model']`) as the model of
 record.
+
+## Seam defects — the other recurring bug class
+
+Provider drift is code correct about one model generation and wrong about the
+current one. The second class is code correct about the part it was added to
+and wrong about the part it meets.
+
+Two seats counted independently over one work period (2026-09, largeliterarymodels
+and malign-logits): **four of the last five defects each were at a seam
+between something new and something already there, none inside either.**
+Examples from this repo's own history, all found by review rather than by
+tests: `state_text()` against `_prepare()` (two renderers of one state, so a
+cross-arm check could not be string equality); `validate()` against `_Breaker`
+(a caller's rule tripping an abort that blamed the model); `run()` against
+`imap()` (one numbered its sidecar attempts, the other did not); the
+completeness gate against the stash write (a partial body cached and then
+served as complete, free, forever); `extract_map` accepting
+`validation_context_list` and dropping it in its delegation — committed while
+implementing the very feature the passthrough-asymmetry section is about.
+
+Why tests miss it: a test is written alongside the part it tests, so it
+exercises the part and not the join. Both sides pass in isolation and the
+suite is green.
+
+The habit that catches it: when adding a part, name every existing part it
+touches and write one test per JOIN rather than per part. Ask specifically —
+does the new failure reach the retry loop, the breaker, the cache write, the
+sidecar, the error row, and the receipt, and does each of them attribute it
+correctly? Each of those is a place where a new kind of failure can be
+counted as an old kind.
+
 
 ## Decoder parameters — top_p and its neighbours
 

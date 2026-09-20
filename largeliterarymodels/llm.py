@@ -1077,7 +1077,7 @@ def _diagnose_partial_response(parsed, schema):
     return matches[0] if len(matches) == 1 else None
 
 
-def _retry_prompt(prompt, partial_field=None):
+def _retry_prompt(prompt, partial_field=None, validation_error=None):
     """The reprompt sent after a response failed to parse/validate.
 
     One definition shared by extract, extract_imap, and Task.retry_prompt, so
@@ -1088,19 +1088,45 @@ def _retry_prompt(prompt, partial_field=None):
             _diagnose_partial_response), naming it converts "that wasn't valid
             JSON" — true but useless, since the JSON parsed fine — into the
             actual defect.
+        validation_error: When the JSON parsed and a validator rejected it.
+            The default complaint asserts the response "was not valid JSON",
+            which is FALSE in that case, and a model told its format was
+            wrong reformats instead of fixing the defect. Same principle as
+            partial_field: a named defect beats a generic complaint.
     """
+    return f"{_retry_complaint(partial_field, validation_error)}\n\n{prompt}"
+
+
+#: Cap on a validation message quoted back to the model. Generous, because
+#: the deciding detail is routinely at the end of a pydantic error and
+#: clipping it is how a reprompt asks the model to guess again; marked when
+#: it bites, so nobody reads a truncated rule as the whole rule.
+_MAX_VALIDATION_COMPLAINT = 2000
+
+
+def _retry_complaint(partial_field=None, validation_error=None):
+    """The sentence a reprompt leads with. Also the repeat test's identity:
+    two attempts are the same request iff they carry the same complaint."""
     if partial_field:
-        complaint = (
+        return (
             f"Your previous response contained only the value of the "
             f"`{partial_field}` field. Return the COMPLETE object with every "
             f"required field, not the value of a single field."
         )
-    else:
-        complaint = (
-            "Your previous response was not valid JSON. "
-            "Return ONLY valid JSON matching the schema, nothing else."
+    if validation_error:
+        msg = str(validation_error)
+        if len(msg) > _MAX_VALIDATION_COMPLAINT:
+            msg = (msg[:_MAX_VALIDATION_COMPLAINT]
+                   + " …[truncated; more problems followed]")
+        return (
+            f"Your previous response was valid JSON but broke a rule of this "
+            f"task:\n\n{msg}\n\nThe format was fine — do not reformat. Fix "
+            f"that specific problem and return the corrected object."
         )
-    return f"{complaint}\n\n{prompt}"
+    return (
+        "Your previous response was not valid JSON. "
+        "Return ONLY valid JSON matching the schema, nothing else."
+    )
 
 
 def _parse_json_response(text):
@@ -1140,17 +1166,30 @@ def _parse_json_response(text):
     raise ValueError(f"Could not parse JSON from response: {text[:200]}...")
 
 
-def _validate_parsed(data, schema):
-    """Validate parsed JSON against the Pydantic schema."""
+def _validate_parsed(data, schema, context=None):
+    """Validate parsed JSON against the Pydantic schema.
+
+    `context` reaches a `model_validator(mode="after")` as `info.context`.
+    A validator that raises is already a rejection hook — the retry loops
+    catch it and re-ask — but without context it can only check the response
+    against itself. Whether a word belongs in `words_b` is a property of the
+    ITEM, not of the schema, and is exactly the class of rule that needs
+    this (malign-logits seat, 2026-09-20).
+
+    It never enters a cache key: it governs whether an answer is ACCEPTED,
+    not what was administered, and the item it derives from is already in
+    the key as the prompt.
+    """
     is_list, item_schema = _unwrap_schema(schema)
     data = _unwrap_envelopes(data, item_schema)
     if is_list:
         if not isinstance(data, list):
             data = [data]
-        return [item_schema.model_validate(_unwrap_envelopes(item, item_schema))
+        return [item_schema.model_validate(
+                    _unwrap_envelopes(item, item_schema), context=context)
                 for item in data]
     else:
-        return item_schema.model_validate(data)
+        return item_schema.model_validate(data, context=context)
 
 
 def _unwrap_envelopes(data, item_schema):
@@ -1353,6 +1392,7 @@ class LLM:
         return result
 
     def extract(self, prompt, schema, system_prompt=None, examples=None,
+                validation_context=None,
                 temperature=None, max_tokens=None, images=None, metadata=None,
                 force=False, retries=1, cache_key=None, prebuilt=False,
                 raw_transport=None, sampling=None, sample=None, **kwargs):
@@ -1425,7 +1465,8 @@ class LLM:
         if hit:
             if isinstance(cached, str):
                 try:
-                    return _validate_parsed(_parse_json_response(cached), schema)
+                    return _validate_parsed(_parse_json_response(cached),
+                                            schema, validation_context)
                 except Exception as e:
                     # Schema changed since the response was cached — fall
                     # through and recompute (matches extract_imap behavior).
@@ -1439,7 +1480,10 @@ class LLM:
         last_error = None
         raw = None
         attempts = 0
+        ctx = validation_context
         partial_field = None
+        last_complaint = None
+        validation_error = None
         for attempt in range(1 + retries):
             attempts += 1
             if attempt == 0:
@@ -1451,7 +1495,8 @@ class LLM:
                     attempt, retries, s_name, self.model, last_error,
                 )
                 call_system = full_system
-                call_prompt = _retry_prompt(user_prompt, partial_field)
+                call_prompt = _retry_prompt(
+                    user_prompt, partial_field, validation_error)
 
             # Provider call inside the try so transient network/API errors
             # consume a retry instead of aborting (parity with extract_imap).
@@ -1477,19 +1522,27 @@ class LLM:
                     **call_kwargs,
                 )
                 parsed = _parse_json_response(raw)
-                result = _validate_parsed(parsed, schema)
+                result = _validate_parsed(parsed, schema, ctx)
                 self.stash[key] = raw
                 return result
             except Exception as e:
                 partial_field = _diagnose_partial_response(parsed, schema)
-                # An identical repeat is deterministic — a further billed
-                # attempt cannot succeed, so stop rather than burn it, unless
-                # the diagnosis gives the retry something new to say.
-                if (last_error is not None and not partial_field
-                        and _Breaker.signature(e) == _Breaker.signature(last_error)):
-                    last_error = e
+                validation_error = e if parsed is not None else None
+                complaint = _retry_complaint(partial_field, validation_error)
+                # The repeat test is COMPLAINT identity, not error
+                # identity. "A further attempt cannot succeed" holds only
+                # if we would send the same request again; once the
+                # reprompt carries a validation message it is telling the
+                # model something it has not been told. At temperature 0
+                # a semantic failure reproduces its signature exactly, so
+                # a signature-only test made the new information inert on
+                # the first attempt that could have used it.
+                same = (last_error is not None and not partial_field
+                        and complaint == last_complaint
+                        and _Breaker.signature(e) == _Breaker.signature(last_error))
+                last_error, last_complaint = e, complaint
+                if same:
                     break
-                last_error = e
                 continue
 
         # Report attempts actually made, not the configured ceiling — they
@@ -1645,6 +1698,7 @@ class LLM:
         return results
 
     def extract_imap(self, prompts, schema, system_prompt=None, examples=None,
+                     validation_context_list=None,
                      temperature=None, max_tokens=None, images_list=None,
                      metadata_list=None, num_workers=4,
                      force=False, retries=1, verbose=False, errors=None,
@@ -1782,7 +1836,13 @@ class LLM:
             if hit:
                 if isinstance(cached, str):
                     try:
-                        result = _validate_parsed(_parse_json_response(cached), schema)
+                        # Same rule a fresh response would face: a cached
+                        # answer the item's own validator rejects must not be
+                        # served as good, and re-reading it costs nothing.
+                        result = _validate_parsed(
+                            _parse_json_response(cached), schema,
+                            validation_context_list[i]
+                            if validation_context_list else None)
                         if verbose:
                             _emit_verbose(i, prompt, metadata, result, from_cache=True)
                         yield i, result
@@ -1872,7 +1932,11 @@ class LLM:
             last_error = None
             raw = None
             attempts = 0
+            ctx = (validation_context_list[i]
+                   if validation_context_list else None)
             partial_field = None
+            last_complaint = None
+            validation_error = None
             call_kwargs = dict(kwargs)
             call_kwargs["usage_sink"] = _item_sink(i)
             for attempt in range(1 + retries):
@@ -1885,7 +1949,8 @@ class LLM:
                         "extract_imap retry %d/%d for prompt %d (model=%s): %s",
                         attempt, retries, i, self.model, last_error,
                     )
-                    call_prompt = _retry_prompt(prompt, partial_field)
+                    call_prompt = _retry_prompt(
+                        prompt, partial_field, validation_error)
                 attempts += 1
                 breaker.record_attempt()
                 # `parsed` is re-bound every attempt (see extract): a stale
@@ -1909,7 +1974,7 @@ class LLM:
                         **self._provider_kwargs(call_kwargs, sampling),
                     )
                     parsed = _parse_json_response(raw)
-                    result = _validate_parsed(parsed, schema)
+                    result = _validate_parsed(parsed, schema, ctx)
                     self.stash[key] = raw
                     breaker.record_success()
                     return i, result
@@ -1918,12 +1983,20 @@ class LLM:
                     # failure so the retry can name it instead of complaining
                     # about JSON that actually parsed fine.
                     partial_field = _diagnose_partial_response(parsed, schema)
-                    # A repeat of the identical error on the same item is
-                    # deterministic; a further attempt costs money and cannot
-                    # succeed — unless we now have something new to say.
+                    validation_error = e if parsed is not None else None
+                    complaint = _retry_complaint(partial_field, validation_error)
+                    # The repeat test is COMPLAINT identity, not error
+                    # identity. "A further attempt cannot succeed" holds only
+                    # if we would send the same request again; once the
+                    # reprompt carries a validation message it is telling the
+                    # model something it has not been told. At temperature 0
+                    # a semantic failure reproduces its signature exactly, so
+                    # a signature-only test made the new information inert on
+                    # the first attempt that could have used it.
                     repeat = (last_error is not None
+                              and complaint == last_complaint
                               and _Breaker.signature(e) == _Breaker.signature(last_error))
-                    last_error = e
+                    last_error, last_complaint = e, complaint
                     if repeat and not partial_field:
                         break
                     continue
@@ -2044,6 +2117,7 @@ class LLM:
                               type(e).__name__, e)
 
     def extract_map(self, prompts, schema, system_prompt=None, examples=None,
+                     validation_context_list=None,
                     temperature=None, max_tokens=None, images_list=None,
                     metadata_list=None, num_workers=4,
                     force=False, retries=1, verbose=False, errors=None,
@@ -2077,7 +2151,8 @@ class LLM:
                 images_list=images_list, metadata_list=metadata_list,
                 num_workers=num_workers, force=force, retries=retries,
                 verbose=verbose, errors=errors, fail_fast=fail_fast,
-                warm_cache=warm_cache, per_item_usage=per_item_usage, **kwargs,
+                warm_cache=warm_cache, per_item_usage=per_item_usage,
+                validation_context_list=validation_context_list, **kwargs,
             ):
                 results[i] = result
         except BatchAborted as e:

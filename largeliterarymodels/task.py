@@ -157,6 +157,7 @@ class Task(_Administered):
 
     def _imap_kwargs(self, system_prompt=None, examples=None,
                      images_list=None, metadata_list=None,
+                     validation_context_list=None,
                      num_workers=4, force=False, verbose=False,
                      errors=None, per_item_usage=None, **kwargs):
         """Build kwargs for extract_imap/extract_map."""
@@ -166,6 +167,7 @@ class Task(_Administered):
             examples=examples if examples is not None else self.examples,
             images_list=images_list,
             metadata_list=metadata_list,
+            validation_context_list=validation_context_list,
             num_workers=num_workers,
             retries=self.retries,
             force=force,
@@ -177,6 +179,7 @@ class Task(_Administered):
 
     def imap(self, prompts, model=None, system_prompt=None, examples=None,
              images_list=None, metadata_list=None,
+             validation_context_list=None,
              num_workers=4, force=False, verbose=False, errors=None,
              per_item_usage=None, **kwargs):
         """Extract structured data, yielding (index, result) as each completes.
@@ -196,6 +199,7 @@ class Task(_Administered):
             yield from llm.extract_imap(
                 prompts=prompts,
                 **self._imap_kwargs(system_prompt=system_prompt,
+                                    validation_context_list=validation_context_list,
                                     examples=examples,
                                     images_list=images_list,
                                     metadata_list=metadata_list,
@@ -215,6 +219,7 @@ class Task(_Administered):
             yield from llm.extract_imap(
                 prompts=prompts,
                 **self._imap_kwargs(system_prompt=system_prompt,
+                                    validation_context_list=validation_context_list,
                                     examples=examples,
                                     images_list=images_list,
                                     metadata_list=metadata_list,
@@ -228,6 +233,7 @@ class Task(_Administered):
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
             images_list=None, metadata_list=None,
+            validation_context_list=None,
             num_workers=4, force=False, verbose=False, errors=None,
             per_item_usage=None, batch=False, **kwargs):
         """Extract structured data from multiple inputs, with parallelism.
@@ -290,6 +296,7 @@ class Task(_Administered):
             results = llm.extract_map(
                 prompts=prompts,
                 **self._imap_kwargs(system_prompt=system_prompt,
+                                    validation_context_list=validation_context_list,
                                     examples=examples,
                                     images_list=images_list,
                                     metadata_list=metadata_list,
@@ -520,7 +527,8 @@ class Task(_Administered):
             )
             return None
 
-    def retry_prompt(self, item, partial_field=None):
+    def retry_prompt(self, item, partial_field=None,
+                     validation_error=None):
         """The reprompt the API path uses after an invalid response.
 
         Administering the instrument by hand otherwise loses the retry half
@@ -530,7 +538,7 @@ class Task(_Administered):
         — "you returned only the value of the X field" — is reachable by
         hand exactly as it is by API.
         """
-        return _retry_prompt(item, partial_field)
+        return _retry_prompt(item, partial_field, validation_error)
 
     @property
     def results(self):

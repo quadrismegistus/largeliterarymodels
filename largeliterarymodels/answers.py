@@ -32,6 +32,25 @@ class AnswerError(ValueError):
     """The response did not answer what was asked."""
 
 
+class MissingAnswer(AnswerError, KeyError):
+    """No answer under this question id.
+
+    Both AnswerError and KeyError, deliberately. KeyError is what
+    Mapping.get() catches, so `answers.get(qid)` returns its default like any
+    other mapping instead of raising — which is what a caller writing
+    `getattr(answers.get(qid), "value", "")` has every right to expect, and
+    what one such caller assumed was already happening. Raising from .get()
+    breaks the Mapping contract in a way nothing warns about.
+
+    Still an AnswerError, so `except AnswerError` keeps working, and __str__
+    is overridden because KeyError's own repr would wrap the message in
+    quotes.
+    """
+
+    def __str__(self):
+        return self.args[0] if self.args else ""
+
+
 class IncompleteAnswers(AnswerError):
     """Questions were asked and came back unanswered.
 
@@ -211,7 +230,7 @@ class Answers(Mapping):
         try:
             return self._a[qid]
         except KeyError:
-            raise AnswerError(
+            raise MissingAnswer(
                 f"no answer for {qid!r}. Asked: {len(self._asked)} questions, "
                 f"answered: {len(self._a)}."
             ) from None

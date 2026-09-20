@@ -141,3 +141,42 @@ class TestScore:
     def test_degenerate_level_count(self):
         bare = {"answers": {"q": {"type": "score", "score": 0.0}}}
         assert A.parse(bare)["q"].normalized is None
+
+
+class TestMappingContract:
+    """`answers.get(qid)` must behave like any mapping's get. It did not:
+    Mapping.get catches KeyError and AnswerError was a ValueError, so a
+    caller writing getattr(answers.get(qid), "value", "") got an exception
+    where they had asked for a default — and one downstream audit was
+    written believing the default path existed."""
+
+    A = A.parse({"model": "m", "usage": {},
+                 "answers": {"q0": {"type": "noul", "noul": 0.5}}},
+                asked=["q0", "q1"])
+
+    def test_get_returns_the_default(self):
+        assert self.A.get("q1") is None
+        assert self.A.get("q1", "fallback") == "fallback"
+
+    def test_the_getattr_chain_a_caller_writes(self):
+        assert getattr(self.A.get("q1"), "value", "") == ""
+        assert getattr(self.A.get("q0"), "value", "") == 0.5
+
+    def test_indexing_still_raises_with_the_useful_message(self):
+        with pytest.raises(A.MissingAnswer, match="no answer for 'q1'"):
+            self.A["q1"]
+
+    def test_it_is_both_error_kinds(self):
+        assert issubclass(A.MissingAnswer, A.AnswerError)
+        assert issubclass(A.MissingAnswer, KeyError)
+
+    def test_message_is_not_quote_wrapped_by_keyerror(self):
+        # KeyError's own __str__ would wrap it in quotes.
+        try:
+            self.A["q1"]
+        except A.MissingAnswer as e:
+            assert str(e).startswith("no answer"), str(e)
+
+    def test_dict_idioms_work(self):
+        assert "q1" not in self.A and "q0" in self.A
+        assert dict(self.A).keys() == {"q0"}

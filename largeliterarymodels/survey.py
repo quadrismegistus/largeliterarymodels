@@ -65,6 +65,14 @@ log = logging.getLogger(__name__)
 DEFAULT_SURVEY_MODEL = "jev-latest"
 
 
+def _package_version():
+    try:
+        import importlib.metadata as _m
+        return _m.version("largeliterarymodels")
+    except Exception:  # noqa: BLE001 — provenance must not fail a run
+        return None
+
+
 class Survey(_Administered):
     """A question set administered to items, with its own cache."""
 
@@ -178,6 +186,14 @@ class Survey(_Administered):
             "survey": self.task_name,
             "class": type(self).__name__,
             "model": model or self.model,
+            # The instrument digest hashes the QUESTIONS. It cannot see a
+            # change to how answers are gated, retried or parsed, so a corpus
+            # collected across such a change has two administrations under one
+            # digest and nothing in the artifact says so. This is the field
+            # that says so. It never enters a cache key — a version bump would
+            # orphan every key ever written, which is the same reason
+            # _SAMPLING_DEFAULTS stays out.
+            "package_version": _package_version(),
             "n_questions": (len(self.questions)
                             if self.has_static_instrument else None),
             "per_item_questions": not self.has_static_instrument,

@@ -883,3 +883,20 @@ class TestIncompleteResponses:
         s.map([{"p": 1}], num_workers=1)
         assert len(list(s.raw_sidecar.keys())) >= 1
         assert list(s.stash.keys()) == []
+
+
+class TestProvenance:
+    def test_record_carries_the_package_version(self):
+        # The question digest hashes the QUESTIONS; it cannot see a change to
+        # how answers are gated, retried or parsed. Without this a corpus
+        # collected across such a change has two administrations under one
+        # digest and nothing in the artifact says so.
+        rec = _survey().administration_record()
+        assert rec["package_version"]
+
+    def test_version_never_enters_a_key(self):
+        # A version bump would orphan every key ever written — the same
+        # reason _SAMPLING_DEFAULTS stays out of keys.
+        _, _, key = _survey()._prepare({"passage": "x"})
+        assert "package_version" not in key
+        assert "version" not in " ".join(key)

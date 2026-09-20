@@ -1076,3 +1076,117 @@ class TestConcurrency:
         before = len(seen)
         s.map(items, num_workers=w)
         assert len(seen) == before, "every item warm on the second pass"
+
+
+class TestBreakerAttribution:
+    """The breaker counts an item's final failure by signature and does not
+    care what kind it is, so a caller's own validate() rejecting everything
+    produced an abort message blaming the model. Attribution, not exemption:
+    it must still abort, because each rejection is retried and every retry is
+    billed."""
+
+    def _run(self, monkeypatch, validate, n=40):
+        import largeliterarymodels.providers as P
+        from largeliterarymodels.llm import BatchAborted
+
+        def call(state, questions, **kw):
+            return {"model": "m", "usage": {},
+                    "answers": {"q": {"type": "noul", "noul": 0.9}}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"q": Noul(instructions="x")}
+        S.name = "_attrib"
+        S.retries = 0
+        S.validate = validate
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        try:
+            s.map([{"p": i} for i in range(n)], num_workers=1, fail_fast=5)
+        except BatchAborted as e:
+            return str(e)
+        return None
+
+    def test_a_strict_hook_still_aborts(self, monkeypatch):
+        # Exemption would be the wrong fix: every rejection costs a call.
+        msg = self._run(monkeypatch, lambda self, i, a: "too strict")
+        assert msg is not None and "Aborting batch" in msg
+
+    def test_the_message_blames_the_hook_not_the_model(self, monkeypatch):
+        msg = self._run(monkeypatch, lambda self, i, a: "too strict")
+        assert "YOUR validate()" in msg
+        assert "not a fault of model" in msg
+        assert "Look at the hook before the model" in msg
+
+    def test_it_says_the_provider_did_its_part(self, monkeypatch):
+        msg = self._run(monkeypatch, lambda self, i, a: "too strict")
+        assert "answered every question" in msg
+
+    def test_it_still_says_why_it_aborted_anyway(self, monkeypatch):
+        msg = self._run(monkeypatch, lambda self, i, a: "too strict")
+        assert "every retry is billed" in msg
+        assert "fail_fast=False" in msg
+
+    def test_a_provider_fault_keeps_the_original_message(self, monkeypatch):
+        import largeliterarymodels.providers as P
+        from largeliterarymodels.llm import BatchAborted
+
+        def call(state, questions, **kw):
+            raise RuntimeError("upstream is down")
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"q": Noul(instructions="x")}
+        S.name = "_attrib2"
+        S.retries = 0
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        with pytest.raises(BatchAborted) as e:
+            s.map([{"p": i} for i in range(40)], num_workers=1, fail_fast=5)
+        msg = str(e.value)
+        assert "Aborting batch on model" in msg
+        assert "YOUR validate()" not in msg
+
+    def test_the_breaker_records_which_type_tripped_it(self):
+        from largeliterarymodels.answers import AnswerRejected
+        from largeliterarymodels.llm import _Breaker
+        b = _Breaker(floor=2, min_outcomes=2)
+        for _ in range(3):
+            b.record_failure(AnswerRejected("nope"))
+        assert b.tripped_type is AnswerRejected
+        assert b._caller_side()
+
+
+class TestSidecarAttemptNumbering:
+    def test_run_numbers_its_attempts_like_imap_does(self, tmp_path,
+                                                     monkeypatch):
+        # A retried item writes one record per try; without the index they
+        # cannot be told apart, and a rejected body is only diagnosable
+        # against the attempt that replaced it.
+        import largeliterarymodels.providers as P
+        from largeliterarymodels.rawlog import RawLog
+        n = {"i": 0}
+
+        def call(state, questions, raw_sink=None, **kw):
+            n["i"] += 1
+            body = {"model": "m", "usage": {},
+                    "answers": {"q": {"type": "noul",
+                                      "noul": 0.9 if n["i"] < 3 else 0.1}}}
+            if raw_sink:
+                raw_sink(body)
+            return body
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"q": Noul(instructions="x")}
+
+            def validate(self, item, answers):
+                return "too high" if answers.p("q") > 0.5 else None
+        S.name = "_attempts"
+        S.retries = 3
+        s = S(raw_log=RawLog(root=str(tmp_path / "raw")))
+        s._stash = HashStash(engine="memory").clear()
+        s.run({"p": 1})
+        [key] = list(s.raw_sidecar.keys())
+        attempts = [e.get("attempt") for e in s.raw_sidecar.history(key)]
+        assert attempts == [0, 1, 2], attempts

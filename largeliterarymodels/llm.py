@@ -563,6 +563,10 @@ class _Breaker:
         self.attempts = 0
         self.tripped_signature = None
         self.tripped_reason = None
+        # The exception TYPE that tripped it, kept beside the signature so
+        # error() can say WHOSE fault this is. A signature is a string and
+        # matching prose against it is how the wrong file gets blamed.
+        self.tripped_type = None
 
     @staticmethod
     def signature(exc):
@@ -591,6 +595,7 @@ class _Breaker:
         if not self.enabled:
             return False
         sig = self.signature(exc)
+        etype = type(exc)
         with self._lock:
             self.outcomes += 1
             self.total_failures += 1
@@ -598,6 +603,7 @@ class _Breaker:
             if self.tripped_signature is None:
                 if count >= self.floor and count == self.outcomes:
                     self.tripped_signature = sig
+                    self.tripped_type = etype
                     self.tripped_reason = (
                         f"the first {self.outcomes} items to complete all "
                         f"failed this way ({self.attempts} billed attempts)"
@@ -605,6 +611,7 @@ class _Breaker:
                 elif (self.outcomes >= self.min_outcomes
                         and count / self.outcomes > self.rate):
                     self.tripped_signature = sig
+                    self.tripped_type = etype
                     self.tripped_reason = (
                         f"{count} of {self.outcomes} completed items "
                         f"({count / self.outcomes:.0%}) failed with one "
@@ -616,10 +623,35 @@ class _Breaker:
     def tripped(self):
         return self.tripped_signature is not None
 
+    #: Exception types raised by the CALLER'S own code rather than by a
+    #: provider. They still trip the breaker — each retry is billed whoever
+    #: caused it — but the abort message must not blame the model for them.
+    #: Two minutes to falsify is the standard this message sets itself, and
+    #: it fails that standard if it points at the wrong file.
+    CALLER_SIDE = ("AnswerRejected",)
+
+    def _caller_side(self):
+        name = getattr(self.tripped_type, "__name__", "")
+        return name in self.CALLER_SIDE
+
     def error(self, model):
         # State the inference, not just the verdict: naming why it believes
         # this is systematic is what lets a caller falsify it in two minutes
         # instead of hunting for a bug that isn't there.
+        if self._caller_side():
+            return (
+                f"Aborting batch: {self.tripped_reason} — "
+                f"{self.tripped_signature}. This is YOUR validate() "
+                f"rejecting them, not a fault of model {model!r}: the "
+                f"provider answered every question and your own consistency "
+                f"rule refused the result. Look at the hook before the "
+                f"model. It still aborts because each rejection is retried "
+                f"and every retry is billed. If the rule is right and the "
+                f"rejections are expected, loosen the breaker with "
+                f"fail_fast=False or fail_fast={{'rate': 0.5}}; if it is "
+                f"too strict, or inverted, fix it and rerun — completed "
+                f"results are cached and a rerun resumes."
+            )
         return (
             f"Aborting batch on model {model!r}: {self.tripped_reason} — "
             f"{self.tripped_signature}. Inference: item failures at this rate "

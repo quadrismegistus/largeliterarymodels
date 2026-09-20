@@ -301,13 +301,20 @@ class Survey(_Administered):
                 return parse_answers(cached, asked=wire)
 
         sidecar = self._resolved_raw_log()
-        raw_sink = None
-        if sidecar is not None:
-            raw_sink = lambda body: sidecar.record(  # noqa: E731
-                key, body, transport="sync", model=model, provider="typesafe")
 
         last = None
-        for _ in range(1 + self.retries):
+        for attempt in range(1 + self.retries):
+            # Built per attempt, not once: a retried item writes one sidecar
+            # record per try, and without the attempt index they cannot be
+            # told apart — which is exactly the case the sidecar is for,
+            # since a rejected or incomplete body is only diagnosable against
+            # the attempt that replaced it. imap has always numbered these;
+            # this path did not.
+            raw_sink = None
+            if sidecar is not None:
+                raw_sink = lambda body, a=attempt: sidecar.record(  # noqa: E731
+                    key, body, transport="sync", model=model,
+                    provider="typesafe", attempt=a)
             try:
                 body = providers.call_typesafe_survey(
                     state=state, questions=wire, model=model,

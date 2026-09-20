@@ -51,6 +51,17 @@ class MissingAnswer(AnswerError, KeyError):
         return self.args[0] if self.args else ""
 
 
+class AnswerRejected(AnswerError):
+    """A response the caller's own validate() refused.
+
+    Separate from IncompleteAnswers because the provider did nothing wrong:
+    every question was answered, and the instrument's own consistency rule
+    says the set is unusable. Retried the same way, and its body is likewise
+    not stashed — a rejected answer that stays in the cache is served as good
+    on every later read.
+    """
+
+
 class IncompleteAnswers(AnswerError):
     """Questions were asked and came back unanswered.
 

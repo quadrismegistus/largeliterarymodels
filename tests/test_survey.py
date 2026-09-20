@@ -900,3 +900,179 @@ class TestProvenance:
         _, _, key = _survey()._prepare({"passage": "x"})
         assert "package_version" not in key
         assert "version" not in " ".join(key)
+
+
+class TestValidateHook:
+    """A check that runs after map() can only DISCARD: the administration is
+    over and the body is cached, so the item is lost rather than retried.
+    The same check inside the loop costs a call and keeps the item."""
+
+    def _s(self, monkeypatch, validate, bad_for=2, retries=2):
+        import largeliterarymodels.providers as P
+        n = {"calls": 0}
+
+        def call(state, questions, **kw):
+            n["calls"] += 1
+            bad = n["calls"] <= bad_for
+            return {"model": "m", "usage": {}, "answers": {
+                "gate": {"type": "noul", "noul": 0.1},
+                "score": {"type": "noul", "noul": 0.99 if bad else 0.2}}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"gate": Noul(instructions="is it a word?"),
+                         "score": Noul(instructions="how far?")}
+        S.name = "_validate"
+        S.retries = retries
+        S.validate = validate
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        return s, n
+
+    @staticmethod
+    def _inconsistent(self, item, answers):
+        if answers.p("gate") < 0.5 and answers.p("score") > 0.9:
+            return "scored high on a word the gate rejects"
+        return None
+
+    def test_rejection_is_retried_and_can_recover(self, monkeypatch):
+        s, n = self._s(monkeypatch, self._inconsistent)
+        out = s.map([{"p": 1}], num_workers=1)
+        assert out[0] is not None
+        assert n["calls"] == 3, "two rejections, then an accepted response"
+
+    def test_a_rejected_body_is_never_stashed(self, monkeypatch):
+        # A rejected answer left in the cache is served as good on every
+        # later read, which is the durable half of the defect.
+        s, _ = self._s(monkeypatch, self._inconsistent, bad_for=99, retries=1)
+        s.map([{"p": 1}], num_workers=1)
+        assert list(s.stash.keys()) == []
+
+    def test_the_complaint_reaches_the_error_row(self, monkeypatch):
+        s, _ = self._s(monkeypatch, self._inconsistent, bad_for=99, retries=0)
+        errs = {}
+        s.map([{"p": 1}], num_workers=1, errors=errs)
+        assert "gate rejects" in errs[0]["rejected"]
+
+    def test_the_default_accepts_everything(self, monkeypatch):
+        s, n = self._s(monkeypatch, Survey.validate, bad_for=99)
+        assert s.map([{"p": 1}], num_workers=1)[0] is not None
+        assert n["calls"] == 1
+
+    def test_it_sees_the_item_not_just_the_answers(self, monkeypatch):
+        seen = []
+
+        def v(self, item, answers):
+            seen.append(item)
+            return None
+        s, _ = self._s(monkeypatch, v)
+        s.map([{"p": 7}], num_workers=1)
+        assert seen == [{"p": 7}]
+
+    def test_run_uses_the_hook_too(self, monkeypatch):
+        from largeliterarymodels.answers import AnswerRejected
+        s, _ = self._s(monkeypatch, self._inconsistent, bad_for=99, retries=0)
+        with pytest.raises(AnswerRejected):
+            s.run({"p": 1})
+        assert list(s.stash.keys()) == []
+
+    @pytest.mark.parametrize("bad", [False, True, 0, 1, "", "   ", []])
+    def test_a_non_string_return_raises_rather_than_guessing(self, monkeypatch,
+                                                             bad):
+        # `return False` for "bad" is the obvious wrong guess and is falsy,
+        # so guessing would silently accept the thing being rejected.
+        s, _ = self._s(monkeypatch, lambda self, i, a: bad, retries=0)
+        errs = {}
+        s.map([{"p": 1}], num_workers=1, errors=errs)
+        assert errs[0]["error"].startswith("TypeError"), errs[0]["error"]
+
+
+class TestConcurrency:
+    """Every other test runs num_workers=1. Real runs go to 32."""
+
+    def _s(self, monkeypatch, n_items, workers, validate=None):
+        import largeliterarymodels.providers as P
+        import threading
+        seen, lock = [], threading.Lock()
+
+        def call(state, questions, **kw):
+            with lock:
+                seen.append(state["p"])
+            return {"model": "m", "usage": {},
+                    "answers": {"q": {"type": "noul", "noul": 0.5}}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"q": Noul(instructions="x")}
+        S.name = "_conc"
+        if validate is not None:
+            S.validate = validate
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        items = [{"p": i} for i in range(n_items)]
+        return s, items, seen, workers
+
+    def test_every_item_is_called_exactly_once(self, monkeypatch):
+        s, items, seen, w = self._s(monkeypatch, 300, 32)
+        out = s.map(items, num_workers=w)
+        assert sorted(seen) == list(range(300)), "no item dropped or repeated"
+        assert len(out) == 300 and all(a is not None for a in out)
+
+    def test_results_land_in_item_order_not_completion_order(self, monkeypatch):
+        s, items, _, w = self._s(monkeypatch, 96, 32)
+        out = s.map(items, num_workers=w)
+        assert len(out) == 96 and all(a is not None for a in out)
+
+    def test_one_stash_entry_per_item(self, monkeypatch):
+        s, items, _, w = self._s(monkeypatch, 300, 32)
+        s.map(items, num_workers=w)
+        assert len(list(s.stash.keys())) == 300
+
+    def test_usage_totals_survive_parallel_sinks(self, monkeypatch):
+        import largeliterarymodels.providers as P
+
+        def call(state, questions, usage_sink=None, **kw):
+            if usage_sink:
+                usage_sink({"input_tokens": 10, "output_tokens": 1,
+                            "cache_read_tokens": 0, "cache_write_tokens": 0,
+                            "reasoning_tokens": 0, "reasoning_reported": False,
+                            "reasoning_observed": False, "response_model": "m"})
+            return {"model": "m", "usage": {},
+                    "answers": {"q": {"type": "noul", "noul": 0.5}}}
+        monkeypatch.setattr(P, "call_typesafe_survey", call)
+
+        class S(Survey):
+            questions = {"q": Noul(instructions="x")}
+        S.name = "_conc_usage"
+        s = S()
+        s._stash = HashStash(engine="memory").clear()
+        pu = {}
+        s.map([{"p": i} for i in range(300)], num_workers=32,
+              per_item_usage=pu)
+        r = s.usage.report()
+        assert r["calls"] == 300, "a lost increment means an unlocked counter"
+        assert r["input_tokens"] == 3000
+        assert len(pu) == 300
+
+    def test_validate_runs_concurrently_without_shared_state(self, monkeypatch):
+        # The hook is handed everything it needs as arguments precisely so an
+        # override needs no ambient per-call state — there is no single
+        # "current item" at 32 workers.
+        import threading
+        threads, lock = set(), threading.Lock()
+
+        def v(self, item, answers):
+            with lock:
+                threads.add(threading.get_ident())
+            return None
+        s, items, _, w = self._s(monkeypatch, 300, 32, validate=v)
+        out = s.map(items, num_workers=w)
+        assert all(a is not None for a in out)
+        assert len(threads) > 1, "the hook really did run on several threads"
+
+    def test_a_resumed_parallel_run_recalls_nothing(self, monkeypatch):
+        s, items, seen, w = self._s(monkeypatch, 300, 32)
+        s.map(items, num_workers=w)
+        before = len(seen)
+        s.map(items, num_workers=w)
+        assert len(seen) == before, "every item warm on the second pass"

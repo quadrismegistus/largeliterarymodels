@@ -52,7 +52,7 @@ import json
 import logging
 
 from .administered import _Administered
-from .answers import IncompleteAnswers
+from .answers import AnswerRejected, IncompleteAnswers
 from .answers import parse as parse_answers
 from .llm import (
     BatchAborted, UsageTracker, _make_survey_key, _record_item_usage,
@@ -223,6 +223,47 @@ class Survey(_Administered):
                                metadata=metadata, sample=sample)
         return state, wire, key
 
+    def validate(self, item, answers):
+        """Caller-defined check, run INSIDE the retry loop. Override to reject.
+
+        Return None to accept, or a short string saying what is wrong to
+        reject. A rejected response is retried like any other defect and its
+        body is not stashed, so the next run recomputes rather than serving
+        it. Returning anything else raises, because the obvious wrong guess —
+        `return False` for "bad" — is falsy and would silently accept.
+
+        This exists because a check that runs after `map` returns can only
+        DISCARD: the administration is over, the body is cached, and the item
+        is lost rather than retried. The same check here costs a call and
+        keeps the item.
+
+        THREAD SAFETY IS THE OVERRIDER'S. This is called from worker threads,
+        concurrently, one per in-flight item — runs here go to 32 workers.
+        It is handed everything it needs as arguments for that reason, and
+        ambient per-call state (a contextvar, an instance attribute mutated
+        per item) is the wrong shape: there is no single "current item". Read
+        only the arguments and immutable configuration, or hold your own lock.
+
+        Cheap checks only. It runs on every response, including ones that
+        were about to be accepted.
+        """
+        return None
+
+    def _accept(self, item, answers, wire):
+        """The gate every response passes before it is stashed."""
+        self._complete(answers, wire)
+        complaint = self.validate(item, answers)
+        if complaint is None:
+            return answers
+        if not isinstance(complaint, str) or not complaint.strip():
+            raise TypeError(
+                f"{type(self).__name__}.validate() returned "
+                f"{complaint!r}; return None to accept or a non-empty string "
+                f"saying what is wrong. A bare False would be falsy and "
+                f"silently accept, so it is refused rather than guessed at."
+            )
+        raise AnswerRejected(complaint)
+
     @staticmethod
     def _complete(answers, wire):
         """Raise unless every question asked came back answered.
@@ -271,7 +312,8 @@ class Survey(_Administered):
                 body = providers.call_typesafe_survey(
                     state=state, questions=wire, model=model,
                     usage_sink=self.usage.record, raw_sink=raw_sink, **kwargs)
-                answers = self._complete(parse_answers(body, asked=wire), wire)
+                answers = self._accept(
+                    item, parse_answers(body, asked=wire), wire)
             except Exception as e:  # noqa: BLE001 — retried, then re-raised
                 last = e
                 continue
@@ -321,13 +363,13 @@ class Survey(_Administered):
             meta = metadata_list[i] if metadata_list else None
             sample = samples[i] if samples else None
             state, wire, key = self._prepare(item, meta, sample, model)
-            prepared.append((i, state, wire, key))
+            prepared.append((i, item, state, wire, key))
 
         # Cache pass first, so a resumed run yields its warm half immediately
         # and only the cold half reaches a worker. No cache WARMING pass: that
         # exists on the extract path to avoid N parallel prompt-cache write
         # premiums, and this provider has no cache tier to write to.
-        for i, state, wire, key in prepared:
+        for i, item, state, wire, key in prepared:
             if not force:
                 hit, cached = _stash_read(self.stash, key, None, model)
                 if hit:
@@ -335,7 +377,7 @@ class Survey(_Administered):
                         log.info("[%d] cached", i)
                     yield i, parse_answers(cached, asked=wire)
                     continue
-            pending.append((i, state, wire, key))
+            pending.append((i, item, state, wire, key))
 
         if not pending:
             return
@@ -349,7 +391,7 @@ class Survey(_Administered):
             return sink
 
         def _do_one(task):
-            i, state, wire, key = task
+            i, item, state, wire, key = task
             last_error = None
             for attempt in range(1 + self.retries):
                 if breaker.tripped:
@@ -369,8 +411,8 @@ class Survey(_Administered):
                     body = providers.call_typesafe_survey(
                         state=state, questions=wire, model=model,
                         usage_sink=_sink(i), raw_sink=raw_sink, **kwargs)
-                    answers = self._complete(
-                        parse_answers(body, asked=wire), wire)
+                    answers = self._accept(
+                        item, parse_answers(body, asked=wire), wire)
                     self.stash[key] = body
                     breaker.record_success()
                     return i, answers
@@ -385,6 +427,8 @@ class Survey(_Administered):
                     "attempts": 1 + self.retries,
                     "metadata": metadata_list[i] if metadata_list else None,
                 }
+                if isinstance(last_error, AnswerRejected):
+                    errors[i]["rejected"] = str(last_error)
                 if isinstance(last_error, IncompleteAnswers):
                     # Name them, so the caller can see WHICH questions the
                     # provider dropped rather than that something went wrong.

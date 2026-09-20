@@ -1,0 +1,102 @@
+{
+  "_recorded": "2026-09-20, live call to jev-latest",
+  "_why": "Pins the WIRE SHAPE against a real response. Every other fixture in the suite is synthetic and therefore written to match the parser.",
+  "request_questions": {
+    "plain_noul": {
+      "type": "noul",
+      "instructions": "Is the vocabulary abstract?"
+    },
+    "structured_noul": {
+      "type": "noul",
+      "instructions": {
+        "question": "Does concrete imagery carry an abstract idea?",
+        "inspect": "passage",
+        "focus": "Judge the binding, not the presence of detail."
+      },
+      "criteria": {
+        "true": {
+          "what": "sustained allegorical binding",
+          "examples": [
+            "landscape read as moral terrain"
+          ]
+        },
+        "false": {
+          "what": "concrete stays concrete",
+          "not_for": "Do not answer false merely because the passage is abstract."
+        }
+      }
+    },
+    "choice_q": {
+      "type": "choice",
+      "instructions": "Dominant rhetorical mode?",
+      "criteria": {
+        "narrative": "recounts events",
+        "didactic": {
+          "what": "instructs a reader"
+        },
+        "descriptive": null
+      }
+    },
+    "score_q": {
+      "type": "score",
+      "instructions": "How abstract is the vocabulary?",
+      "criteria": [
+        {
+          "level": "almost wholly concrete",
+          "examples": [
+            "named persons and dates"
+          ]
+        },
+        "mixed",
+        "largely abstract"
+      ]
+    }
+  },
+  "response_body": {
+    "model": "jev-1.13.0",
+    "answers": {
+      "plain_noul": {
+        "type": "noul",
+        "noul": 0.93
+      },
+      "structured_noul": {
+        "type": "noul",
+        "noul": 0.46
+      },
+      "choice_q": {
+        "type": "choice",
+        "choice": "didactic",
+        "confidence": 0.37,
+        "probabilities": {
+          "descriptive": 0.42,
+          "narrative": 0.0,
+          "didactic": 0.58
+        }
+      },
+      "score_q": {
+        "type": "score",
+        "score": 1.99,
+        "confidence": 0.99,
+        "legend": {
+          "0": {
+            "level": "almost wholly concrete",
+            "examples": [
+              "named persons and dates"
+            ]
+          },
+          "1": "mixed",
+          "2": "largely abstract"
+        },
+        "probabilities": {
+          "0": 0.0,
+          "1": 0.01,
+          "2": 0.99
+        }
+      }
+    },
+    "usage": {
+      "input_tokens": 558,
+      "output_tokens": 99
+    }
+  }
+}

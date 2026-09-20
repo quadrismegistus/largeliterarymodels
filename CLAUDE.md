@@ -92,6 +92,37 @@ Task catalog:
 - **Base tasks**: GenreTask, GenreTaskLite, FryeTask, CharacterTask, CharacterIntroTask, TranslationTask, BibliographyTask, OCRCleanTask
 - **Sequential tasks**: PassageContentTask, PassageFormTask, SocialNetworkTask
 
+## Survey — typed questions, for System One models (branch `survey-jev`)
+
+**Not merged yet.** A sibling of `Task`, not a mode of it. A Task sends a system prompt built from a Pydantic schema and parses text back; a `Survey` sends state plus a dict of typed questions and gets typed answers back, each carrying a probability.
+
+```python
+class Abstraction(Survey):
+    questions = {"abstract": Noul(instructions=...),          # -> P(true)
+                 "mode":     Choice(instructions=..., criteria={...}),
+                 "degree":   Score(instructions=..., criteria=[...])}  # -> position
+answers = Abstraction().map(items)
+answers[0].p("abstract")     # 0.91, never a bool
+```
+
+**Why not a mode of Task.** Compiling a schema to questions throws away the reason to be there: `bool` → Noul → threshold at 0.5 → `bool` pays for a probability and stores a boolean. And the compile fails on the cases that gain most — a `list[Model]` field became tractable only because each item became a question KEY, which needs the item list at call time and is not in the schema. The reverse direction is total, so `as_task()` goes questions → Task and there is no route back.
+
+**Measured, 2026-09-17, 583 passages against a Sonnet reference.** Thresholding each answer at 0.5 and averaging booleans gave a half-century contrast of −0.111, CI [−0.276, +0.050]; averaging the probability gave −0.129, CI [−0.179, −0.081]. Same items, CI 3× tighter, and a discontinuity the booleans could not resolve. The quantization was the whole loss — hence no `bool` property and no implicit threshold anywhere. Best per-field cut ranged 0.24–0.59 while AUC stayed above 0.86: the ordering is good and the absolute placement is not.
+
+**jev accepts BPE fragments as complete words.** Measured on the malignment garment run (lacan seat, 479 candidates, 2026-09-18): 58 words jev placed in the worn set deepseek called NOT_A_WORD, 40 of them jev called GARMENT outright — `blaz`, `kimon`, `knick`, `legg`, `trou`, `underp`, `shir` — and **zero went the other way**. A truncated token sitting in a frame reads to the model as the completed word. Any gate distinguishing words from fragments needs `"judge the string EXACTLY as given; do not complete or expand it"` in its `focus`, and a two-coder veto (or a plain string check in code) is more reliable than either model alone. On words both arms accept, the two coders' scale agreement runs 0.75–0.91.
+
+**The API accepts no decoder parameters at all** — no temperature, top_p, penalties or seed — so `_SAMPLING_SUPPORT["typesafe"]` is `_REJECTS` for every one and `effective_temperature` returns None. Consequence for methods: a Survey *cannot* be temperature-pinned, so replicates (`sample=i`) are the only handle on the model's own variance, and identical output across two runs demonstrates caching. `results_history` reads versions back after `force=True`.
+
+**No cache tier.** Every input token bills fresh at $0.042/MTok, output free (console, 2026-09-17 — not a published rate card). `cached: null` in the pricing table is what makes that correct; the cache-floor padding economics of the Anthropic path are actively wrong here.
+
+**An unanswered question is a retryable defect, not a result.** A response omitting questions used to parse, stash, and report success — and because the stash is the artifact, the gap was then served as complete on every later read, free, forever, undiscoverable by rerunning because rerunning hit the cache. Now it raises `IncompleteAnswers`, is retried, and the partial body is not stashed; the error row names the missing ids. Whole-call retry, not subset re-asking: a subset would be answer-equivalent (questions are scored independently) but produces a second administration, and a derived column computed across two of them — a gate from one, scores from the other — is a quantity no response ever had.
+
+**Both arms of a crossing must see one item.** `state_text()` is the single renderer, so `key["state"]` is byte-identical to `as_task_prompts()` output and a cross-arm check is string equality over stash keys — a route that does not depend on either arm reporting it saw the right thing.
+
+**Instrument identity** is the canonical question set as administered bytes, in the key, exactly as `system_prompt` is on the extract path. Order is administered: reordering Score levels renumbers every answer. The question types are ours rather than the SDK's so an SDK release cannot re-key a corpus. Per-item question sets are supported; there is then no static instrument and `instrument_sha256()` refuses rather than fabricating, as `SequentialTask` does. `administration_record()` carries `package_version`, because the question digest cannot see a change to gating, retry or parsing.
+
+**Not stable:** unmerged, no CLI verb, no batch transport, >68 questions per call untested, concurrency unexercised (every test runs `num_workers=1`), and no fixture pins the wire shape against a real response.
+
 ## Provider drift — the recurring bug class
 
 Every provider bug this package has shipped has the same shape: **the code is

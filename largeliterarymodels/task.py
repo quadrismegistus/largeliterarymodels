@@ -538,7 +538,8 @@ class Task(_Administered):
         — "you returned only the value of the X field" — is reachable by
         hand exactly as it is by API.
         """
-        return _retry_prompt(item, partial_field, validation_error)
+        return _retry_prompt(item, partial_field, validation_error,
+                             _unwrap_schema(self.schema)[0])
 
     @property
     def results(self):

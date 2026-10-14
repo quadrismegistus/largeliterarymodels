@@ -180,3 +180,109 @@ class TestRetryLoopUsesIt:
         out = llm.extract("p", Groups, retries=1,
                           validation_context={"group_a": ["strangle"]})
         assert out.words_b == ["kiss"], "the warm row failed the rule and recomputed"
+
+
+class Setting(BaseModel):
+    """The oh-james shape: a list schema whose items are checked against the
+    source text, so one bad item rejects an otherwise good 40-item answer."""
+    place: str
+    quote: str
+
+    @model_validator(mode="after")
+    def _quote_in_source(self, info):
+        source = (info.context or {}).get("source", "")
+        if self.quote not in source:
+            raise ValueError(f"the quote {self.quote!r} is not in the source")
+        return self
+
+
+class TestListSchemaRetry:
+    """A stateless retry plus an item-level complaint closing on "return the
+    corrected object" was answered with the fixed item alone, which validated
+    and replaced the whole list (oh-james seat, 2026-10: 40 settings -> 1 on
+    two of three films, deepseek-v4-pro, no error)."""
+
+    SOURCE = {"source": "under the parachutes; at the bank; in the vault"}
+    FULL_BAD = ('[{"place": "a", "quote": "under the parachutes"},'
+                ' {"place": "b", "quote": "NOT THERE"},'
+                ' {"place": "c", "quote": "in the vault"},'
+                ' {"place": "d", "quote": "at the bank"}]')
+    ONLY_FIXED = '[{"place": "b", "quote": "at the bank"}]'
+
+    def test_the_rejection_names_the_failing_items_index(self):
+        import json
+        with pytest.raises(ValidationError) as ei:
+            _validate_parsed(json.loads(self.FULL_BAD), list[Setting],
+                             self.SOURCE)
+        assert [e["loc"][0] for e in ei.value.errors()] == [1]
+
+    def test_every_failing_item_is_reported_not_just_the_first(self):
+        with pytest.raises(ValidationError) as ei:
+            _validate_parsed([{"place": "a", "quote": "x"},
+                              {"place": "b", "quote": "y"}],
+                             list[Setting], self.SOURCE)
+        assert [e["loc"][0] for e in ei.value.errors()] == [0, 1]
+
+    def test_the_list_complaint_asks_for_the_complete_array(self):
+        c = _retry_complaint(validation_error="1\n  bad quote", is_list=True)
+        assert "COMPLETE array" in c and "every item" in c
+        assert "corrected object" not in c
+        assert "do not reformat" in c
+
+    def test_the_object_complaint_is_unchanged(self):
+        c = _retry_complaint(validation_error="bad")
+        assert c.endswith("return the corrected object.")
+        assert "COMPLETE" not in c
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_extract_sends_the_list_complaint(self, call):
+        call.side_effect = [self.FULL_BAD, self.ONLY_FIXED]
+        _llm().extract("p", list[Setting], retries=1,
+                       validation_context=self.SOURCE)
+        second = call.call_args_list[1].kwargs["prompt"]
+        assert "COMPLETE array" in second
+        assert "list[Setting]\n1\n" in second, "the index reaches the model"
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_imap_sends_the_list_complaint(self, call):
+        call.side_effect = [self.FULL_BAD, self.ONLY_FIXED]
+        _llm().extract_map(["p"], list[Setting], num_workers=1, retries=1,
+                           validation_context_list=[self.SOURCE])
+        assert "COMPLETE array" in call.call_args_list[1].kwargs["prompt"]
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_a_collapsed_retry_is_announced(self, call, caplog):
+        # Accepted, not rejected: dropping the bad item can be a legitimate
+        # fix. But 4 -> 1 must leave a trace beyond a row count.
+        call.side_effect = [self.FULL_BAD, self.ONLY_FIXED]
+        out = _llm().extract("p", list[Setting], retries=1,
+                             validation_context=self.SOURCE)
+        assert len(out) == 1
+        assert "returned 1 item(s) where the rejected response had 4" \
+            in caplog.text
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_a_collapsed_imap_retry_is_announced(self, call, caplog):
+        call.side_effect = [self.FULL_BAD, self.ONLY_FIXED]
+        _llm().extract_map(["p"], list[Setting], num_workers=1, retries=1,
+                           validation_context_list=[self.SOURCE])
+        assert "rejected response had 4" in caplog.text
+
+    @patch("largeliterarymodels.llm._call_provider")
+    def test_a_complete_retry_is_not_announced(self, call, caplog):
+        call.side_effect = [self.FULL_BAD, self.FULL_BAD.replace(
+            "NOT THERE", "at the bank")]
+        out = _llm().extract("p", list[Setting], retries=1,
+                             validation_context=self.SOURCE)
+        assert len(out) == 4 and "rejected response had" not in caplog.text
+
+    def test_the_hand_path_says_the_same_thing(self):
+        from largeliterarymodels.task import Task
+
+        class T(Task):
+            schema = list[Setting]
+            system_prompt = "Extract settings."
+        T.name = "list_retry_parity"
+        assert T().retry_prompt("ITEM", None, "bad") == \
+            _retry_prompt("ITEM", None, "bad", is_list=True)
+        assert "COMPLETE array" in T().retry_prompt("ITEM", None, "bad")

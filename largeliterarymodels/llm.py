@@ -1,5 +1,6 @@
 """Core LLM class: unified interface for text generation with HashStash caching."""
 
+import functools
 import hashlib
 import json
 import logging
@@ -1077,7 +1078,8 @@ def _diagnose_partial_response(parsed, schema):
     return matches[0] if len(matches) == 1 else None
 
 
-def _retry_prompt(prompt, partial_field=None, validation_error=None):
+def _retry_prompt(prompt, partial_field=None, validation_error=None,
+                  is_list=False):
     """The reprompt sent after a response failed to parse/validate.
 
     One definition shared by extract, extract_imap, and Task.retry_prompt, so
@@ -1093,8 +1095,15 @@ def _retry_prompt(prompt, partial_field=None, validation_error=None):
             which is FALSE in that case, and a model told its format was
             wrong reformats instead of fixing the defect. Same principle as
             partial_field: a named defect beats a generic complaint.
+        is_list: The schema is ``list[Model]``. The retry is stateless — the
+            model never sees its rejected answer again — so a complaint about
+            one item, closing on "return the corrected object", is answered
+            with a one-element list holding the fixed item, which validates
+            and replaces the whole answer (oh-james seat, 2026-10: 40 Bond
+            settings became 1 on two of three films, silently).
     """
-    return f"{_retry_complaint(partial_field, validation_error)}\n\n{prompt}"
+    complaint = _retry_complaint(partial_field, validation_error, is_list)
+    return f"{complaint}\n\n{prompt}"
 
 
 #: Cap on a validation message quoted back to the model. Generous, because
@@ -1104,7 +1113,8 @@ def _retry_prompt(prompt, partial_field=None, validation_error=None):
 _MAX_VALIDATION_COMPLAINT = 2000
 
 
-def _retry_complaint(partial_field=None, validation_error=None):
+def _retry_complaint(partial_field=None, validation_error=None,
+                     is_list=False):
     """The sentence a reprompt leads with. Also the repeat test's identity:
     two attempts are the same request iff they carry the same complaint."""
     if partial_field:
@@ -1118,6 +1128,20 @@ def _retry_complaint(partial_field=None, validation_error=None):
         if len(msg) > _MAX_VALIDATION_COMPLAINT:
             msg = (msg[:_MAX_VALIDATION_COMPLAINT]
                    + " …[truncated; more problems followed]")
+        if is_list:
+            # The numbers in the message above are item indices (see
+            # _validate_parsed). Without "COMPLETE", a complaint about one
+            # item is read as a request for that item alone.
+            return (
+                f"Your previous response was valid JSON but broke a rule of "
+                f"this task:\n\n{msg}\n\nThe format was fine — do not "
+                f"reformat. The leading number in each problem above is the "
+                f"position of the offending item in your array (0-based). "
+                f"Your previous response will not be shown to you again: "
+                f"return the COMPLETE array the task below calls for, every "
+                f"item, with that problem fixed — not only the item you "
+                f"corrected."
+            )
         return (
             f"Your previous response was valid JSON but broke a rule of this "
             f"task:\n\n{msg}\n\nThe format was fine — do not reformat. Fix "
@@ -1185,11 +1209,43 @@ def _validate_parsed(data, schema, context=None):
     if is_list:
         if not isinstance(data, list):
             data = [data]
-        return [item_schema.model_validate(
-                    _unwrap_envelopes(item, item_schema), context=context)
-                for item in data]
+        # Validated as one list rather than item by item, so a rejection
+        # carries the failing item's INDEX in its loc ("3.quote", or "3" from
+        # a model_validator) and reports every failing item, not the first.
+        # The reprompt quotes this message; without the index, the model
+        # cannot tell which of 40 items to fix.
+        return _list_adapter(item_schema).validate_python(
+            [_unwrap_envelopes(item, item_schema) for item in data],
+            context=context)
     else:
         return item_schema.model_validate(data, context=context)
+
+
+@functools.lru_cache(maxsize=None)
+def _list_adapter(item_schema):
+    from pydantic import ConfigDict, TypeAdapter
+    # Titled, or the message the model is shown opens with pydantic's
+    # internal "list[function-after[_validator(), Model]]".
+    return TypeAdapter(list[item_schema],
+                       config=ConfigDict(title=_schema_name(list[item_schema])))
+
+
+def _warn_if_list_collapsed(rejected_n, result, s_name, model, where):
+    """Announce a retry whose accepted list is far shorter than the rejected one.
+
+    Not a rejection: dropping the offending item can be a legitimate fix, and
+    a stateless retry regenerates the list rather than editing it, so its
+    length varies anyway. But 40 -> 1 is the signature of a model that took
+    an item-level complaint as a request for that item alone, and before
+    this it passed with no trace but a row count.
+    """
+    if rejected_n and isinstance(result, list) and len(result) * 2 < rejected_n:
+        log.warning(
+            "%s: retry for %s (model=%s) returned %d item(s) where the "
+            "rejected response had %d — accepted, but check whether the "
+            "model returned only the item it was told to fix",
+            where, s_name, model, len(result), rejected_n,
+        )
 
 
 def _unwrap_envelopes(data, item_schema):
@@ -1484,6 +1540,8 @@ class LLM:
         partial_field = None
         last_complaint = None
         validation_error = None
+        is_list = _unwrap_schema(schema)[0]
+        rejected_n = None
         for attempt in range(1 + retries):
             attempts += 1
             if attempt == 0:
@@ -1496,7 +1554,7 @@ class LLM:
                 )
                 call_system = full_system
                 call_prompt = _retry_prompt(
-                    user_prompt, partial_field, validation_error)
+                    user_prompt, partial_field, validation_error, is_list)
 
             # Provider call inside the try so transient network/API errors
             # consume a retry instead of aborting (parity with extract_imap).
@@ -1523,12 +1581,18 @@ class LLM:
                 )
                 parsed = _parse_json_response(raw)
                 result = _validate_parsed(parsed, schema, ctx)
+                _warn_if_list_collapsed(rejected_n, result, s_name,
+                                        self.model, "extract")
                 self.stash[key] = raw
                 return result
             except Exception as e:
                 partial_field = _diagnose_partial_response(parsed, schema)
                 validation_error = e if parsed is not None else None
-                complaint = _retry_complaint(partial_field, validation_error)
+                rejected_n = (len(parsed) if validation_error is not None
+                              and is_list and isinstance(parsed, list)
+                              else None)
+                complaint = _retry_complaint(partial_field, validation_error,
+                                             is_list)
                 # The repeat test is COMPLAINT identity, not error
                 # identity. "A further attempt cannot succeed" holds only
                 # if we would send the same request again; once the
@@ -1927,6 +1991,8 @@ class LLM:
                     _record_item_usage(per_item_usage, i, usage)
             return sink
 
+        is_list = _unwrap_schema(schema)[0]
+
         def _do_one(item):
             i, prompt, key, images = item
             last_error = None
@@ -1937,6 +2003,7 @@ class LLM:
             partial_field = None
             last_complaint = None
             validation_error = None
+            rejected_n = None
             call_kwargs = dict(kwargs)
             call_kwargs["usage_sink"] = _item_sink(i)
             for attempt in range(1 + retries):
@@ -1950,7 +2017,7 @@ class LLM:
                         attempt, retries, i, self.model, last_error,
                     )
                     call_prompt = _retry_prompt(
-                        prompt, partial_field, validation_error)
+                        prompt, partial_field, validation_error, is_list)
                 attempts += 1
                 breaker.record_attempt()
                 # `parsed` is re-bound every attempt (see extract): a stale
@@ -1975,6 +2042,8 @@ class LLM:
                     )
                     parsed = _parse_json_response(raw)
                     result = _validate_parsed(parsed, schema, ctx)
+                    _warn_if_list_collapsed(rejected_n, result, s_name,
+                                            self.model, f"extract_imap[{i}]")
                     self.stash[key] = raw
                     breaker.record_success()
                     return i, result
@@ -1984,7 +2053,11 @@ class LLM:
                     # about JSON that actually parsed fine.
                     partial_field = _diagnose_partial_response(parsed, schema)
                     validation_error = e if parsed is not None else None
-                    complaint = _retry_complaint(partial_field, validation_error)
+                    rejected_n = (len(parsed) if validation_error is not None
+                                  and is_list and isinstance(parsed, list)
+                                  else None)
+                    complaint = _retry_complaint(partial_field,
+                                                 validation_error, is_list)
                     # The repeat test is COMPLAINT identity, not error
                     # identity. "A further attempt cannot succeed" holds only
                     # if we would send the same request again; once the

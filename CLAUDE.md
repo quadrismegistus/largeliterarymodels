@@ -132,6 +132,8 @@ carries the complaint, attempt 3 would be byte-identical and cannot differ at
 temperature 0, so the loop stops. Raise `retries` if one shot is not enough,
 but see it fail *with the named complaint in hand* first.
 
+**On a `list[Model]` schema, one bad item rejects the whole list, and the retry is stateless.** The model never sees its rejected answer again, so a complaint about one item that ends "return the corrected object" was answered with that one item alone. It validated and replaced the whole answer: 40 Bond settings became 1 on two of three films, with no error (oh-james seat, deepseek-v4-pro, 2026-10). Lists are now validated as a single list, so the quoted error carries each failing item's index and reports every failing item. The list complaint asks for the COMPLETE array. A retry whose accepted list is under half the rejected one's length logs a WARNING. It is not rejected, because dropping the bad item can be a legitimate fix. Wrapping the list in an object schema (`items: list[Model]`) also worked in the field.
+
 `Survey.validate(item, answers)` is the same idea on the Survey path, where
 there is no schema to hang a validator on.
 

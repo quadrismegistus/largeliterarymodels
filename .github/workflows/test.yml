@@ -39,7 +39,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,analysis,annotate]"
 
       - name: Run tests with coverage
         run: pytest tests/ -v --cov=largeliterarymodels --cov-report=xml

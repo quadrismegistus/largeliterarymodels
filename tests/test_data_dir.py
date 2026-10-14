@@ -74,7 +74,16 @@ def test_every_persistent_store_derives_from_one_root():
     data_root = os.path.dirname(L.STASH_PATH)
     assert B.LEDGER_DIR == os.path.join(data_root, "batch_ledger")
     assert R._default_root() == os.path.join(data_root, "raw_responses")
+    # Behavioural rather than a source grep: the writer moved from task.py
+    # down to llm.py (so the LLM path could keep receipts too) and a
+    # grep-shaped pin passes or fails on where the code LIVES rather than on
+    # where the file lands. Ask it where it writes.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        stash = os.path.join(tmp, "stash")
+        path = L.append_usage_log("probe", "m", {}, stash_path=stash)
+    assert path == os.path.join(tmp, "usage_logs", "probe.jsonl")
+    # And the default, with no stash_path passed, is STASH_PATH's sibling.
     import inspect
-    task_src = inspect.getsource(
-        __import__("largeliterarymodels.task", fromlist=["task"]))
-    assert 'os.path.dirname(STASH_PATH), "usage_logs"' in task_src
+    src = inspect.getsource(L.append_usage_log)
+    assert 'os.path.dirname(' in src and '"usage_logs"' in src

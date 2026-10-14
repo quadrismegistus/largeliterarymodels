@@ -57,6 +57,16 @@ _LAZY_IMPORTS = {
 
     'OCRCleanTask': ('.clean_ocr', 'OCRCleanTask'),
 
+    'ProppTask': ('.classify_propp', 'ProppTask'),
+    'ProppAnnotation': ('.classify_propp', 'ProppAnnotation'),
+    'ProppFunctionInstance': ('.classify_propp', 'ProppFunctionInstance'),
+    'PROPP_FUNCTIONS': ('.classify_propp', 'PROPP_FUNCTIONS'),
+    'FUNCTION_VOCAB': ('.classify_propp', 'FUNCTION_VOCAB'),
+    'prepare_tale_text': ('.classify_propp', 'prepare_tale_text'),
+    'locate_spans': ('.classify_propp', 'locate_spans'),
+    'consensus': ('.classify_propp', 'consensus'),
+    'span_report': ('.classify_propp', 'span_report'),
+
     'PlotGenreTask': ('.classify_plot_genre', 'PlotGenreTask'),
     'PlotGenreAnnotation': ('.classify_plot_genre', 'PlotGenreAnnotation'),
 
@@ -102,6 +112,21 @@ _LAZY_IMPORTS = {
     'prepare_alignment_text': ('.score_alignment_asymmetry', 'prepare_alignment_text'),
     # Deprecated alias
     'prepare_text': ('.score_alignment_asymmetry', 'prepare_text'),
+
+    'JudgeTask': ('.classify_alignment_transformation', 'JudgeTask'),
+    'JudgeTaskA': ('.classify_alignment_transformation', 'JudgeTaskA'),
+    'JudgeTaskB': ('.classify_alignment_transformation', 'JudgeTaskB'),
+    'JudgeTaskC': ('.classify_alignment_transformation', 'JudgeTaskC'),
+    'JudgeLabel': ('.classify_alignment_transformation', 'JudgeLabel'),
+    'JudgeLabelA': ('.classify_alignment_transformation', 'JudgeLabelA'),
+    'JudgeLabelB': ('.classify_alignment_transformation', 'JudgeLabelB'),
+    'JudgeLabelC': ('.classify_alignment_transformation', 'JudgeLabelC'),
+    'TransformationLabel': ('.classify_alignment_transformation', 'TransformationLabel'),
+    'THEORY_MAP': ('.classify_alignment_transformation', 'THEORY_MAP'),
+    'format_judge_input': ('.classify_alignment_transformation', 'format_judge_input'),
+    'format_manifest_record': ('.classify_alignment_transformation', 'format_manifest_record'),
+    'load_manifest': ('.classify_alignment_transformation', 'load_manifest'),
+    'detect_moralization': ('.classify_alignment_transformation', 'detect_moralization'),
 
     'ContradictionResponseTask': ('.classify_contradiction_response', 'ContradictionResponseTask'),
     'ContradictionAnnotation': ('.classify_contradiction_response', 'ContradictionAnnotation'),

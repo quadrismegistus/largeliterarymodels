@@ -5,41 +5,19 @@ import json
 import logging
 import os
 from hashstash import HashStash
+from .administered import _Administered, _merge_per_item
 from .llm import (
     LLM, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, STASH_PATH,
-    UsageTracker, _build_extract_prompt, _diagnose_partial_response,
-    _parse_json_response, _retry_prompt, _validate_parsed, _unwrap_schema,
+    _build_extract_prompt, _diagnose_partial_response, _parse_json_response,
+    _retry_prompt, _validate_parsed, _unwrap_schema,
 )
 
 log = logging.getLogger(__name__)
 
 
-def _merge_per_item(dst, src_items):
-    """Accumulate batch-local per-item rows into a caller's dict.
-
-    Preserves the documented accumulation semantics of a reused
-    per_item_usage dict while letting the usage_log collect into a fresh
-    one — the direct-write arrangement double-counted: batch 2's receipt
-    carried batch 1's tokens.
-    """
-    for i, entry in src_items.items():
-        row = dst.setdefault(i, {
-            "index": i, "calls": 0, "input_tokens": 0,
-            "output_tokens": 0, "cache_read_tokens": 0,
-            "cache_write_tokens": 0, "reasoning_tokens": 0,
-            "response_model": None,
-        })
-        for k in ("calls", "input_tokens", "output_tokens",
-                  "cache_read_tokens", "cache_write_tokens",
-                  "reasoning_tokens"):
-            row[k] = row.get(k, 0) + entry.get(k, 0)
-        if entry.get("response_model"):
-            row["response_model"] = entry["response_model"]
-        if "duplicate_of" in entry:
-            row["duplicate_of"] = entry["duplicate_of"]
 
 
-class Task:
+class Task(_Administered):
     """A reusable structured extraction task.
 
     Bundles together a Pydantic schema, system prompt, few-shot examples,
@@ -84,59 +62,16 @@ class Task:
     retries = 1
     temperature = DEFAULT_TEMPERATURE
     max_tokens = DEFAULT_MAX_TOKENS
-    # Prompt-cache lifetime for the instrument: None = 5-minute default,
-    # "1h" for long or resumed runs. The 1-hour write costs 2x base input vs
-    # 1.25x, so it pays back only across three or more reads — and a "1h"
-    # request reads an already-warm 5-minute entry instead of upgrading it,
-    # so set this before a run rather than partway through.
-    cache_ttl = None
-    # Opt-in durable usage receipts. The stash stores only the response
-    # text, so token counts — and with them any post-hoc price estimate —
-    # die with the process. usage_log=True appends one JSONL record per
-    # map() batch (run report + per-item rows: tokens, reasoning,
-    # response_model) to data/usage_logs/<task_name>.jsonl. Additive: no
-    # stash value or key is touched, old entries simply have no log rows.
-    usage_log = False
-    # Opt-in raw-response sidecar (rawlog.RawLog). The stash stores only
-    # the answer text and the receipts only the fields the normalizers
-    # knew to extract — raw_log=True keeps the provider's serialized body,
-    # whole, in data/raw_responses under the SAME key as the annotation
-    # (True for the default root; a path or RawLog instance to relocate).
-    # Additive: off constructs no sink and touches no write path.
-    raw_log = False
+    # Decoder parameters beyond temperature, e.g. {"top_p": 0.9}. Part of
+    # the administration and therefore part of the cache key, flat, one
+    # field per parameter, and absent from the key when unset — so a task
+    # that pins nothing keys exactly as it did before this existed. Pinning
+    # one on a model family nobody has measured raises rather than guessing;
+    # see providers.effective_sampling for why neither guess is safe.
+    sampling = None
 
-    # Attributes settable via __init__ kwargs even when the class doesn't
-    # declare them (subclasses commonly set `model` as a class attribute,
-    # but the base class leaves it to _get_llm's DEFAULT_MODEL fallback).
-    _DYNAMIC_ATTRS = {'model'}
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if not hasattr(type(self), k) and k not in self._DYNAMIC_ATTRS:
-                import warnings
-                warnings.warn(
-                    f"{type(self).__name__}({k}=...): unknown attribute — "
-                    f"possible typo? Known: name, schema, system_prompt, "
-                    f"examples, retries, temperature, max_tokens, model.",
-                    stacklevel=2,
-                )
-            setattr(self, k, v)
-        self._stash = None
-        self._human_stashes = {}
-        self._usage = None
-        self._raw_log = None
-
-    @property
-    def task_name(self):
-        return self.name or self.__class__.__name__
-
-    @property
-    def stash(self):
-        if self._stash is None:
-            stash_dir = os.path.join(STASH_PATH, self.task_name)
-            self._stash = HashStash(stash_dir, engine="pairtree", append_mode=True)
-        return self._stash
-
+    _KNOWN_ATTRS_HINT = ("name, schema, system_prompt, examples, retries, "
+                         "temperature, max_tokens, sampling, model")
     def human_stash(self, annotator: str = 'default'):
         """JSONL-backed stash for human annotations by this annotator.
 
@@ -166,25 +101,6 @@ class Task:
             )
         return self._human_stashes[annotator]
 
-    @property
-    def usage(self):
-        """Token usage accumulated across this task's calls.
-
-        A receipt rather than an assumption: a run whose prompt cache silently
-        stopped working produces identical output at roughly ten times the
-        input price, and thinking tokens bill as output. Read after a run:
-
-            results = task.map(prompts)
-            print(task.usage.summary_line())
-            task.usage.report()['cache_hit_rate']
-
-        Counts only live provider calls — cache hits from the local stash never
-        reach a provider, so a fully-cached run reports zero.
-        """
-        if self._usage is None:
-            self._usage = UsageTracker()
-        return self._usage
-
     def _get_llm(self, model=None):
         """Get an LLM instance using this task's stash."""
         return LLM(
@@ -197,45 +113,15 @@ class Task:
             # accumulate across run/map calls instead of resetting per call.
             usage=self.usage,
             raw_log=self._resolved_raw_log(),
+            sampling=self.sampling,
         )
 
-    def _resolved_raw_log(self):
-        """Resolve raw_log once per Task, so every LLM this task builds
-        shares one sidecar handle instead of re-opening the store."""
-        if self._raw_log is None and self.raw_log:
-            from .rawlog import RawLog
-            self._raw_log = RawLog.resolve(self.raw_log)
-        return self._raw_log
-
-    @property
-    def raw_sidecar(self):
-        """The resolved RawLog store, or None when the sidecar is off.
-
-        The public accessor: `task.raw_log` is the *configuration*
-        (bool/path/RawLog) and has no methods when set with True —
-        `task.raw_sidecar.certify(...)` is the object call sites want.
-        """
-        return self._resolved_raw_log()
-
-    def certify_raw(self, keys=None, since=None):
-        """Certify sidecar coverage against this task's OWN annotation
-        stash — the independent record certify() requires. Passing keys
-        derived from the sidecar itself is the tautology its docstring
-        warns about; this method makes the correct call the easy one by
-        sourcing the denominator from the annotation store.
-
-        keys: iterable of annotation keys to scope to (default: every
-        key in this task's stash — fine for a task-sized claim, too
-        broad for a run-sized one; pass the run's keys for that).
-        """
-        sidecar = self._resolved_raw_log()
-        if sidecar is None:
-            raise ValueError(
-                f"Task {self.task_name!r} has no raw-response sidecar "
-                f"(raw_log is falsy) — nothing to certify.")
-        if keys is None:
-            keys = list(self.stash.keys())
-        return sidecar.certify(keys, since=since)
+    # Delimiters for the hand/second-coder path (render_instrument). Class
+    # attributes so a task whose items legitimately contain them can move
+    # them rather than being unable to render.
+    ITEM_HEADER = "=== ITEM TO ANNOTATE ==="
+    ITEM_FOOTER = "=== END ITEM ==="
+    CONTRACT_REMINDER = "Respond with ONLY the JSON described above."
 
     def run(self, prompt, model=None, system_prompt=None, examples=None,
             images=None, metadata=None, force=False, **kwargs):
@@ -271,6 +157,7 @@ class Task:
 
     def _imap_kwargs(self, system_prompt=None, examples=None,
                      images_list=None, metadata_list=None,
+                     validation_context_list=None,
                      num_workers=4, force=False, verbose=False,
                      errors=None, per_item_usage=None, **kwargs):
         """Build kwargs for extract_imap/extract_map."""
@@ -280,6 +167,7 @@ class Task:
             examples=examples if examples is not None else self.examples,
             images_list=images_list,
             metadata_list=metadata_list,
+            validation_context_list=validation_context_list,
             num_workers=num_workers,
             retries=self.retries,
             force=force,
@@ -291,6 +179,7 @@ class Task:
 
     def imap(self, prompts, model=None, system_prompt=None, examples=None,
              images_list=None, metadata_list=None,
+             validation_context_list=None,
              num_workers=4, force=False, verbose=False, errors=None,
              per_item_usage=None, **kwargs):
         """Extract structured data, yielding (index, result) as each completes.
@@ -310,6 +199,7 @@ class Task:
             yield from llm.extract_imap(
                 prompts=prompts,
                 **self._imap_kwargs(system_prompt=system_prompt,
+                                    validation_context_list=validation_context_list,
                                     examples=examples,
                                     images_list=images_list,
                                     metadata_list=metadata_list,
@@ -319,17 +209,17 @@ class Task:
             )
             return
         # usage_log covers imap too — it is the resumable long-run path,
-        # which is exactly where a durable receipt matters most. Same
-        # fresh-dict-then-merge shape as map(); the receipt lands in the
-        # finally so a consumer that stops iterating early still gets one
-        # for the calls that were made.
+        # which is exactly where a durable receipt matters most. The
+        # fresh-dict-then-merge shape, and the finally that writes a receipt
+        # even when the consumer stops iterating early, are shared with
+        # Survey; both live in _Administered._with_usage_log.
         prompts = list(prompts)
-        log_items = {}
-        log_errors = errors if errors is not None else {}
-        try:
+
+        def _run(log_errors, log_items):
             yield from llm.extract_imap(
                 prompts=prompts,
                 **self._imap_kwargs(system_prompt=system_prompt,
+                                    validation_context_list=validation_context_list,
                                     examples=examples,
                                     images_list=images_list,
                                     metadata_list=metadata_list,
@@ -337,18 +227,13 @@ class Task:
                                     verbose=verbose, errors=log_errors,
                                     per_item_usage=log_items, **kwargs),
             )
-        finally:
-            try:
-                self._append_usage_log(llm, log_items, metadata_list,
-                                       log_errors)
-            except Exception as e:  # noqa: BLE001
-                log.error("usage_log: failed to append receipt (%s: %s)",
-                          type(e).__name__, e)
-            if per_item_usage is not None:
-                _merge_per_item(per_item_usage, log_items)
+
+        yield from self._with_usage_log(llm, metadata_list, errors,
+                                        per_item_usage, _run)
 
     def map(self, prompts, model=None, system_prompt=None, examples=None,
             images_list=None, metadata_list=None,
+            validation_context_list=None,
             num_workers=4, force=False, verbose=False, errors=None,
             per_item_usage=None, batch=False, **kwargs):
         """Extract structured data from multiple inputs, with parallelism.
@@ -411,6 +296,7 @@ class Task:
             results = llm.extract_map(
                 prompts=prompts,
                 **self._imap_kwargs(system_prompt=system_prompt,
+                                    validation_context_list=validation_context_list,
                                     examples=examples,
                                     images_list=images_list,
                                     metadata_list=metadata_list,
@@ -432,78 +318,6 @@ class Task:
             if per_item_usage is not None:
                 _merge_per_item(per_item_usage, log_items)
         return results
-
-    def _append_usage_log(self, llm, per_item, metadata_list, errors=None):
-        """Append this batch's usage receipts as one JSONL record.
-
-        The stash stores only response text, so token counts (and any
-        post-hoc price estimate) are otherwise unrecoverable once the
-        process exits — Registration P's pricing worked only because that
-        producer kept its own artifact. One record per batch: timestamp,
-        model, the batch report, and per-item rows keyed by index with
-        metadata attached where given. Fully-cached batches log a report
-        of zeros — a receipt that nothing was billed is still a receipt.
-        """
-        import time
-
-        log_dir = os.path.join(os.path.dirname(STASH_PATH), "usage_logs")
-        os.makedirs(log_dir, exist_ok=True)
-        path = os.path.join(log_dir, f"{self.task_name}.jsonl")
-        items = []
-        for i, entry in sorted((per_item or {}).items()):
-            row = dict(entry)
-            if metadata_list and i < len(metadata_list) and metadata_list[i]:
-                row["metadata"] = metadata_list[i]
-            if errors and i in errors:
-                # Spend on an item that produced no annotation is still
-                # spend, but a per-annotation cost table must not read it
-                # as an annotation's price.
-                row["failed"] = True
-            items.append(row)
-        # Batch totals from the per-item rows, not the Task-lifetime
-        # tracker: a record claiming to describe THIS batch must not carry
-        # every previous batch's tokens inside it.
-        token_keys = ("calls", "input_tokens", "output_tokens",
-                      "cache_read_tokens", "cache_write_tokens",
-                      "reasoning_tokens")
-        batch = {k: sum(e.get(k, 0) for e in items) for k in token_keys}
-        served = {}
-        for e in items:
-            rm = e.get("response_model")
-            # Rows that made no call (de-duplicated twins) carry a copied
-            # response_model for provenance, but counting them made
-            # response_models sum to 3 beside calls: 2 in the same dict.
-            if rm and e.get("calls", 0) > 0:
-                served[rm] = served.get(rm, 0) + 1
-        batch["response_models"] = served
-        record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "task": self.task_name,
-            "model": llm.model,
-            "batch": batch,
-            "items": items,
-        }
-        with open(path, "a") as f:
-            f.write(json.dumps(record, default=str) + "\n")
-        log.info("usage_log: appended %d item rows to %s", len(items), path)
-
-    # ------------------------------------------------------------------
-    # Instrument serialisation
-    #
-    # An annotation scheme that only one code path can administer is not
-    # frozen, only committed: cross-provider replication, a subagent second
-    # coder, or a human on paper all require the instrument as text. These
-    # methods delegate to llm._build_extract_prompt — the same function the
-    # API path calls — so the rendered instrument cannot drift from the
-    # administered one. Do not re-render the parts here.
-    # ------------------------------------------------------------------
-
-    ITEM_HEADER = "=== ITEM TO ANNOTATE ==="
-    ITEM_FOOTER = "=== END ITEM ==="
-    # The one-line contract reminder appended after the item block. A class
-    # constant, not a literal in render_instrument, because instrument_sha256
-    # covers it: the digest must hash the same string the renderer emits.
-    CONTRACT_REMINDER = "Respond with ONLY the JSON described above."
 
     def _require_schema(self):
         if self.schema is None:
@@ -563,15 +377,52 @@ class Task:
         omits — what a methods note needs so "the same instrument" and "the
         same administration" stay distinct claims. Pin the model explicitly
         when the run overrides the task default.
+
+        Carries two things about decoder parameters that a cache key
+        deliberately does not. `sampling` is what this task pins.
+        `vendor_sampling_defaults` is what an UNPINNED field was measured to
+        run at — empty for most models, because for three of four vendors
+        that number is not knowable by any instrument we have, and empty
+        means unmeasured rather than 1.0. It is not in the key because a
+        vendor default can change under us and every old key would then be
+        asserting a number nobody re-measured; it is here because a methods
+        note that omits it is claiming less than it knows. The live case is
+        the Opus line at top_p=0.99 — an unpinned Opus corpus is a
+        nucleus-truncated corpus, and no vendor documentation says so.
         """
         import pydantic
+        from .providers import (effective_temperature,
+                                known_sampling_defaults,
+                                unavailable_sampling)
+        resolved = model or getattr(self, "model", None) or DEFAULT_MODEL
         return {
             "task": self.task_name,
             "schema": _schema_repr(self.schema),
             "instrument_sha256": self.instrument_sha256(),
-            "model": model or getattr(self, "model", None) or DEFAULT_MODEL,
+            "model": resolved,
+            # REQUESTED, which is not the same as applied. Sonnet 5,
+            # Opus 5/4.8/4.7, Fable and the claude-cli transport all take a
+            # temperature and do not use it, so a methods note written off
+            # `temperature` alone can say "administered at temperature 0" of
+            # a run that was never temperature-controlled.
             "temperature": self.temperature,
+            # What actually governed: None where the family rejects or
+            # ignores it. The two fields differ exactly where a claim would
+            # have been false, which is the only place a receipt earns its
+            # keep. Note the split WITHIN a vendor — haiku-4-5 honours a
+            # temperature that sonnet-5 and opus-5 discard — so "the
+            # Anthropic arm was temperature-pinned" can be true of one model
+            # and false of the next in the same corpus.
+            "temperature_effective": effective_temperature(
+                resolved, self.temperature),
             "max_tokens": self.max_tokens,
+            "sampling": dict(self.sampling) if self.sampling else None,
+            "vendor_sampling_defaults": known_sampling_defaults(resolved),
+            # Fields this model would not have let a caller pin anyway.
+            # A methods note about an unset field is stronger for saying
+            # "and it could not have been set", and silence here reads as
+            # "nobody tried" when the truth is "it was not available".
+            "sampling_unavailable": unavailable_sampling(resolved),
             "retries": self.retries,
             # The digest embeds model_json_schema() output, which can change
             # across pydantic versions with no change to the scheme — this
@@ -676,7 +527,8 @@ class Task:
             )
             return None
 
-    def retry_prompt(self, item, partial_field=None):
+    def retry_prompt(self, item, partial_field=None,
+                     validation_error=None):
         """The reprompt the API path uses after an invalid response.
 
         Administering the instrument by hand otherwise loses the retry half
@@ -686,7 +538,8 @@ class Task:
         — "you returned only the value of the X field" — is reachable by
         hand exactly as it is by API.
         """
-        return _retry_prompt(item, partial_field)
+        return _retry_prompt(item, partial_field, validation_error,
+                             _unwrap_schema(self.schema)[0])
 
     @property
     def results(self):

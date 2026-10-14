@@ -7,5 +7,7 @@ from .llm import (
     GEMINI_PRO, GEMINI_FLASH,
 )
 from .task import Task
+from .survey import Survey
+from .questions import Choice, Noul, Score
 from .providers import check_api_keys, set_api_keys
 from .utils import available_models, pdf_to_images

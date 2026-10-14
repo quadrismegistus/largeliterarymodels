@@ -88,9 +88,104 @@ carries both halves. Byte-identity holds for extract-path tasks only:
 refuse rather than fabricate, and the `claude-cli/` transport flattens the
 system prompt into the user turn.
 
+### Rejecting an answer the schema cannot reject
+
+A `model_validator(mode="after")` that raises IS a rejection hook: both retry
+loops catch it and re-ask. This worked for a long time and was undocumented,
+which is most of why it went unused (malign-logits seat, 2026-09-20).
+
+```python
+class Groups(BaseModel):
+    words_b: list[str]
+
+    @model_validator(mode="after")
+    def _only_group_b(self, info):
+        shown_in_a = (info.context or {}).get("group_a", ())
+        if bad := [w for w in self.words_b if w in shown_in_a]:
+            raise ValueError(f"the word {bad[0]} appears in words_b but was "
+                             f"shown in GROUP A")
+        return self
+
+task.map(prompts, validation_context_list=[{"group_a": a} for a in columns])
+```
+
+`validation_context` (extract/`run`) and `validation_context_list`
+(imap/map, parallel to `metadata_list`) reach `info.context`. Rules that
+depend on the ITEM rather than on the response — which column a word was
+shown in, what the source document contained — need it; nothing else can
+express them.
+
+**It never enters a cache key.** It governs whether an answer is ACCEPTED,
+not what was administered, and the item it derives from is already in the key
+as the prompt. **Warm hits re-validate under it**, so a cached answer the
+item's own rule rejects is recomputed rather than served — a cache hit looks
+like a pass, so without this the first run to cache a rejected row serves it
+free forever.
+
+**The reprompt names the defect.** Where the JSON parsed and a validator
+rejected it, the retry quotes the validation message and says the format was
+fine. The old generic complaint asserted the response "was not valid JSON",
+which is false in that case, and a model told its format is wrong reformats
+instead of fixing the defect. Consequence worth knowing: the informative
+attempt gets exactly one shot — attempt 1 is the plain prompt, attempt 2
+carries the complaint, attempt 3 would be byte-identical and cannot differ at
+temperature 0, so the loop stops. Raise `retries` if one shot is not enough,
+but see it fail *with the named complaint in hand* first.
+
+**On a `list[Model]` schema, one bad item rejects the whole list, and the retry is stateless.** The model never sees its rejected answer again, so a complaint about one item that ends "return the corrected object" was answered with that one item alone. It validated and replaced the whole answer: 40 Bond settings became 1 on two of three films, with no error (oh-james seat, deepseek-v4-pro, 2026-10). Lists are now validated as a single list, so the quoted error carries each failing item's index and reports every failing item. The list complaint asks for the COMPLETE array. A retry whose accepted list is under half the rejected one's length logs a WARNING. It is not rejected, because dropping the bad item can be a legitimate fix. Wrapping the list in an object schema (`items: list[Model]`) also worked in the field.
+
+`Survey.validate(item, answers)` is the same idea on the Survey path, where
+there is no schema to hang a validator on.
+
+
 Task catalog:
 - **Base tasks**: GenreTask, GenreTaskLite, FryeTask, CharacterTask, CharacterIntroTask, TranslationTask, BibliographyTask, OCRCleanTask
 - **Sequential tasks**: PassageContentTask, PassageFormTask, SocialNetworkTask
+
+## Survey — typed questions, for System One models (branch `survey-jev`)
+
+**Not merged yet.** A sibling of `Task`, not a mode of it. A Task sends a system prompt built from a Pydantic schema and parses text back; a `Survey` sends state plus a dict of typed questions and gets typed answers back, each carrying a probability.
+
+```python
+class Abstraction(Survey):
+    questions = {"abstract": Noul(instructions=...),          # -> P(true)
+                 "mode":     Choice(instructions=..., criteria={...}),
+                 "degree":   Score(instructions=..., criteria=[...])}  # -> position
+answers = Abstraction().map(items)
+answers[0].p("abstract")     # 0.91, never a bool
+```
+
+**Why not a mode of Task.** Compiling a schema to questions throws away the reason to be there: `bool` → Noul → threshold at 0.5 → `bool` pays for a probability and stores a boolean. And the compile fails on the cases that gain most — a `list[Model]` field became tractable only because each item became a question KEY, which needs the item list at call time and is not in the schema. The reverse direction is total, so `as_task()` goes questions → Task and there is no route back.
+
+**Measured, 2026-09-17, 583 passages against a Sonnet reference.** Thresholding each answer at 0.5 and averaging booleans gave a half-century contrast of −0.111, CI [−0.276, +0.050]; averaging the probability gave −0.129, CI [−0.179, −0.081]. Same items, CI 3× tighter, and a discontinuity the booleans could not resolve. The quantization was the whole loss — hence no `bool` property and no implicit threshold anywhere. Best per-field cut ranged 0.24–0.59 while AUC stayed above 0.86: the ordering is good and the absolute placement is not.
+
+**jev accepts BPE fragments as complete words, and deepseek does not.** A truncated token sitting in a frame reads to the model as the completed word: `blaz`, `kimon`, `knick`, `legg`, `trou`, `underp`, `shir` were all called GARMENT.
+
+What generalises is the **direction**: across 479 candidates every disagreement ran one way — jev placing in the worn set what deepseek would not — with **zero reverse cases** (lacan seat, malignment garment run, 2026-09-18). That asymmetry is the finding, and it is why a two-coder veto works here at all rather than being two opinions.
+
+**Count the disagreement, not one of its labels.** The same jev failure arrives under more than one of the other coder's categories: on that run 58 words went to `NOT_A_WORD` and a further 89 to `OTHER_NOUN`, one failure wearing two labels, 147 of 479. Tallying a single category undercounted it by more than half. Treat this as a lint rather than a note about one entry: **anywhere a two-coder gate reports its own disagreement rate, check whether the denominator is admission or a category.** The same undercount was found independently in the producer's own source comment, beside the code computing the veto.
+
+What does NOT generalise is the rate. Those counts are facts about a candidate list drawn from one slot's moving vocabulary, whose fragment base rate is a property of that list; another corpus has a different base rate and therefore a different error rate. Same rule this file applies to model generations, pointed at item sets: do not carry a magnitude across the boundary it was measured inside. The 0.75–0.91 inter-coder scale agreement on accepted words is list-specific in the same way.
+
+**What the veto COSTS is not measured.** A veto discards every word the two coders disagree about, not only the fragments — on a corpus with a low fragment base rate that is a selection on inter-coder agreement, and the surviving set is biased toward easy items. Whether that bias is material is untested and could not be tested here: this list contains no stratum of clean, gradable words the two coders merely disagree about, so there was nothing to measure the cost against. The list that makes the veto obviously worth it is the same list that makes its cost unmeasurable. Carry this as an open question, not as a cheap price.
+
+Pricing it is its own experiment, not an appendix to a run: a corpus with a deliberately low fragment rate and a stratum of well-formed but genuinely ambiguous items, scored veto-in against veto-out on a criterion external to **both coders and to the item selection** — external to the selection too, or the ambiguous stratum is chosen by the same judgement that later scores it.
+
+The mitigation does generalise. A gate distinguishing words from fragments needs `"judge the string EXACTLY as given; do not complete or expand it"` in its `focus`, and a two-coder veto — or, for fragment-vs-word specifically, a plain string check in code — is more reliable than either model alone.
+
+**The API accepts no decoder parameters at all** — no temperature, top_p, penalties or seed — so `_SAMPLING_SUPPORT["typesafe"]` is `_REJECTS` for every one and `effective_temperature` returns None. Consequence for methods: a Survey *cannot* be temperature-pinned, so replicates (`sample=i`) are the only handle on the model's own variance, and identical output across two runs demonstrates caching. `results_history` reads versions back after `force=True`.
+
+**No cache tier.** Every input token bills fresh at $0.042/MTok, output free (console, 2026-09-17 — not a published rate card). `cached: null` in the pricing table is what makes that correct; the cache-floor padding economics of the Anthropic path are actively wrong here.
+
+**An unanswered question is a retryable defect, not a result.** A response omitting questions used to parse, stash, and report success — and because the stash is the artifact, the gap was then served as complete on every later read, free, forever, undiscoverable by rerunning because rerunning hit the cache. Now it raises `IncompleteAnswers`, is retried, and the partial body is not stashed; the error row names the missing ids. Whole-call retry, not subset re-asking: a subset would be answer-equivalent (questions are scored independently) but produces a second administration, and a derived column computed across two of them — a gate from one, scores from the other — is a quantity no response ever had.
+
+**Both arms of a crossing must see one item.** `state_text()` is the single renderer, so `key["state"]` is byte-identical to `as_task_prompts()` output and a cross-arm check is string equality over stash keys — a route that does not depend on either arm reporting it saw the right thing.
+
+**Instrument identity** is the canonical question set as administered bytes, in the key, exactly as `system_prompt` is on the extract path. Order is administered: reordering Score levels renumbers every answer. The question types are ours rather than the SDK's so an SDK release cannot re-key a corpus. Per-item question sets are supported; there is then no static instrument and `instrument_sha256()` refuses rather than fabricating, as `SequentialTask` does. `administration_record()` carries `package_version`, because the question digest cannot see a change to gating, retry or parsing.
+
+**`validate(item, answers)`** is a caller-defined check that runs INSIDE the retry loop. A check that runs after `map` returns can only discard — the administration is over and the body is cached, so the item is lost rather than retried; the same check here costs a call and keeps the item. Return None to accept or a non-empty string saying what is wrong; anything else raises, because `return False` for "bad" is falsy and would silently accept. Rejected bodies are not stashed. Thread safety is the overrider's: it is called concurrently from worker threads and is handed everything it needs as arguments for that reason — there is no single "current item" at 32 workers, so ambient per-call state is the wrong shape.
+
+**Not stable:** unmerged, no CLI verb, no batch transport, >68 questions per call untested. `tests/fixtures/typesafe_system_one_response.json` is a recorded live response and the only thing in the suite that would notice the API changing its envelope — but it is a recording, not a contract: re-record it when the parser is touched, and expect it to be stale rather than trusting it to be current.
 
 ## Provider drift — the recurring bug class
 
@@ -126,6 +221,104 @@ WARNs, because it cannot break a parse by construction. Exit 1 on any FAIL
 clean bill. Providers also log the server-resolved model id once per run;
 record *that* (or `per_item_usage[i]['response_model']`) as the model of
 record.
+
+## Seam defects — the other recurring bug class
+
+Provider drift is code correct about one model generation and wrong about the
+current one. The second class is code correct about the part it was added to
+and wrong about the part it meets.
+
+Two seats counted independently over one work period (2026-09, largeliterarymodels
+and malign-logits): **four of the last five defects each were at a seam
+between something new and something already there, none inside either.**
+Examples from this repo's own history, all found by review rather than by
+tests: `state_text()` against `_prepare()` (two renderers of one state, so a
+cross-arm check could not be string equality); `validate()` against `_Breaker`
+(a caller's rule tripping an abort that blamed the model); `run()` against
+`imap()` (one numbered its sidecar attempts, the other did not); the
+completeness gate against the stash write (a partial body cached and then
+served as complete, free, forever); `extract_map` accepting
+`validation_context_list` and dropping it in its delegation — committed while
+implementing the very feature the passthrough-asymmetry section is about.
+
+Why tests miss it: a test is written alongside the part it tests, so it
+exercises the part and not the join. Both sides pass in isolation and the
+suite is green.
+
+The habit that catches it: when adding a part, name every existing part it
+touches and write one test per JOIN rather than per part. Ask specifically —
+does the new failure reach the retry loop, the breaker, the cache write, the
+sidecar, the error row, and the receipt, and does each of them attribute it
+correctly? Each of those is a place where a new kind of failure can be
+counted as an old kind.
+
+
+## Decoder parameters — top_p and its neighbours
+
+`top_p` was not a parameter of this package until 2026-08, and the absence was not neutrality. `**kwargs` reached `call_deepseek` and were forwarded verbatim; `call_anthropic`, `call_openai`, `call_google` and `call_local` each declared `**kwargs` and silently discarded them. **A caller who "pinned" `top_p` across four vendors pinned exactly one**, with no error, no warning, and byte-identical cache keys either way — a per-vendor covariate manufactured by our own passthrough asymmetry (lacan seat, after 6,600 passages across four vendors ran unpinned on a surprisal axis that nucleus truncation moves).
+
+```python
+task = MyTask(sampling={"top_p": 0.9})          # or LLM(..., sampling={...})
+llm.extract(text, Schema, sampling={"top_p": 0.9})
+```
+
+One door (`sampling=`), not five keyword arguments — and a bare `top_p=` kwarg now **raises** on every route, because that spelling either vanishes or is sent without entering the key.
+
+**The key records what governed the call and omits the field when nothing was sent.** A value present in a key means that value governed; absent means unpinned — the vendor chose, and which value it chose that day is a fact the key cannot carry and must not pretend to. Written flat, one field per parameter (`top_p: 0.9`, not a nested blob), so "which fields were pinned" is readable off the key itself, which is the claim a methods note has to make. Every pre-2026-08 key is byte-stable, and adding a sixth parameter later orphans nothing.
+
+**Pinning on an unmeasured family raises `SamplingUnmeasured`.** Neither guess is safe: assume it governs and the key carries a pin that may never have applied (the false claim `effective_temperature` exists to prevent); assume it does not and two differently-sampled runs share one cell (the poisoning `thinking_fingerprint` exists to prevent). So the third state is a refusal. Resolving a family means adding a constant to `providers._SAMPLING_SUPPORT` with its measurement date and recipe — reviewable and versioned, deliberately **not** an env flag, because key identity must not depend on ambient configuration that nothing records.
+
+**Measured 2026-08-21** (`litmod probe-sampling --param top_p --rejection-scan`, six calls per model, lacan seat):
+
+| model | result |
+|---|---|
+| `claude-opus-5` | only 0.99 accepted; everything else, control included, refused **"`top_p` is deprecated for this model."** |
+| `claude-sonnet-5` | same |
+| `claude-haiku-4-5` | refuses the **parameter** — all six values, one error shape |
+| `deepseek-v4-flash`, `gpt-5.4-nano`, `gemini-3.5-flash-lite` | SETTABLE — every value accepted, control included |
+
+**Three models in one vendor's current lineup, three regimes.** A family claim from one member would have been right about Sonnet by luck and wrong about Haiku — which is why `_SAMPLING_FAMILIES` keys on `(route, family-substring)` and `claude-opus-4-8` still raises.
+
+**A correction worth keeping, because the evidence never changed — only the reading.** The Opus pattern was first recorded as "accepts iff equals the undisclosed default", making 0.99 Anthropic's unpublished `top_p` default, and `_SAMPLING_DEFAULTS` briefly held it. Then someone read the 400 text instead of truncating it: `top_p` is *deprecated* there, not validated against a default. A surviving legacy value, a no-op and a default produce identical acceptance evidence — and a parameter that does nothing has no reason to reject anything, so the no-op reading is if anything likelier. **What governed `top_p` on those runs is undisclosed, and 0.99 licenses no claim.** The state is `_DEPRECATED`: never sent, reported in `dropped_params` with the reason, kept out of the key. An accepted-and-ignored value in a cache key is the exact false pin the schema exists to prevent.
+
+Two things changed in the tool as a result. The verdict is now `ONLY_VALUE_ACCEPTED` rather than `DEFAULT_FOUND` — named for what was observed, since the old name was true about the API and false about the world — and it prints **no constant**, deferring to the refusal text. And refusal text is printed **verbatim, never truncated**: the sentence that overturned the verdict sat past a 120-character cut, on screen the whole time. Pinned by test.
+
+**`_SAMPLING_DEFAULTS` is empty**, and empty means *unmeasured* — not 1.0. No vendor default for any decoder parameter has been established by measurement. It never enters a cache key even when populated (a vendor default can change under us, and every old key would then assert a number nobody re-measured); it rides in `task.administration_record()` beside `sampling_unavailable`, which says what a model would not have let a caller pin anyway.
+
+**SETTABLE is not `_ACCEPTS`.** Accepting the absurd control proves the parameter is settable and says nothing about whether it *governs* — DeepSeek's thinking mode accepts all four and ignores them. Those three get no constant; a future corpus can pin them explicitly, but an already-collected one cannot recover what it ran at.
+
+**`temperature` is a denylist, and the asymmetry bites.** A family in `_NO_TEMPERATURE_MODELS` is *measured* to reject; a family absent is only "not known to reject", which is neither "accepts" nor "applies". `litmod probe-sampling --param temperature` now measures it — the one question the support test answers with power to spare, since 0.0 against 1.0 is an enormous effect where `top_p` 0.95 against 1.0 is a sliver. `administration_record()` carries `temperature` (requested) beside `temperature_effective` (what governed), and they differ exactly where a claim would be false. Note the split *within* a vendor: `haiku-4-5` honours a temperature that `sonnet-5` and `opus-5` discard, so "the Anthropic arm was temperature-pinned" can be true of one model and false of the next in the same corpus.
+
+**Per-family, not per-route.** `_SAMPLING_FAMILIES` and `_SAMPLING_DEFAULTS` key on `(route, family-substring)` and are consulted before the route-wide table, because a measurement on one model generation is a fact about that generation — generalising it is this package's recurring bug class, and `claude-sonnet-5` still raises while `claude-opus-5` does not.
+
+`_SAMPLING_DEFAULTS` never enters a cache key (a vendor default can change under us, and every old key would then assert a number nobody re-measured). It rides in `task.administration_record()` as `vendor_sampling_defaults`, so a methods note can state what an *unpinned* field actually ran at. **Empty there means unmeasured, not 1.0.**
+
+Otherwise the table has DeepSeek (`top_p`, `frequency_penalty`, `presence_penalty`, from their docs) and claude-cli (rejects everything, like temperature). **OpenAI, Google, local and the non-Opus Anthropic families all raise until someone probes them.** The vendor-doc ground is worse than "undocumented": DeepSeek documents a default of 1; OpenAI publishes no prose default, only example payloads echoing 1.0, possibly contingent on `reasoning_effort`; Google states the default *varies by model* and is retrievable only via an authenticated `getModel`, while the 3.x guide deprecates the sampling params outright; Anthropic publishes no `top_p` default for any model, and the Opus line rejects non-default values — a fixed number that is both unchangeable and undisclosed. "top_p was 1.0" is a claim the documentation supports for one vendor of four.
+
+**How to resolve a cell — a 200 is not evidence.** DeepSeek's thinking mode accepts all four and ignores them (handled: they land in `dropped_params` instead of the key). Measure **support size**, not distributional distance: truncation's signature is that outputs become *impossible*, not merely rarer. On a flat-continuation prompt ("Pick a random integer between 1 and 100; reply with the number only"), count *distinct* outputs at the pinned value against n at 1.0 — types, not densities, because a distance test at n=100 has almost no power against a default of 0.95 and its null reads as "the parameter did nothing", a false no-op in the one direction that is unrecoverable. Hold temperature fixed and above zero in both arms, and never run it on a schema prompt: JSON-constrained output is low-entropy by construction and shows a ceiling effect as a no-op.
+
+**A route that truncates unasked cannot be partially pinned.** `providers._SAMPLING_COMPANIONS` names parameters a stack applies whether or not you set them; pinning anything on such a route requires pinning the companion explicitly. Currently just `local` → `top_k`. The measurement that motivates it is adjacent rather than ours, and the difference matters: transformers 5.4.0 applies an effective `top_k=50` when the field is *absent* while `GenerationConfig().top_k`, the checkpoint's own config and the merged `model.generation_config.top_k` **all report None** (lacan seat, SmolLM2-360M-Instruct, 2026-08-21, CPU and MPS alike: 200 draws reached max rank 47 unset against 7090 at `top_k=0`). That is the HF `generate()` path, which we do not use — `local/` speaks HTTP to llama.cpp, vLLM, LM Studio or Ollama, each with its own defaults (llama.cpp has historically applied `top_k=40` and `top_p=0.95` unasked). The number is not ours; the class is, and four backends behind one prefix is worse. **"The config says None" is not evidence a parameter is unset** — which is precisely the inference this package exists to refuse. Cost of not having the rule: with an unrequested `top_k=50` in force, nucleus sizes of 436/223/53 at `top_p` 0.95/0.9/0.7 all collapse to the same top-50 set, so a four-arm sweep varies nothing and returns a flat line reading as "truncation has no effect".
+
+```bash
+litmod probe-sampling --model deepseek/deepseek-v4-pro --param top_p --n 20
+```
+
+Runs an UNSET arm plus one arm per value, counts distinct outputs, and prints the constant to paste into `_SAMPLING_SUPPORT`. It writes no keys and touches no stash — that is what makes its `allow_unmeasured=True` safe, and that flag has exactly this one caller. It also reports whether the **instrument** was validated, which is the part that keeps a null honest: a no-move at `top_p=0.95` is uninformative alone, because 0.95 removes a sliver of tail mass that n draws mostly miss. The low arms are the positive control — if 0.7 collapses support, the test has demonstrated sensitivity and the 0.95 null becomes a *bound* on the effect; if no arm moves at all, nothing was measured and the tool says so rather than reporting "ignored". Known limit: for a hosted model the sharper statistic (rate of draws outside a reference nucleus, a 5%-vs-0% test) needs the model's own distribution, so it works locally and not through an API.
+
+**`--rejection-scan` maps which values a family will accept, in under ten calls.** Cheap enough to run before spending n on any restrictive family. It carries a **negative control** (an in-range value that is certainly nobody's default), because the interesting premise — that an API accepts a value *iff* it equals the default, making acceptance an equality test against an unpublished number — is itself testable and fails silently in two directions. Four outcomes:
+
+- `ONLY_VALUE_ACCEPTED` — one value accepted, control refused. **Consistent with accepts-iff-default AND with a surviving legacy value or a no-op under a deprecated parameter, and the acceptance pattern cannot tell them apart.** So it prints no constant and defers to the refusal text, which usually can. This verdict was originally called `DEFAULT_FOUND` and that name shipped a false reading of a true observation; see the correction below.
+- `NOT_SETTABLE` — everything refused with one error shape, control included → `_REJECTS`.
+- `SETTABLE` — the control was accepted too, so the equality premise is false; fall back to the support test. Without this branch a permissive family returns the first candidate as a "default", and 1.0 leads the list.
+- `INCONCLUSIVE` — refusals differ in shape; read them.
+
+**Refusal text is printed verbatim and never truncated**, because the sentence that decides between those readings lives in the message, and clipping it at 120 characters is how a withdrawn constant got written in the first place.
+
+**Replicates: `sample=i`.** n samples of one prompt were n identical calls and therefore one cache cell — the second through nth collapsed into cache hits and the run reported one observation as n. `sample=` is a replicate index that keys each one separately. Its own field rather than a metadata entry, so it cannot collide with real metadata, and omitted when None. Not named `n=`: OpenAI's API already has an `n` meaning one call returning n completions, which is a different thing.
+
+**`calls == 0` is now two distinguishable states.** Everything cached, or everything failed — the usage sink only fires on success, so the tracker could not tell them apart and a missing `ANTHROPIC_API_KEY` read as a 100% cache hit rate. `UsageTracker` counts `failed_calls` and `failure_types` (attempts, not items) at the single dispatch point in `_call_provider`, and `summary_line()` says which state a zero-call run is in.
+
+**`usage_log` works off `LLM`, not just `Task`.** `LLM(usage_log="run_name")` writes the same per-batch JSONL record `Task` writes, from `llm.append_usage_log` — one writer, because a Task-only sink is why a production run driven straight off `LLM.map` kept no durable record of a single token. In-process `llm.usage.report()` was always live; that is what makes the gap easy to miss.
 
 ## Cost controls worth knowing
 

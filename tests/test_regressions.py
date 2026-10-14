@@ -800,7 +800,7 @@ class TestOpenAIParamHealing:
         client = type("Client", (), {"chat": type("Chat", (), {
             "completions": type("Comp", (), {"create": staticmethod(create)})})})
         msgs = [{"role": "user", "content": "hi"}]
-        for call_n in range(3):
+        for _ in range(3):
             with pytest.raises(P.DroppedParameterError):
                 P._chat_completion(client, "openai", "m", msgs, 0.0, 16)
 
@@ -1183,7 +1183,10 @@ class TestFrameworkKwargCoupling:
         monkeypatch.setenv("DEEPSEEK_API_KEY", "test")
         monkeypatch.setattr(P, "_cached_client", lambda key, factory: client)
         monkeypatch.setattr(P, "_LOGGED_RESOLUTIONS", set())
-        junk = {k: "x" for k in P._NON_API_KWARGS if k != "thinking"}
+        # `sampling` is typed (a dict of decoder params); everything else
+        # in the denylist is opaque to the wire, so a string stands in.
+        junk = {k: ({} if k == "sampling" else "x")
+                for k in P._NON_API_KWARGS if k != "thinking"}
         P.call_deepseek("hi", model="deepseek/deepseek-v4-pro", **junk)
         for k in P._NON_API_KWARGS:
             assert k not in seen[-1]
@@ -1568,14 +1571,14 @@ class TestRequestBuilders:
     def test_google_request_carries_the_thinking_setting(self, monkeypatch):
         import largeliterarymodels.providers as P
         monkeypatch.setattr(P, "_WARNED_GOOGLE_THINKING", set())
-        model, contents, config, setting = P.google_request(
+        model, contents, config, setting, _dropped = P.google_request(
             "the item", model="google/gemini-3.6-flash",
             system_prompt="sys", temperature=0.0)
         assert model == "gemini-3.6-flash"
         assert setting == ("thinking_level", "minimal")
         assert "MINIMAL" in str(config.thinking_config.thinking_level).upper()
         assert config.system_instruction == "sys"
-        model, _, config, setting = P.google_request(
+        model, _, config, setting, _dropped = P.google_request(
             "x", model="gemini-2.5-flash")
         assert setting == ("thinking_budget", 0)
         assert config.thinking_config.thinking_budget == 0

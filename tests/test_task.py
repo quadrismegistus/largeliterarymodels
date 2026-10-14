@@ -669,7 +669,7 @@ class TestParseAndValidate:
         assert self._task().parse_and_validate('{"sentiment": "positive"}') is None
 
     def test_strict_raises(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             self._task().parse_and_validate("I couldn't decide.", strict=True)
 
     def test_list_schema(self):
@@ -1410,8 +1410,8 @@ class TestUsageLogSidecar:
     persists the receipts additively — no stash value or key changes."""
 
     def _task(self, tmp_path, monkeypatch, **kw):
-        import largeliterarymodels.task as task_mod
-        monkeypatch.setattr(task_mod, "STASH_PATH",
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH",
                             str(tmp_path / "stash"))
 
         class T(Task):
@@ -1438,7 +1438,7 @@ class TestUsageLogSidecar:
         task, path = self._task(tmp_path, monkeypatch)
         task.map(["a", "b"], num_workers=1,
                  metadata_list=[{"id": "m1"}, {"id": "m2"}])
-        records = [_json.loads(l) for l in open(path)]
+        records = [_json.loads(line) for line in open(path)]
         assert len(records) == 1
         rec = records[0]
         assert rec["batch"]["output_tokens"] == 14
@@ -1477,7 +1477,7 @@ class TestUsageLogSidecar:
         task, path = self._task(tmp_path, monkeypatch)
         task.map(["a"], num_workers=1)
         task.map(["b"], num_workers=1, force=True)
-        records = [_json.loads(l) for l in open(path)]
+        records = [_json.loads(line) for line in open(path)]
         assert len(records) == 2
         assert records[1]["batch"]["output_tokens"] == 5, \
             "second record must not carry the first batch's tokens"
@@ -1485,8 +1485,8 @@ class TestUsageLogSidecar:
     @patch("largeliterarymodels.llm._call_provider")
     def test_off_by_default_writes_nothing(self, mock_call, tmp_path,
                                            monkeypatch):
-        import largeliterarymodels.task as task_mod
-        monkeypatch.setattr(task_mod, "STASH_PATH", str(tmp_path / "stash"))
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
         mock_call.return_value = '{"sentiment": "positive", "confidence": 0.9}'
 
         class T(Task):
@@ -1502,8 +1502,8 @@ class TestUsageLogSidecar:
 
 class TestUsageLogReviewFindings:
     def _task(self, tmp_path, monkeypatch):
-        import largeliterarymodels.task as task_mod
-        monkeypatch.setattr(task_mod, "STASH_PATH", str(tmp_path / "stash"))
+        import largeliterarymodels.administered as adm_mod
+        monkeypatch.setattr(adm_mod, "STASH_PATH", str(tmp_path / "stash"))
 
         class T(Task):
             schema = Sentiment
@@ -1531,7 +1531,7 @@ class TestUsageLogReviewFindings:
         shared = {}
         task.map(["a"], num_workers=1, per_item_usage=shared)
         task.map(["b"], num_workers=1, per_item_usage=shared, force=True)
-        records = [_json.loads(l) for l in open(path)]
+        records = [_json.loads(line) for line in open(path)]
         assert records[1]["batch"]["output_tokens"] == 5, \
             "batch 2's record must not carry batch 1's tokens"
         # And the caller's documented accumulation semantics survive.

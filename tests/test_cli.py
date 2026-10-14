@@ -283,7 +283,7 @@ class TestDoctorShell:
         from largeliterarymodels.cli.doctor import (PROVIDER_MATRIX,
                                                     _default_model)
         from largeliterarymodels.providers import route_provider
-        for name, spec in PROVIDER_MATRIX.items():
+        for spec in PROVIDER_MATRIX.values():
             for tier in ("cheap", "frontier"):
                 if spec.get(tier):
                     assert route_provider(spec[tier])
@@ -322,7 +322,7 @@ class TestByteIdentityAcrossTheCatalog:
             task._stash = HashStash(engine="memory").clear()
             captured = {}
 
-            def grab(**kw):
+            def grab(captured=captured, **kw):
                 captured["system_prompt"] = kw["system_prompt"]
                 raise RuntimeError("stop before any parsing")
 
@@ -437,7 +437,6 @@ class TestPathResolution:
     def test_imported_classes_are_not_candidates(self, tmp_path):
         """A file importing a Task must not ambiguously 'define' it —
         only classes created in the file count."""
-        import pytest
         from largeliterarymodels.cli.registry import resolve
         path = self._write(
             tmp_path,

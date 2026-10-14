@@ -219,7 +219,7 @@ class TestCaptureAndJoin:
         llm = _llm(raw_log=rawlog)
         with patch("largeliterarymodels.llm._call_provider",
                    side_effect=ConnectionError("provider down")):
-            with pytest.raises(Exception):
+            with pytest.raises(ValueError, match="Failed to extract"):
                 llm.extract("a", Out, system_prompt="sys", retries=0)
         assert rawlog.receipt() == {"recorded": 0, "failed": 0,
                                     "errors": [], "dropped_keys": []}, \
@@ -249,7 +249,7 @@ class TestCaptureAndJoin:
             return "not json at all"
         with patch("largeliterarymodels.llm._call_provider",
                    side_effect=junk):
-            with pytest.raises(Exception):
+            with pytest.raises(ValueError, match="Failed to extract"):
                 llm.extract("a", Out, system_prompt="sys", retries=0)
         assert rawlog.receipt()["recorded"] == 1
         [key] = list(rawlog.keys())

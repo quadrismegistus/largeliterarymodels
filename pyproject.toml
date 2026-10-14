@@ -35,7 +35,7 @@ Issues = "https://github.com/quadrismegistus/largeliterarymodels/issues"
 litmod = "largeliterarymodels.cli.main:main"
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov", "ruff"]
+dev = ["pytest", "pytest-cov", "ruff", "tiktoken"]
 lltk = ["lltk-dh"]
 annotate = ["fh-pydantic-form>=0.3", "uvicorn"]
 analysis = [

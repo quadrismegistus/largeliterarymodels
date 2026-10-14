@@ -195,11 +195,20 @@ class TestBackCompat:
 
 class TestCompare:
     def test_sorted_and_no_dated_variants(self):
-        rows = costs.compare(fresh=1_000_000, output=100_000)
+        # Pinned to a date before every boundary in the table: unpinned, this
+        # failed on 2026-09-01, when sonnet-5's row was correctly superseded
+        # by its dated variant — the test, not the table, had a clock in it.
+        rows = costs.compare(fresh=1_000_000, output=100_000, on="2026-08-15")
         usds = [r["usd"] for r in rows]
         assert usds == sorted(usds)
         assert not any("-post-" in r["model"] for r in rows)
         assert len(rows) > 50, "expected the whole table"
+
+    def test_a_dated_variant_supersedes_rather_than_duplicates(self):
+        after = costs.compare(fresh=1_000_000, output=100_000, on="2026-09-15")
+        sonnet5 = [r["model"] for r in after
+                   if r["model"].startswith("claude-sonnet-5")]
+        assert sonnet5 == ["claude-sonnet-5-post-2026-09-01"]
 
 
 class TestCacheAwarePricing:

@@ -228,8 +228,8 @@ class TestLedgerMoneySafety:
         the set-fingerprint design resubmitted it."""
         stash = FakeStash()
         fake = FakeAdapter()
-        handle = _run(_llm(stash), fake, ["a", "b", "c"], monkeypatch,
-                      ledger=ledger, probe=False, wait=False)
+        _run(_llm(stash), fake, ["a", "b", "c"], monkeypatch,
+             ledger=ledger, probe=False, wait=False)
         fake.submit = lambda requests, sub=None: (_ for _ in ()).throw(
             AssertionError("resubmitted"))
         results = _run(_llm(stash), fake, ["a", "b"], monkeypatch,
@@ -375,7 +375,10 @@ class TestLedgerMoneySafety:
                 outcomes.append("stopped")
         t1 = threading.Thread(target=go, args=(stash_a,))
         t2 = threading.Thread(target=go, args=(stash_b,))
-        t1.start(); t2.start(); t1.join(); t2.join()
+        for t in (t1, t2):
+            t.start()
+        for t in (t1, t2):
+            t.join()
         assert len(fake.submitted) == 1
         assert sorted(outcomes) == ["ran", "stopped"]
 

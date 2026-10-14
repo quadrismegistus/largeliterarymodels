@@ -7,6 +7,7 @@ in the output.
 """
 
 import pytest
+from pydantic import ValidationError
 
 from largeliterarymodels.costs import count_tokens
 from largeliterarymodels.tasks.classify_propp import (
@@ -161,7 +162,7 @@ class TestSchema:
     def test_an_unknown_function_is_rejected(self):
         """The enum is what stops the label set drifting into a long tail
         of near-synonyms across runs."""
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             _fn('hero_gets_a_horse', 'x')
 
     def test_a_non_tale_can_report_no_functions(self):
@@ -321,7 +322,8 @@ class TestRegistryHasNoDuplicates:
         by both classify_propp and score_alignment_asymmetry, and the
         documented import silently returned the wrong one — it accepts a
         single positional argument, so it did not even raise."""
-        import ast, collections
+        import ast
+        import collections
         import largeliterarymodels.tasks as T
         src = open(T.__file__).read()
         for node in ast.walk(ast.parse(src)):

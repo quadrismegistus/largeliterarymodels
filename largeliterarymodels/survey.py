@@ -412,9 +412,9 @@ class Survey(_Administered):
                 try:
                     raw_sink = None
                     if sidecar is not None:
-                        raw_sink = lambda body, k=key: sidecar.record(  # noqa: E731
+                        raw_sink = lambda body, k=key, a=attempt: sidecar.record(  # noqa: E731
                             k, body, transport="sync", model=model,
-                            provider="typesafe", attempt=attempt)
+                            provider="typesafe", attempt=a)
                     body = providers.call_typesafe_survey(
                         state=state, questions=wire, model=model,
                         usage_sink=_sink(i), raw_sink=raw_sink, **kwargs)

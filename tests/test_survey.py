@@ -3,8 +3,8 @@ import json
 
 import pytest
 from hashstash import HashStash
+from pydantic import ValidationError
 
-from largeliterarymodels import survey as survey_mod
 from largeliterarymodels.answers import Answers
 from largeliterarymodels.llm import _make_survey_key
 from largeliterarymodels.questions import Choice, Noul, Score
@@ -343,7 +343,7 @@ class TestAsTask:
         t = self._s().as_task()
         meta = str(t.schema.model_fields["degree"].metadata)
         assert "0" in meta and "2" in meta
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             t.schema.model_validate({"abstract": True, "mode": "narrative",
                                      "degree": 3})
 

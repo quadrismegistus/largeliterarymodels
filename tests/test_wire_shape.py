@@ -20,7 +20,6 @@ gate while `legg` failed it. Synthetic cases keep being easier than the data.
 import json
 import pathlib
 
-import pytest
 
 from largeliterarymodels import answers as A
 from largeliterarymodels.questions import canonical, to_wire

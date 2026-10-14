@@ -12,7 +12,6 @@ import json
 from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel
 
 import largeliterarymodels.providers as P
 from largeliterarymodels.llm import (LLM, UsageTracker, _legacy_key_kwargs,
@@ -222,7 +221,7 @@ class TestZeroCallsIsNotOneThing:
             raise RuntimeError("boom")
         monkeypatch.setattr(M, "route_provider", lambda m: _boom)
         llm = LLM("claude-sonnet-4-6", stash=FakeStash())
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="Failed to extract"):
             llm.extract("t", Out, system_prompt="s", retries=0)
         r = llm.usage.report()
         assert r["calls"] == 0 and r["failed_calls"] == 1
@@ -234,7 +233,7 @@ class TestZeroCallsIsNotOneThing:
         tracker = UsageTracker()
         monkeypatch.setattr(M, "route_provider",
                             lambda m: (_ for _ in ()).throw)
-        with pytest.raises(Exception):
+        with pytest.raises(Exception):  # noqa: B017 — any raise; the count is the point
             M._call_provider("p", "claude-sonnet-4-6",
                              failure_sink=tracker.record_failure)
         assert tracker.report()["failed_calls"] == 1

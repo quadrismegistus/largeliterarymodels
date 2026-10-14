@@ -1042,7 +1042,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
         # reporting, strict-mode, cache-floor warnings — before money).
         built = []
         dropped_all = ()
-        for i, cid, prompt, key, metadata in fresh:
+        for i, cid, prompt, key, _metadata in fresh:
             req, dropped = _build_request(model, prompt, full_system,
                                           temperature, max_tokens,
                                           kwargs.get("thinking", "auto"),
@@ -1090,7 +1090,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
                     raise BatchInProgress(
                         BatchInProgress.__doc__ + f"\n\nsubmission id: "
                         f"{latest[clash[0]].get('sub')}")
-                for i, cid, prompt, key, req in chunk:
+                for _i, cid, _prompt, key, _req in chunk:
                     ledger.set_cid(cid, state="submitting", sub=sub,
                                    batch_id=None,
                                    provider=adapter.provider, key=key)
@@ -1098,7 +1098,7 @@ def extract_batch(llm, prompts, schema, system_prompt=None, examples=None,
                 _Ledger.unlock(lk)
             batch_id = adapter.submit([(c[1], c[4]) for c in chunk],
                                       sub=sub)
-            for i, cid, prompt, key, req in chunk:
+            for _i, cid, _prompt, key, _req in chunk:
                 ledger.set_cid(cid, state="open", sub=sub,
                                batch_id=batch_id,
                                provider=adapter.provider, key=key)

@@ -35,7 +35,7 @@ would freeze someone else's prompt engineering into our types.
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 #: A value acceptable as instructions or as a criterion: string, object or

@@ -800,7 +800,7 @@ class TestOpenAIParamHealing:
         client = type("Client", (), {"chat": type("Chat", (), {
             "completions": type("Comp", (), {"create": staticmethod(create)})})})
         msgs = [{"role": "user", "content": "hi"}]
-        for call_n in range(3):
+        for _ in range(3):
             with pytest.raises(P.DroppedParameterError):
                 P._chat_completion(client, "openai", "m", msgs, 0.0, 16)
 

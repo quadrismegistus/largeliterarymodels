@@ -115,7 +115,7 @@ def cmd_render(args) -> int:
         try:
             records = adapter.fixtures()
         except (SystemExit, Exception) as e:  # noqa: BLE001
-            raise SystemExit(f"could not load fixtures: {e}")
+            raise SystemExit(f"could not load fixtures: {e}") from e
         if not records:
             raise SystemExit("adapter returned no fixtures")
         item, _meta = adapter.build_prompt(records[0])

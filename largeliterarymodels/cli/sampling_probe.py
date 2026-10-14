@@ -85,7 +85,7 @@ def _one_arm(model, param, value, n, prompt, temperature, max_tokens):
     """
     fn = route_provider(model)
     outputs = []
-    for i in range(n):
+    for _ in range(n):
         try:
             outputs.append(_normalise(fn(
                 prompt, model=model, max_tokens=max_tokens,
@@ -127,13 +127,13 @@ def _verdict(arms, param):
     moved = [v for v, s in pinned.items() if s != supports[top]]
     if not moved:
         return ("INCONCLUSIVE",
-                f"support did not move across ANY pinned arm, including the "
-                f"lowest. That is NOT evidence the parameter was ignored: "
-                f"an unvalidated instrument and an inert parameter look "
-                f"identical here. Most likely the prompt's continuation set "
-                f"is smaller than the nucleus at every value tested — widen "
-                f"the prompt, lower the floor arm, or raise n. Do not write "
-                f"a constant from this.",
+                "support did not move across ANY pinned arm, including the "
+                "lowest. That is NOT evidence the parameter was ignored: "
+                "an unvalidated instrument and an inert parameter look "
+                "identical here. Most likely the prompt's continuation set "
+                "is smaller than the nucleus at every value tested — widen "
+                "the prompt, lower the floor arm, or raise n. Do not write "
+                "a constant from this.",
                 "UNVALIDATED — no arm moved, so the test has not shown it "
                 "can detect truncation on this prompt at all.")
     lo = min(pinned)
@@ -241,11 +241,11 @@ def _rejection_scan(model, param, prompt, temperature, max_tokens,
             f"message usually does."), rows)
     if not accepted and not control_ok and len(sigs) == 1:
         return ("NOT_SETTABLE", (
-            f"every value was refused with one error shape, the control "
-            f"included. The premise is wrong: this family rejects the "
-            f"PARAMETER, not non-default values. The constant is _REJECTS, "
-            f"and if it also rejects temperature the family admits no "
-            f"sampling control at all."), rows)
+            "every value was refused with one error shape, the control "
+            "included. The premise is wrong: this family rejects the "
+            "PARAMETER, not non-default values. The constant is _REJECTS, "
+            "and if it also rejects temperature the family admits no "
+            "sampling control at all."), rows)
     if not accepted:
         return ("INCONCLUSIVE", (
             "every candidate was refused but the refusals differ in shape, "
@@ -305,10 +305,10 @@ def _run_rejection_scan(args, model, route, param):
               f"    {text}")
 
     if verdict == "ONLY_VALUE_ACCEPTED":
-        print(f"\n  No constant is printed for this verdict on purpose. "
-              f"Decide from the refusal text above which reading it "
-              f"supports, and record the TEXT beside whichever constant "
-              f"you write.")
+        print("\n  No constant is printed for this verdict on purpose. "
+              "Decide from the refusal text above which reading it "
+              "supports, and record the TEXT beside whichever constant "
+              "you write.")
     elif verdict == "NOT_SETTABLE":
         print(f"\n  Constant to add in providers._SAMPLING_SUPPORT:\n"
               f'    "{route}": {{"{param}": _REJECTS}},')
@@ -389,12 +389,12 @@ def cmd_probe_sampling(args) -> int:
             # the point: absence from a DENYLIST is not a measurement, it
             # is only "not known to reject". That is exactly the gap this
             # probe closes, so say which fact was established.
-            print(f"\n  temperature is governed by "
-                  f"providers._NO_TEMPERATURE_MODELS (a denylist), not by "
-                  f"_SAMPLING_SUPPORT.")
+            print("\n  temperature is governed by "
+                  "providers._NO_TEMPERATURE_MODELS (a denylist), not by "
+                  "_SAMPLING_SUPPORT.")
             if verdict == "REJECTS":
-                print(f"  Add the family tag to _NO_TEMPERATURE_MODELS with "
-                      f"the date and this command line.")
+                print("  Add the family tag to _NO_TEMPERATURE_MODELS with "
+                      "the date and this command line.")
             else:
                 print(f"  MEASURED: {model} both accepts temperature AND "
                       f"varies with it, so a run that set it was "

@@ -133,7 +133,7 @@ class TestRetryLoopUsesIt:
         heard the real complaint — the inertness was in the MESSAGE, not in
         the loop."""
         call.side_effect = [self.BAD, self.BAD, self.GOOD]
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="Failed to extract"):
             _llm().extract("p", Groups, retries=3,
                            validation_context={"group_a": ["strangle"]})
         assert call.call_count == 2
@@ -154,7 +154,7 @@ class TestRetryLoopUsesIt:
         # The saving the short-circuit exists for is kept: once the same
         # complaint has been sent and produced the same error, stop.
         call.side_effect = [self.BAD] * 8
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="Failed to extract"):
             _llm().extract("p", Groups, retries=6,
                            validation_context={"group_a": ["strangle"]})
         assert call.call_count == 2, "one plain attempt, one informative, stop"
